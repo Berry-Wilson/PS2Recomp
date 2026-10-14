@@ -438,10 +438,14 @@ namespace ps2recomp
         case OPCODE_COP2:
             if (m_branchInst.rs == COP2_BC)
             {
+                // BC2F/BC2T test the COP2 condition line, i.e. whether VU0 is still running a
+                // micro program (VPU-STAT.VBS0). vu0_status is the VU status *flag* register
+                // (bit 0 = Z), so testing it made "wait for VCALLMS" loops spin whenever the
+                // micro program left Z set.
                 const uint8_t bcCond = static_cast<uint8_t>(m_branchInst.rt);
                 return (bcCond == COP2_BC_BCF || bcCond == COP2_BC_BCFL)
-                           ? "!(ctx->vu0_status & 0x1)"
-                           : "(ctx->vu0_status & 0x1)";
+                           ? "!(ctx->vu0_vpu_stat & 0x1)"
+                           : "(ctx->vu0_vpu_stat & 0x1)";
             }
             break;
         default:

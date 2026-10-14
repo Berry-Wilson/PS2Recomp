@@ -68,6 +68,9 @@ namespace ps2x::iop::detail
         void setInterruptControl(uint32_t value) noexcept { m_interruptControl = value & 1u; }
 
         [[nodiscard]] std::optional<DmaStart> takeDmaStart() noexcept;
+        // Ends an SPU2 DMA transfer when its completion interrupt (0x24/0x28) is delivered:
+        // clears CHCR.start and sets the core's STATX DMA-ready bit (0x80).
+        void completeSpuDma(int irq);
         [[nodiscard]] std::span<const uint8_t> ram() const noexcept { return m_ram; }
 
         [[nodiscard]] static uint32_t physicalAddress(uint32_t address) noexcept;
@@ -76,6 +79,7 @@ namespace ps2x::iop::detail
         [[nodiscard]] uint32_t readHardware32(uint32_t address) const;
         void writeHardware32(uint32_t address, uint32_t value);
         void markOwned(uint32_t address, size_t size);
+        void setSpuDmaReady(bool secondCore, bool ready);
 
         std::vector<uint8_t> m_ram;
         std::vector<uint8_t> m_owned;

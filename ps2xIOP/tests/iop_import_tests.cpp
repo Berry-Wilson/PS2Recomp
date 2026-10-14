@@ -62,8 +62,39 @@ namespace
             return kind == HostPathKind::CdRoot ? root.string() : std::string{};
         }
 
+        // Plain file access so virtual-ISO sector reads reach the files under root.
+        uint64_t openHostFile(std::string_view path) override
+        {
+            files.emplace_back(path);
+            return files.size();
+        }
+
+        bool hostFileSize(uint64_t handle, uint64_t &size) const override
+        {
+            std::error_code error;
+            if (handle == 0u || handle > files.size())
+                return false;
+            size = std::filesystem::file_size(files[handle - 1u], error);
+            return !error;
+        }
+
+        bool readHostFile(uint64_t handle, uint64_t offset, void *destination, size_t size, size_t &bytesRead) override
+        {
+            bytesRead = 0u;
+            if (handle == 0u || handle > files.size())
+                return false;
+            std::ifstream file(files[handle - 1u], std::ios::binary);
+            file.seekg(static_cast<std::streamoff>(offset));
+            file.read(static_cast<char *>(destination), static_cast<std::streamsize>(size));
+            bytesRead = static_cast<size_t>(file.gcount());
+            return true;
+        }
+
+        void closeHostFile(uint64_t) override {}
+
     private:
         std::filesystem::path root;
+        std::vector<std::filesystem::path> files;
     };
 
     class RecordingExecutor final : public IopGuestExecutor
@@ -274,6 +305,67 @@ namespace
         return passed;
     }
 
+    bool testCdvdReadSpillsPastAllocation()
+    {
+        // Drivers read ceil(size / 2048) sectors into a buffer allocated for the exact file size;
+        // CD DMA writes the whole last sector into RAM past the block, as on hardware.
+        const auto suffix = std::to_string(
+            static_cast<unsigned long long>(std::chrono::steady_clock::now().time_since_epoch().count()));
+        const std::filesystem::path root =
+            std::filesystem::temp_directory_path() / ("ps2x-iop-cdvd-read-" + suffix);
+        const std::filesystem::path dataDirectory = root / "DATA";
+        std::error_code error;
+        std::filesystem::create_directories(dataDirectory, error);
+        if (!expect(!error, "could not create the temporary CD root"))
+            return false;
+
+        constexpr uint32_t fileSize = 0x6260u; // 12.3 sectors -> 13-sector read
+        std::vector<uint8_t> contents(fileSize);
+        for (uint32_t i = 0; i < fileSize; ++i)
+            contents[i] = static_cast<uint8_t>(i * 7u + 3u);
+        {
+            std::ofstream file(dataDirectory / "SNDDATA.BIN", std::ios::binary);
+            file.write(reinterpret_cast<const char *>(contents.data()), static_cast<std::streamsize>(contents.size()));
+        }
+
+        CdRootHost host(root);
+        IopMemory memory;
+        IopKernel kernel(memory);
+        kernel.reset();
+        IopCdvd cdvd(host, memory, kernel);
+        cdvd.reset();
+
+        constexpr uint32_t resultAddress = 0x2400u;
+        constexpr uint32_t pathAddress = 0x2480u;
+        const char path[] = "cdrom0:\\DATA\\SNDDATA.BIN;1";
+        (void)memory.writeRam(pathAddress, path, sizeof(path));
+
+        IopCpuState cpu{};
+        cpu.gpr[4] = resultAddress;
+        cpu.gpr[5] = pathAddress;
+        bool passed = expect(cdvd.dispatchImport(10u, cpu) && cpu.gpr[2] == 1u, "sceCdSearchFile did not find the file");
+        const uint32_t lsn = memory.read32(resultAddress);
+
+        const uint32_t buffer = memory.allocate(fileSize);
+        passed = passed && expect(buffer != 0u, "could not allocate the read buffer");
+
+        cpu = {};
+        cpu.gpr[4] = lsn;
+        cpu.gpr[5] = (fileSize + 2047u) / 2048u;
+        cpu.gpr[6] = buffer;
+        passed = passed &&
+                 expect(cdvd.dispatchImport(6u, cpu), "sceCdRead was not handled") &&
+                 expect(cpu.gpr[2] == 1u, "sceCdRead rejected a read whose last sector spills past its block");
+
+        std::vector<uint8_t> readBack(fileSize);
+        passed = passed &&
+                 expect(memory.readRam(buffer, readBack.data(), readBack.size()) && readBack == contents,
+                        "sceCdRead did not deliver the file contents");
+
+        std::filesystem::remove_all(root, error);
+        return passed;
+    }
+
     bool testTimrmanPeriodicCallback()
     {
         IopTimrman timrman;
@@ -330,7 +422,7 @@ namespace
 
 int main()
 {
-    if (!testLoadcoreRebootLibraryMode() || !testCdvdSpecialControl() || !testCdvdSearchFile() ||
+    if (!testLoadcoreRebootLibraryMode() || !testCdvdSpecialControl() || !testCdvdSearchFile() || !testCdvdReadSpillsPastAllocation() ||
         !testTimrmanPeriodicCallback())
         return 1;
     std::cout << "ps2xIOP import tests passed\n";

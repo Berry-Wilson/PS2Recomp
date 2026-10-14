@@ -243,20 +243,20 @@ inline std::filesystem::path g_cdrom_cwd;
 inline std::string g_ps2_cwd_device = "host0";
 
 static constexpr uint32_t kRpcPacketSize = 64;
-static constexpr uint32_t kRpcPacketPoolBase = 0x01F00000;
+static constexpr uint32_t kRpcPacketPoolBase = PS2_RUNTIME_RPC_PACKET_POOL_BASE;
 static constexpr uint32_t kRpcPacketPoolBytes = 0x00010000;
 static constexpr uint32_t kRpcPacketPoolCount = kRpcPacketPoolBytes / kRpcPacketSize;
-static constexpr uint32_t kRpcServerPoolBase = 0x01F10000;
+static constexpr uint32_t kRpcServerPoolBase = PS2_RUNTIME_RPC_SERVER_POOL_BASE;
 static constexpr uint32_t kRpcServerPoolBytes = 0x00010000;
 static constexpr uint32_t kRpcServerStride = 0x80;
 static constexpr uint32_t kRpcServerPoolCount = kRpcServerPoolBytes / kRpcServerStride;
 
-static constexpr uint32_t kTlsPoolBase = 0x01F20000;
+static constexpr uint32_t kTlsPoolBase = PS2_RUNTIME_TLS_POOL_BASE;
 static constexpr uint32_t kTlsPoolBytes = 0x00010000;
 static constexpr uint32_t kTlsBlockSize = 0x100;
 static constexpr uint32_t kTlsPoolCount = kTlsPoolBytes / kTlsBlockSize;
 
-static constexpr uint32_t kBootModePoolBase = 0x01F30000;
+static constexpr uint32_t kBootModePoolBase = PS2_RUNTIME_BOOT_MODE_POOL_BASE;
 static constexpr uint32_t kBootModePoolBytes = 0x00001000;
 
 static constexpr uint32_t kSifRpcModeNowait = 0x01;

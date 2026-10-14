@@ -338,6 +338,13 @@ public:
     bool registerFunction(uint32_t address, RecompiledFunction func);
     RecompiledFunction lookupFunction(uint32_t address);
     bool hasFunction(uint32_t address) const;
+
+    // Consulted when an address misses the generated function table, e.g. for code overlays
+    // that are recompiled as separate units and swapped in at runtime. Returns nullptr when the
+    // address is not covered.
+    using FunctionLookupFallback = RecompiledFunction (*)(PS2Runtime &runtime, uint32_t address);
+    void setFunctionLookupFallback(FunctionLookupFallback fallback) { m_functionLookupFallback = fallback; }
+
     bool dispatchGuestBranch(uint8_t *rdram,
                              R5900Context *ctx,
                              uint32_t targetPc,
@@ -489,6 +496,7 @@ private:
 
 private:
     PS2Memory m_memory;
+    FunctionLookupFallback m_functionLookupFallback = nullptr;
     GifArbiter m_gifArbiter;
     GS m_gs;
     std::unique_ptr<PS2IopHostAdapter> m_iopHost;

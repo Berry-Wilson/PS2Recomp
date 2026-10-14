@@ -79,6 +79,56 @@ namespace
 
         return 0u;
     }
+
+    // Quadwords still owed to a VIF1 DIRECT/DIRECTHL whose payload ran past the end of the data
+    // handed to processVIF1Data. Those bytes arrive raw at the start of the next call. Kept
+    // separate from PS2Memory::m_vif1PendingPath2ImageQwc, which is GIF-level state (an IMAGE
+    // GIFtag still waiting for data) and must only be fed from later DIRECT payloads.
+    uint32_t s_vif1DirectRemainQwc = 0u;
+    bool s_vif1DirectRemainHl = false;
+}
+
+void resetVif1DirectContinuation()
+{
+    s_vif1DirectRemainQwc = 0u;
+    s_vif1DirectRemainHl = false;
+}
+
+static void feedVif1Path2(PS2Memory &mem, const uint8_t *data, uint32_t qwCount, bool directHl)
+{
+    // An IMAGE transfer started by an earlier DIRECT continues with this payload: the GIF keeps
+    // its NLOOP state across VIF DIRECT commands.
+    uint32_t consumedQw = 0u;
+    if (mem.m_vif1PendingPath2ImageQwc != 0u && qwCount != 0u)
+    {
+        const uint32_t chunkQw = std::min<uint32_t>(mem.m_vif1PendingPath2ImageQwc, qwCount);
+        std::vector<uint8_t> imagePacket(16u + static_cast<size_t>(chunkQw) * 16u, 0u);
+        const uint64_t imageTag =
+            static_cast<uint64_t>(chunkQw & 0x7FFFu) |
+            ((mem.m_vif1PendingPath2ImageQwc == chunkQw) ? (1ull << 15) : 0ull) |
+            (static_cast<uint64_t>(kGifFmtImage) << 58);
+        std::memcpy(imagePacket.data(), &imageTag, sizeof(imageTag));
+        std::memcpy(imagePacket.data() + 16u, data, static_cast<size_t>(chunkQw) * 16u);
+        mem.submitGifPacket(GifPathId::Path2, imagePacket.data(), static_cast<uint32_t>(imagePacket.size()), true,
+                        mem.m_vif1PendingPath2DirectHl || directHl);
+        mem.m_vif1PendingPath2ImageQwc -= chunkQw;
+        if (mem.m_vif1PendingPath2ImageQwc == 0u)
+            mem.m_vif1PendingPath2DirectHl = false;
+        consumedQw = chunkQw;
+    }
+
+    if (qwCount > consumedQw)
+    {
+        const uint8_t *packet = data + consumedQw * 16u;
+        const uint32_t packetBytes = (qwCount - consumedQw) * 16u;
+        mem.submitGifPacket(GifPathId::Path2, packet, packetBytes, true, directHl);
+        const uint32_t pendingImageQw = pendingGifImageQwc(packet, packetBytes);
+        if (pendingImageQw != 0u)
+        {
+            mem.m_vif1PendingPath2ImageQwc = pendingImageQw;
+            mem.m_vif1PendingPath2DirectHl = directHl;
+        }
+    }
 }
 
 void PS2Memory::processVIF0Data(uint32_t srcPhys, uint32_t sizeBytes)
@@ -268,6 +318,16 @@ void PS2Memory::processVIF0Data(const uint8_t *data, uint32_t sizeBytes)
                         std::memcpy(&scalar, srcVec + c * 4u, sizeof(scalar));
                         lanes[c] = scalar;
                     }
+                    // Hardware fills the lanes V2/V3 lack: V2 writes x,y,x,y; V3 W gets the next element.
+                    if (components == 2)
+                    {
+                        lanes[2] = lanes[0];
+                        lanes[3] = lanes[1];
+                    }
+                    else if (components == 3 && srcVec + 16u <= data + sizeBytes)
+                    {
+                        std::memcpy(&lanes[3], srcVec + 12u, sizeof(uint32_t));
+                    }
                     _mm_storeu_si128(reinterpret_cast<__m128i *>(m_vu0Data + destOff), _mm_loadu_si128(reinterpret_cast<const __m128i *>(lanes)));
                 }
             }
@@ -304,30 +364,21 @@ void PS2Memory::processVIF1Data(const uint8_t *data, uint32_t sizeBytes)
 
     while (pos + 4 <= sizeBytes)
     {
-        if (m_vif1PendingPath2ImageQwc != 0u)
+        if (s_vif1DirectRemainQwc != 0u)
         {
+            // Rest of a DIRECT/DIRECTHL payload that did not fit in the previous call.
             const uint32_t availableQw = (sizeBytes - pos) / 16u;
             if (availableQw == 0u)
             {
                 break;
             }
 
-            const uint32_t chunkQw = std::min<uint32_t>(m_vif1PendingPath2ImageQwc, availableQw);
-            std::vector<uint8_t> imagePacket(16u + static_cast<size_t>(chunkQw) * 16u, 0u);
-            const uint64_t imageTag =
-                static_cast<uint64_t>(chunkQw & 0x7FFFu) |
-                ((m_vif1PendingPath2ImageQwc == chunkQw) ? (1ull << 15) : 0ull) |
-                (static_cast<uint64_t>(kGifFmtImage) << 58);
-            std::memcpy(imagePacket.data(), &imageTag, sizeof(imageTag));
-            std::memcpy(imagePacket.data() + 16u, data + pos, static_cast<size_t>(chunkQw) * 16u);
-            submitGifPacket(GifPathId::Path2, imagePacket.data(), static_cast<uint32_t>(imagePacket.size()), true, m_vif1PendingPath2DirectHl);
-
+            const uint32_t chunkQw = std::min<uint32_t>(s_vif1DirectRemainQwc, availableQw);
+            feedVif1Path2(*this, data + pos, chunkQw, s_vif1DirectRemainHl);
             pos += chunkQw * 16u;
-            m_vif1PendingPath2ImageQwc -= chunkQw;
-            if (m_vif1PendingPath2ImageQwc == 0u)
-            {
-                m_vif1PendingPath2DirectHl = false;
-            }
+            s_vif1DirectRemainQwc -= chunkQw;
+            if (s_vif1DirectRemainQwc == 0u)
+                s_vif1DirectRemainHl = false;
             continue;
         }
 
@@ -492,21 +543,16 @@ void PS2Memory::processVIF1Data(const uint8_t *data, uint32_t sizeBytes)
                 qwCount = 65536;
             const uint32_t availableQw = (sizeBytes - pos) / 16u;
             const bool truncated = qwCount > availableQw;
-            if (qwCount > availableQw)
+            const bool directHl = (opcode == VIF_DIRECTHL);
+            if (truncated)
+            {
+                s_vif1DirectRemainQwc = qwCount - availableQw;
+                s_vif1DirectRemainHl = directHl;
                 qwCount = availableQw;
+            }
 
             if (qwCount > 0)
-            {
-                const bool directHl = (opcode == VIF_DIRECTHL);
-                submitGifPacket(GifPathId::Path2, data + pos, qwCount * 16, true, directHl);
-
-                const uint32_t pendingImageQw = pendingGifImageQwc(data + pos, qwCount * 16u);
-                if (pendingImageQw != 0u)
-                {
-                    m_vif1PendingPath2ImageQwc = pendingImageQw;
-                    m_vif1PendingPath2DirectHl = directHl;
-                }
-            }
+                feedVif1Path2(*this, data + pos, qwCount, directHl);
 
             pos += qwCount * 16;
             if (truncated)
@@ -708,6 +754,37 @@ void PS2Memory::processVIF1Data(const uint8_t *data, uint32_t sizeBytes)
                     else
                     {
                         handledFormat = false;
+                    }
+
+                    // Lanes a V2/V3 unpack has no data for are still written on hardware (PCSX2
+                    // Vif_Unpack.cpp): V2 writes x,y,x,y, and V3 uses the V4 path, so W receives the
+                    // next source element. Games rely on this, e.g. adding STROW 1.0f to the
+                    // duplicated U in offset mode to get Q = 1.0.
+                    if (handledFormat && vl != 3u)
+                    {
+                        if (components == 2)
+                        {
+                            decompressed[2] = decompressed[0];
+                            decompressed[3] = decompressed[1];
+                        }
+                        else if (components == 3)
+                        {
+                            const uint32_t elemBytes = static_cast<uint32_t>(bitsPerComponent) / 8u;
+                            const uint8_t *next = srcVec + 3u * elemBytes;
+                            if (next + elemBytes <= data + sizeBytes)
+                            {
+                                if (vl == 0u)
+                                    std::memcpy(&decompressed[3], next, sizeof(uint32_t));
+                                else if (vl == 1u)
+                                {
+                                    uint16_t raw = 0;
+                                    std::memcpy(&raw, next, sizeof(raw));
+                                    decompressed[3] = extend16(raw);
+                                }
+                                else
+                                    decompressed[3] = extend8(*next);
+                            }
+                        }
                     }
 
                     // Unknown compressed format fallback: preserve legacy raw-copy behavior.

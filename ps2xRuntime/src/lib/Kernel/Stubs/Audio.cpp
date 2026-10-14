@@ -1,10 +1,14 @@
 #include "Common.h"
 #include "Audio.h"
+#include "Syscalls/Helpers/State.h"
+#include "../../ps2_iop_transport.h"
 
 namespace ps2_stubs
 {
     namespace
     {
+        constexpr uint32_t kSdrRpcSid = 0x80000701u;
+        constexpr uint32_t kLibSdCmdInit = 0x8000u;
         constexpr uint32_t kLibSdCmdSetParam = 0x8010u;
         constexpr uint32_t kLibSdCmdVoiceTrans = 0x80D0u;
         constexpr uint32_t kLibSdCmdBlockTrans = 0x80E0u;
@@ -61,6 +65,38 @@ namespace ps2_stubs
             const uint32_t bank = (transfer.loop && halfSize != 0u && transfer.offset >= halfSize) ? 1u : 0u;
             return (bank << 24u) | position;
         }
+
+        // Bridge: sceSdRemote is handled natively here, but IOP modules that call LIBSD directly
+        // (e.g. a game's own sound driver using MODHSYN) still need the real LIBSD initialised,
+        // which on hardware happens when SDRDRV services rSdInit. Forward the init command to the
+        // IOP with the libsdr packet layout (function = command, args from word 1, 16-byte reply).
+        // A guest-registered SDRDRV server takes it; otherwise the HLE libsd service absorbs it.
+        void forwardSdInitToIop(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime, uint32_t flag)
+        {
+            if (!runtime || !rdram || kRpcPacketPoolCount == 0u)
+                return;
+            // Same slot rotation as the SIF RPC code (g_rpc_packet_index is shared), so these
+            // packets never alias an in-flight RPC packet.
+            const auto allocPacket = [rdram]()
+            {
+                const uint32_t slot = g_rpc_packet_index++ % kRpcPacketPoolCount;
+                const uint32_t addr = kRpcPacketPoolBase + slot * kRpcPacketSize;
+                std::memset(getMemPtr(rdram, addr), 0, kRpcPacketSize);
+                return addr;
+            };
+            const uint32_t sendAddr = allocPacket();
+            const uint32_t receiveAddr = allocPacket();
+            const uint32_t args[2] = {0u, flag};
+            std::memcpy(getMemPtr(rdram, sendAddr), args, sizeof(args));
+
+            ps2x::iop::RpcRequest request{};
+            request.sid = kSdrRpcSid;
+            request.function = kLibSdCmdInit;
+            request.mode = 0u;
+            request.send = {sendAddr, kRpcPacketSize};
+            request.receive = {receiveAddr, 16u};
+            (void)PS2IopTransport::handleRpc(runtime, rdram, ctx, request);
+        }
     }
 
     void resetAudioStubState()
@@ -76,8 +112,6 @@ namespace ps2_stubs
 
     void sceSdRemote(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
     {
-        (void)runtime;
-
         const uint32_t cmd = getRegU32(ctx, 5);
         const uint32_t cmdArg0 = getRegU32(ctx, 6);
         const uint32_t cmdArg1 = getRegU32(ctx, 7);
@@ -91,6 +125,11 @@ namespace ps2_stubs
         const uint32_t arg4 = (arg4Reg != 0u) ? arg4Reg : arg4Stk;
         const uint32_t arg5 = (arg5Reg != 0u) ? arg5Reg : arg5Stk;
         const uint32_t arg6 = (arg6Reg != 0u) ? arg6Reg : arg6Stk;
+
+        if (cmd == kLibSdCmdInit)
+        {
+            forwardSdInitToIop(rdram, ctx, runtime, cmdArg0);
+        }
 
         std::lock_guard<std::mutex> lock(g_audio_stub_mutex);
         g_audio_stub_state.initialized = true;

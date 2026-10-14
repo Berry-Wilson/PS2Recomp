@@ -1,4 +1,6 @@
 #include "runtime/ps2_memory.h"
+
+void resetVif1DirectContinuation(); // defined in ps2_vif1_interpreter.cpp
 #include "runtime/ps2_address.h"
 #include "runtime/gs/gs_frontend.h"
 #include "ps2_log.h"
@@ -207,7 +209,8 @@ namespace
         out.qwc = static_cast<uint16_t>(tag & 0xFFFFu);
         out.id = static_cast<uint8_t>((tag >> 28u) & 0x7u);
         out.irq = ((tag >> 31u) & 0x1ull) != 0ull;
-        out.addr = static_cast<uint32_t>((tag >> 32u) & 0x7FFFFFFFu);
+        // Bit 63 (SPR) stays as bit 31 of the address so scratchpad sources resolve to SPR.
+        out.addr = static_cast<uint32_t>(tag >> 32u);
         out.upper = static_cast<uint32_t>((tag >> 16u) & 0xFFFFu);
         return out;
     }
@@ -331,6 +334,7 @@ bool PS2Memory::initialize(size_t ramSize)
     m_path3MaskedFifo.clear();
     m_vif1PendingPath2ImageQwc = 0u;
     m_vif1PendingPath2DirectHl = false;
+    resetVif1DirectContinuation();
     resetEeTimers();
 
     try
@@ -1231,6 +1235,7 @@ bool PS2Memory::writeIORegister(uint32_t address, uint32_t value)
                 std::memset(&vif1_regs, 0, sizeof(vif1_regs));
                 m_vif1PendingPath2ImageQwc = 0u;
                 m_vif1PendingPath2DirectHl = false;
+                resetVif1DirectContinuation();
                 m_path3Masked = false;
                 if (wasPath3Masked)
                     flushMaskedPath3Packets();
@@ -1438,7 +1443,10 @@ bool PS2Memory::writeIORegister(uint32_t address, uint32_t value)
                         uint16_t tagQwc = static_cast<uint16_t>(tag & 0xFFFF);
                         uint32_t id = static_cast<uint32_t>((tag >> 28) & 0x7);
                         const bool irq = ((tag >> 31) & 0x1ull) != 0ull;
-                        uint32_t addr = static_cast<uint32_t>((tag >> 32) & 0x7FFFFFFF);
+                        // ADDR is bits 32..62 and bit 63 is the SPR flag. Keep it as bit 31 of
+                        // the address (MADR convention) so isScratchpad() routes scratchpad
+                        // display lists and tags to SPR instead of the same offset in RDRAM.
+                        uint32_t addr = static_cast<uint32_t>(tag >> 32);
                         lastTagUpper = static_cast<uint32_t>((tag >> 16) & 0xFFFFu);
                         ++tagsProcessed;
 

@@ -174,6 +174,8 @@ void EeScheduler::run()
                 publishIdleDebugContext();
                 publishSnapshot();
                 waitForEvent();
+                // A polling thread re-checks its condition once time has moved on.
+                wakeSpinWaiters();
                 continue;
             }
             if (next)
@@ -376,8 +378,13 @@ bool EeScheduler::checkpointDue(uint32_t cycles) noexcept
         return false;
     }
 
+    // The EE kernel never time-slices between threads of equal priority: a thread keeps the CPU
+    // until it blocks, rotates the ready queue, or a strictly higher-priority thread is ready.
+    // Round-robining equal priorities reorders game start-up code (dot hack's title camera was
+    // applied to the wrong view because ccThDtMenu ran in the middle of ccThDemo's setup).
     const GuestThread *running = currentThread();
-    if (running != nullptr && hasReadyAtOrAbovePriority(running->currentPriority))
+    if (running != nullptr && running->currentPriority > 0 &&
+        hasReadyAtOrAbovePriority(running->currentPriority - 1))
     {
         m_rescheduleRequested = true;
         m_timeSliceExpired = true;
@@ -574,7 +581,13 @@ int EeScheduler::suspendThread(int id, bool interruptSafe)
         return KE_DORMANT;
     }
 
-    ++target->suspendCount;
+    // EE kernel suspension does not nest (ee_thread_status_t has no suspend count): a thread is
+    // either suspended or not, and one ResumeThread undoes any number of SuspendThread calls.
+    // Games rely on this, e.g. suspending a stream reader every lap but resuming it once.
+    if (target->suspendCount == 0)
+    {
+        target->suspendCount = 1;
+    }
     switch (target->status)
     {
     case EeThreadStatus::Running:
@@ -757,6 +770,15 @@ int EeScheduler::rotateReadyQueue(int priority, bool interruptSafe)
     GuestThread *self = currentThread();
     if (self && self->currentPriority == priority)
     {
+        // With no other thread ready at this priority or above, rotating is a no-op on the EE
+        // and the caller just keeps polling at full speed until an interrupt changes something.
+        // Round-tripping through the scheduler here would charge only a few cycles per lap and
+        // starve VBlank/timer progress, so keep the CPU until the next event instead.
+        if (!interruptSafe && !hasReadyAtOrAbovePriority(priority))
+        {
+            setReturnS32(&self->activeContext(), KE_OK);
+            spinUntilNextEvent();
+        }
         enqueueReady(*self);
         m_currentThreadId = 0;
         m_rescheduleRequested = true;
@@ -1328,6 +1350,41 @@ uint32_t EeScheduler::setGsVSyncCallback(uint32_t callback, uint32_t gp, uint32_
         std::move(completion)});
 }
 
+[[noreturn]] void EeScheduler::waitVSyncBusy(uint64_t afterTick, int fixedResult)
+{
+    blockCurrent(EeWaitState{
+        EeWaitReason::VSync,
+        EeVSyncWait{afterTick, fixedResult, true},
+        {}});
+}
+
+[[noreturn]] void EeScheduler::spinUntilNextEvent()
+{
+    // afterTick never elapses, so completeVSync leaves it alone; wakeSpinWaiters ends it.
+    blockCurrent(EeWaitState{
+        EeWaitReason::VSync,
+        EeVSyncWait{std::numeric_limits<uint64_t>::max(), KE_OK, true, true},
+        {}});
+}
+
+void EeScheduler::wakeSpinWaiters()
+{
+    std::vector<int> spinners;
+    for (const auto &[id, candidate] : m_threads)
+    {
+        if ((candidate.status == EeThreadStatus::Waiting || candidate.status == EeThreadStatus::WaitingSuspended) &&
+            candidate.wait.reason == EeWaitReason::VSync &&
+            std::get<EeVSyncWait>(candidate.wait.payload).spin)
+        {
+            spinners.push_back(id);
+        }
+    }
+    for (const int id : spinners)
+    {
+        makeReady(*thread(id), KE_OK, false);
+    }
+}
+
 void EeScheduler::completeVSync(uint64_t tick)
 {
     assertExecutor();
@@ -1613,8 +1670,24 @@ void EeScheduler::removeReady(GuestThread &item)
 
 GuestThread *EeScheduler::selectReady()
 {
-    for (auto &queue : m_readyQueues)
+    // A thread busy-polling for VBlank keeps the EE: nothing at its priority or below may run.
+    // With no eligible thread the scheduler idles until the next event, which also paces the
+    // VBlank against host time instead of against a lower-priority spin loop.
+    // Only a waiter that is not suspended holds the CPU: a suspended poller is not running.
+    int busyCeiling = kPriorityCount;
+    for (const auto &[id, candidate] : m_threads)
     {
+        if (candidate.status == EeThreadStatus::Waiting &&
+            candidate.wait.reason == EeWaitReason::VSync &&
+            std::get<EeVSyncWait>(candidate.wait.payload).busy)
+        {
+            busyCeiling = std::min(busyCeiling, candidate.currentPriority);
+        }
+    }
+
+    for (int priority = 0; priority < busyCeiling; ++priority)
+    {
+        auto &queue = m_readyQueues[static_cast<size_t>(priority)];
         if (queue.empty())
         {
             continue;

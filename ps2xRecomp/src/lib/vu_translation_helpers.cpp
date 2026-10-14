@@ -113,12 +113,22 @@ namespace ps2recomp
 
     std::string CodeGenerator::translateVU_VILWR(const Instruction &inst)
     {
-        return fmt::format("{{ uint32_t addr = (uint32_t)(ctx->vi[{}] << 2) & 0x3FFC; ctx->vi[{}] = static_cast<uint16_t>(READ32(addr)); }}", inst.rd, inst.rt); // VILWR.<f> vit, (vis)
+        // Macro-mode VILWR reads VU0 data memory: qword address vis, word selected by the dest field.
+        const uint8_t dest_mask = inst.vectorInfo.vectorField;
+        const uint32_t fieldOffset = (dest_mask & 0x8) ? 0u : (dest_mask & 0x4) ? 4u : (dest_mask & 0x2) ? 8u : 12u;
+        return fmt::format("{{ " "uint8_t *vu0m = runtime->memory().getVU0Data(); " "uint32_t off = (((uint32_t)ctx->vi[{}] & 0xFFu) << 4) + {}u; "
+                           "uint16_t v; std::memcpy(&v, vu0m + off, sizeof(v)); ctx->vi[{}] = v; }}",
+                           inst.rd, fieldOffset, inst.rt); // VILWR.<f> vit, (vis)
     }
 
     std::string CodeGenerator::translateVU_VISWR(const Instruction &inst)
     {
-        return fmt::format("{{ uint32_t addr = (uint32_t)(ctx->vi[{}] << 2) & 0x3FFC; WRITE32(addr, (uint32_t)ctx->vi[{}]); }}", inst.rd, inst.rt); // VISWR.<f> vit, (vis)
+        // Macro-mode VISWR writes the zero-extended 16-bit vit into VU0 data memory.
+        const uint8_t dest_mask = inst.vectorInfo.vectorField;
+        const uint32_t fieldOffset = (dest_mask & 0x8) ? 0u : (dest_mask & 0x4) ? 4u : (dest_mask & 0x2) ? 8u : 12u;
+        return fmt::format("{{ " "uint8_t *vu0m = runtime->memory().getVU0Data(); " "uint32_t off = (((uint32_t)ctx->vi[{}] & 0xFFu) << 4) + {}u; "
+                           "uint32_t v = (uint32_t)(uint16_t)ctx->vi[{}]; std::memcpy(vu0m + off, &v, sizeof(v)); }}",
+                           inst.rd, fieldOffset, inst.rt); // VISWR.<f> vit, (vis)
     }
 
     std::string CodeGenerator::translateVU_VIADD(const Instruction &inst)
@@ -767,13 +777,13 @@ namespace ps2recomp
 
     std::string CodeGenerator::translateVU_VLQI(const Instruction &inst)
     {
+        // Macro-mode VLQI loads from VU0 data memory, then post-increments vis.
         uint8_t vis = inst.rd;
         uint8_t dest_mask = inst.vectorInfo.vectorField;
-        return fmt::format("{{ uint32_t addr = ((uint32_t)(ctx->vi[{}] & 0x3FF)) << 4; "
-                           "__m128 res = _mm_castsi128_ps(READ128(addr)); "
+        return fmt::format("{{ " "uint8_t *vu0m = runtime->memory().getVU0Data(); " "uint32_t off = ((uint32_t)ctx->vi[{}] & 0xFFu) << 4; "
+                           "__m128 res = _mm_loadu_ps(reinterpret_cast<const float *>(vu0m + off)); "
                            "__m128i mask = _mm_set_epi32({}, {}, {}, {}); "
-                           "ctx->vu0_vf[{}] = _mm_blendv_ps(ctx->vu0_vf[{}], res, _mm_castsi128_ps(mask)); "
-                           "ctx->vi[{}] = (ctx->vi[{}] + 1) & 0x3FF; }}",
+                           "ctx->vu0_vf[{}] = _mm_blendv_ps(ctx->vu0_vf[{}], res, _mm_castsi128_ps(mask)); ctx->vi[{}] = (ctx->vi[{}] + 1) & 0x3FF; }}",
                            vis,
                            (dest_mask & 0x1) ? -1 : 0, (dest_mask & 0x2) ? -1 : 0,
                            (dest_mask & 0x4) ? -1 : 0, (dest_mask & 0x8) ? -1 : 0,
@@ -783,15 +793,16 @@ namespace ps2recomp
 
     std::string CodeGenerator::translateVU_VSQI(const Instruction &inst)
     {
-        uint8_t vis = inst.rd;
+        // Macro-mode VSQI stores to VU0 data memory, then post-increments vit.
+        // Stores: fs (inst.rd) is the source vf, ft (inst.rt) the address/increment vi.
+        uint8_t vis = inst.rt;
         uint8_t dest_mask = inst.vectorInfo.vectorField;
-        return fmt::format("{{ uint32_t addr = ((uint32_t)(ctx->vi[{}] & 0x3FF)) << 4; "
-                           "__m128i old_val = READ128(addr); "
-                           "__m128 res = _mm_blendv_ps(_mm_castsi128_ps(old_val), ctx->vu0_vf[{}], _mm_castsi128_ps(_mm_set_epi32({}, {}, {}, {}))); "
-                           "WRITE128(addr, _mm_castps_si128(res)); "
-                           "ctx->vi[{}] = (ctx->vi[{}] + 1) & 0x3FF; }}",
+        return fmt::format("{{ " "uint8_t *vu0m = runtime->memory().getVU0Data(); " "uint32_t off = ((uint32_t)ctx->vi[{}] & 0xFFu) << 4; "
+                           "__m128 old_val = _mm_loadu_ps(reinterpret_cast<const float *>(vu0m + off)); "
+                           "__m128 res = _mm_blendv_ps(old_val, ctx->vu0_vf[{}], _mm_castsi128_ps(_mm_set_epi32({}, {}, {}, {}))); "
+                           "_mm_storeu_ps(reinterpret_cast<float *>(vu0m + off), res); ctx->vi[{}] = (ctx->vi[{}] + 1) & 0x3FF; }}",
                            vis,
-                           inst.rt,
+                           inst.rd,
                            (dest_mask & 0x1) ? -1 : 0, (dest_mask & 0x2) ? -1 : 0,
                            (dest_mask & 0x4) ? -1 : 0, (dest_mask & 0x8) ? -1 : 0,
                            vis, vis);
@@ -799,11 +810,11 @@ namespace ps2recomp
 
     std::string CodeGenerator::translateVU_VLQD(const Instruction &inst)
     {
+        // Macro-mode VLQD pre-decrements vis, then loads from VU0 data memory.
         uint8_t vis = inst.rd;
         uint8_t dest_mask = inst.vectorInfo.vectorField;
-        return fmt::format("{{ ctx->vi[{}] = (ctx->vi[{}] - 1) & 0x3FF; "
-                           "uint32_t addr = ((uint32_t)(ctx->vi[{}] & 0x3FF)) << 4; "
-                           "__m128 res = _mm_castsi128_ps(READ128(addr)); "
+        return fmt::format("{{ ctx->vi[{}] = (ctx->vi[{}] - 1) & 0x3FF; " "uint8_t *vu0m = runtime->memory().getVU0Data(); " "uint32_t off = ((uint32_t)ctx->vi[{}] & 0xFFu) << 4; "
+                           "__m128 res = _mm_loadu_ps(reinterpret_cast<const float *>(vu0m + off)); "
                            "__m128i mask = _mm_set_epi32({}, {}, {}, {}); "
                            "ctx->vu0_vf[{}] = _mm_blendv_ps(ctx->vu0_vf[{}], res, _mm_castsi128_ps(mask)); }}",
                            vis, vis,
@@ -815,16 +826,17 @@ namespace ps2recomp
 
     std::string CodeGenerator::translateVU_VSQD(const Instruction &inst)
     {
-        uint8_t vis = inst.rd;
+        // Macro-mode VSQD pre-decrements vit, then stores to VU0 data memory.
+        // Stores: fs (inst.rd) is the source vf, ft (inst.rt) the address/increment vi.
+        uint8_t vis = inst.rt;
         uint8_t dest_mask = inst.vectorInfo.vectorField;
-        return fmt::format("{{ ctx->vi[{}] = (ctx->vi[{}] - 1) & 0x3FF; "
-                           "uint32_t addr = ((uint32_t)(ctx->vi[{}] & 0x3FF)) << 4; "
-                           "__m128i old_val = READ128(addr); "
-                           "__m128 res = _mm_blendv_ps(_mm_castsi128_ps(old_val), ctx->vu0_vf[{}], _mm_castsi128_ps(_mm_set_epi32({}, {}, {}, {}))); "
-                           "WRITE128(addr, _mm_castps_si128(res)); }}",
+        return fmt::format("{{ ctx->vi[{}] = (ctx->vi[{}] - 1) & 0x3FF; " "uint8_t *vu0m = runtime->memory().getVU0Data(); " "uint32_t off = ((uint32_t)ctx->vi[{}] & 0xFFu) << 4; "
+                           "__m128 old_val = _mm_loadu_ps(reinterpret_cast<const float *>(vu0m + off)); "
+                           "__m128 res = _mm_blendv_ps(old_val, ctx->vu0_vf[{}], _mm_castsi128_ps(_mm_set_epi32({}, {}, {}, {}))); "
+                           "_mm_storeu_ps(reinterpret_cast<float *>(vu0m + off), res); }}",
                            vis, vis,
                            vis,
-                           inst.rt,
+                           inst.rd,
                            (dest_mask & 0x1) ? -1 : 0, (dest_mask & 0x2) ? -1 : 0,
                            (dest_mask & 0x4) ? -1 : 0, (dest_mask & 0x8) ? -1 : 0);
     }

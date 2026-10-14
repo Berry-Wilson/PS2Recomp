@@ -78,7 +78,8 @@ namespace ps2_syscalls
     void WaitVSyncTick(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime, int fixedResult)
     {
         EeScheduler &ee = scheduler(rdram, ctx, runtime);
-        ee.waitVSync(ee.currentVSyncTick(), fixedResult);
+        // Only sceGsSyncV calls this; libgraph polls CSR.VSINT, so the caller keeps the CPU.
+        ee.waitVSyncBusy(ee.currentVSyncTick(), fixedResult);
     }
 
     void SetVSyncFlag(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)

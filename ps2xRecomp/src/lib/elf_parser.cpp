@@ -1227,6 +1227,11 @@ namespace
                 const uint32_t upperValue = IMMEDIATE(upperRaw) << 16;
                 const uint32_t initialAliases = 1u << upperReg;
 
+                // Regions are only bounded by known starts; when those are sparse (code reached
+                // through function pointers) a region can span hundreds of KB and the per-LUI
+                // (offset, aliases) state space explodes. Bound the walk like the reachability scan.
+                constexpr size_t kMaterializedStateSafetyBudget = 4096;
+
                 std::vector<TrackedGprState> worklist;
                 std::unordered_set<uint64_t> visited;
                 auto enqueue = [&](uint32_t nextOffset, uint32_t aliases)
@@ -1280,7 +1285,7 @@ namespace
                     enqueue(offset + MIPS_INSTRUCTION_SIZE, initialAliases);
                 }
 
-                while (!worklist.empty())
+                while (!worklist.empty() && visited.size() < kMaterializedStateSafetyBudget)
                 {
                     const TrackedGprState state = worklist.back();
                     worklist.pop_back();
@@ -1646,6 +1651,16 @@ namespace
                 {
                     starts.insert(target);
                 }
+            }
+        }
+
+        // Unstripped ELFs: symbol-table function starts are real boundaries and keep the
+        // materialized-address regions below small.
+        for (const auto &symbol : parser->extractSymbols())
+        {
+            if (symbol.isFunction && !symbol.isImported && FindCodeSectionByAddress(sections, symbol.address))
+            {
+                starts.insert(symbol.address);
             }
         }
 

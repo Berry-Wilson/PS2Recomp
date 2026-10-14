@@ -1263,6 +1263,11 @@ namespace ps2_stubs
         }
         else
         {
+            // Complete queued transfers first, as the blocking mode does. Otherwise a DMA kicked
+            // from a VBlank handler (e.g. a movie frame upload) can read as busy forever, since
+            // nothing else necessarily drains the queue between the handler's polls.
+            mem.processPendingTransfers();
+
             uint32_t result = 0;
 
             if ((mem.readIORegister(0x10009000) & 0x100) != 0)

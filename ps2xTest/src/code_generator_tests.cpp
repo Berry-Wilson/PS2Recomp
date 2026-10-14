@@ -1464,6 +1464,31 @@ void register_code_generator_tests()
             t.IsTrue(out.find("ctx->vi[20]") == std::string::npos, "S2 VLQI must not use rs(format) as VI index");
         });
 
+        tc.Run("VU0 S2 VSQI stores fs (rd) to VU0 memory at ft (rt)", [](TestCase &t) {
+            // vsqi.xyzw $vf0, ($vi1++): fs = vf0 (rd), ft = vi1 (rt). The address and increment
+            // register is vi1; vi0 is hardwired zero and must never be written.
+            Instruction inst{};
+            inst.opcode = OPCODE_COP2;
+            inst.rs = COP2_CO | 0x4;
+            inst.rt = 1;
+            inst.rd = 0;
+            inst.function = 0x3C;
+            inst.vectorInfo.vectorField = 0xF;
+
+            uint32_t upper = (VU0_S2_VSQI >> 2) & 0x1F;
+            uint32_t lower = VU0_S2_VSQI & 0x3;
+            inst.raw = (upper << 6) | lower;
+
+            CodeGenerator gen({}, {});
+            std::string out = gen.translateInstruction(inst);
+
+            t.IsTrue(out.find("ctx->vi[1] & 0xFFu") != std::string::npos, "VSQI address should come from ft (rt)");
+            t.IsTrue(out.find("ctx->vu0_vf[0]") != std::string::npos, "VSQI source VF should come from fs (rd)");
+            t.IsTrue(out.find("ctx->vi[0] =") == std::string::npos, "VSQI must not increment vi0");
+            t.IsTrue(out.find("getVU0Data()") != std::string::npos, "VSQI should access VU0 data memory");
+            t.IsTrue(out.find("WRITE128") == std::string::npos, "VSQI must not write EE RAM");
+        });
+
         tc.Run("JAL to known function emits call and check", [](TestCase &t) {
             Function func;
             func.name = "jal_test";

@@ -60,6 +60,12 @@ struct EeVSyncWait
 {
     uint64_t afterTick = 0;
     int fixedResult = -1;
+    // Busy waits model guest code that polls for VBlank (e.g. libgraph sceGsSyncV): the waiter
+    // keeps the CPU, so threads of its priority or lower cannot run until the wait completes.
+    bool busy = false;
+    // Spin waits (busy) model a thread polling in a loop with nothing else to run at its
+    // priority; they end after the scheduler's next idle wait instead of at a VBlank tick.
+    bool spin = false;
 };
 
 struct EeExternalWait
@@ -337,6 +343,12 @@ public:
     uint32_t setGsVSyncCallback(uint32_t callback, uint32_t gp, uint32_t sp);
 
     [[noreturn]] void waitVSync(uint64_t afterTick, int fixedResult = -1, std::function<void(R5900Context &)> completion = {});
+    // VBlank wait for guest code that busy-polls on hardware: lower/equal priority threads stay
+    // off the CPU until it completes (see EeVSyncWait::busy).
+    [[noreturn]] void waitVSyncBusy(uint64_t afterTick, int fixedResult = -1);
+    // The current thread keeps the CPU (as in a polling loop) until the next scheduler event;
+    // returns KE_OK to the guest when it resumes.
+    [[noreturn]] void spinUntilNextEvent();
     void completeVSync(uint64_t tick);
     void completeExternalWait(uint32_t type, uint64_t token, int result);
     [[noreturn]] void waitExternal(EeWaitReason reason, uint32_t type, uint64_t token, std::function<void(R5900Context &)> completion = {});
@@ -393,6 +405,7 @@ private:
     void scheduleEvent(uint64_t deadlineCycle, std::chrono::steady_clock::time_point hostDeadline, EeEvent event);
     void updateNextDeadline();
     [[nodiscard]] bool hasReadyAtOrAbovePriority(int priority) const;
+    void wakeSpinWaiters();
     void renewTimeSlice();
     void copyMainContextToRuntime();
     void publishDebugContext(const R5900Context &context);

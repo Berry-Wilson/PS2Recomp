@@ -250,17 +250,12 @@ namespace ps2x::iop::detail
         if ((address != kDmaSpu0Chcr && address != kDmaSpu1Chcr) || (value & kDmaStart) == 0u)
             return;
 
+        // CHCR.start stays set for the life of the transfer (drivers such as LIBSD read CHCR back
+        // right after starting it) and the core's STATX DMA-ready bit (0x80) drops until it ends;
+        // completeSpuDma restores both when the completion interrupt is delivered. LIBSD's DMA
+        // interrupt handler spins until STATX.0x80 is set before signalling the transfer done.
         const bool secondCore = address == kDmaSpu1Chcr;
-        m_hardware[address] = value & ~kDmaStart;
-
-        const uint32_t statusAddress = 0x1F900344u + (secondCore ? 0x400u : 0u);
-        const uint32_t alignedStatus = statusAddress & ~3u;
-        const uint32_t shift = (statusAddress & 2u) * 8u;
-        uint32_t status = 0u;
-        if (const auto current = m_hardware.find(alignedStatus); current != m_hardware.end())
-            status = current->second;
-        status |= 0x80u << shift;
-        m_hardware[alignedStatus] = status;
+        setSpuDmaReady(secondCore, false);
 
         const uint32_t blockControlAddress = address - sizeof(uint32_t);
         uint32_t blockControl = 0u;
@@ -273,6 +268,32 @@ namespace ps2x::iop::detail
             secondCore ? kDmaSpu1Irq : kDmaSpu0Irq,
             std::max<uint64_t>(transferWords * 2u, 64u),
         };
+    }
+
+    void IopMemory::setSpuDmaReady(bool secondCore, bool ready)
+    {
+        const uint32_t statusAddress = 0x1F900344u + (secondCore ? 0x400u : 0u);
+        const uint32_t alignedStatus = statusAddress & ~3u;
+        const uint32_t shift = (statusAddress & 2u) * 8u;
+        uint32_t status = 0u;
+        if (const auto current = m_hardware.find(alignedStatus); current != m_hardware.end())
+            status = current->second;
+        if (ready)
+            status |= 0x80u << shift;
+        else
+            status &= ~(0x80u << shift);
+        m_hardware[alignedStatus] = status;
+    }
+
+    void IopMemory::completeSpuDma(int irq)
+    {
+        if (irq != kDmaSpu0Irq && irq != kDmaSpu1Irq)
+            return;
+        const bool secondCore = irq == kDmaSpu1Irq;
+        const uint32_t chcr = secondCore ? kDmaSpu1Chcr : kDmaSpu0Chcr;
+        if (const auto current = m_hardware.find(chcr); current != m_hardware.end())
+            current->second &= ~kDmaStart;
+        setSpuDmaReady(secondCore, true);
     }
 
     std::optional<IopMemory::DmaStart> IopMemory::takeDmaStart() noexcept

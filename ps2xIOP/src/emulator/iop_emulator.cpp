@@ -280,9 +280,10 @@ namespace ps2x::iop::detail
             }
             if (iequals(call.library, "thevent"))
             {
-                return kernel.dispatchEventImport(call.ordinal, cpu)
-                           ? ImportDisposition::Handled
-                           : ImportDisposition::Missing;
+                if (!kernel.dispatchEventImport(call.ordinal, cpu))
+                    return ImportDisposition::Missing;
+                completeUnthreadedEventWait(call.ordinal, cpu);
+                return ImportDisposition::Handled;
             }
             if (iequals(call.library, "sifcmd"))
             {
@@ -480,6 +481,28 @@ namespace ps2x::iop::detail
             return callFunction(address, a0, a1, a2, a3, gp, instructionBudget);
         }
 
+        // WaitEventFlag reached outside a kernel thread (e.g. an RPC handler run through
+        // callFunction) cannot yield, so the kernel answers KE_EVF_COND at once. Drivers such as
+        // LIBSD's sceSdVoiceTransStatus ignore that and treat the transfer as finished. On hardware
+        // the caller would block until a DMA completion interrupt set the flag, so advance time to
+        // each pending DMA completion, deliver it, and retry until the wait is satisfied.
+        void completeUnthreadedEventWait(uint16_t ordinal, CpuState &cpu)
+        {
+            constexpr uint16_t kWaitEventFlag = 10u;
+            constexpr int32_t kKeEvfCond = -418;
+            while (ordinal == kWaitEventFlag && !cpu.yielded && !servicingDmaInterrupts &&
+                   static_cast<int32_t>(cpu.gpr[2]) == kKeEvfCond && !pendingDmaInterrupts.empty())
+            {
+                uint64_t nextCompletion = pendingDmaInterrupts.begin()->second;
+                for (const auto &[irq, completionCycle] : pendingDmaInterrupts)
+                    nextCompletion = std::min(nextCompletion, completionCycle);
+                totalCycles = std::max(totalCycles, nextCompletion);
+                servicePendingDmaInterrupts();
+                if (!kernel.dispatchEventImport(ordinal, cpu))
+                    break;
+            }
+        }
+
         // Not that good to use exception handling for control flow but will do for now
         void servicePendingDmaInterrupts()
         {
@@ -502,7 +525,10 @@ namespace ps2x::iop::detail
             try
             {
                 for (const int irq : completed)
+                {
+                    memory.completeSpuDma(irq);
                     (void)intrman.dispatchInterrupt(irq, *this);
+                }
             }
             catch (...)
             {

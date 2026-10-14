@@ -531,6 +531,45 @@ void register_ps2_memory_tests()
             t.Equals(sw, 0x00008001u, "zero-extend w");
         });
 
+        tc.Run("VIF UNPACK V2 writes xyxy and V3 writes the next element into W", [](TestCase &t)
+        {
+            PS2Memory mem;
+            t.IsTrue(mem.initialize(), "PS2Memory initialize should succeed");
+            std::memset(mem.getVU1Data(), 0xEE, PS2_VU1_DATA_SIZE);
+
+            // V2-16 unsigned in offset mode with ROW.z = 1.0f: hardware duplicates x,y into z,w,
+            // so z becomes u + 0x3F800000 (~1.0f). dot hack relies on this for its Q = 1.0 trick.
+            std::vector<uint8_t> packet;
+            appendU32(packet, makeVifCmd(0x30u, 0u, 0u)); // STROW
+            appendU32(packet, 0u);
+            appendU32(packet, 0u);
+            appendU32(packet, 0x3F800000u);
+            appendU32(packet, 0u);
+            appendU32(packet, makeVifCmd(0x05u, 0u, 1u));       // STMOD offset
+            appendU32(packet, makeVifCmd(0x65u, 1u, 0x4000u));  // UNPACK V2-16 unsigned, num=1, addr 0
+            appendU32(packet, 0x00FB0004u);                     // u=4, v=0xFB
+            appendU32(packet, makeVifCmd(0x05u, 0u, 0u));       // STMOD normal
+            appendU32(packet, makeVifCmd(0x68u, 1u, 1u));       // UNPACK V3-32, num=1, addr 1
+            appendU32(packet, 1u);
+            appendU32(packet, 2u);
+            appendU32(packet, 3u);
+            appendU32(packet, 0u); // next word in the stream (a NOP VIFcode)
+
+            mem.processVIF1Data(packet.data(), static_cast<uint32_t>(packet.size()));
+
+            const uint8_t *vu = mem.getVU1Data();
+            uint32_t v[8] = {};
+            std::memcpy(v, vu, sizeof(v));
+            t.Equals(v[0], 4u, "V2 x");
+            t.Equals(v[1], 0xFBu, "V2 y");
+            t.Equals(v[2], 0x3F800004u, "V2 z = x + ROW.z");
+            t.Equals(v[3], 0xFBu, "V2 w = y + ROW.w");
+            t.Equals(v[4], 1u, "V3 x");
+            t.Equals(v[5], 2u, "V3 y");
+            t.Equals(v[6], 3u, "V3 z");
+            t.Equals(v[7], 0u, "V3 w takes the following stream element");
+        });
+
         tc.Run("VIF UNPACK bit15 adds TOPS to destination address", [](TestCase &t)
         {
             PS2Memory mem;
@@ -2112,7 +2151,7 @@ void register_ps2_memory_tests()
             t.IsTrue(imageOk, "VIF1 DIRECT image should update GS VRAM through GIF path2");
         });
 
-        tc.Run("VIF1 DIRECT image tag can continue with raw image qwords", [](TestCase &t)
+        tc.Run("VIF1 DIRECT image tag continues in the next DIRECT payload", [](TestCase &t)
         {
             PS2Memory mem;
             t.IsTrue(mem.initialize(), "PS2Memory initialize should succeed");
@@ -2141,6 +2180,10 @@ void register_ps2_memory_tests()
             appendU32(packet, makeVifCmd(0x50u, 0u, 1u)); // DIRECT 1 QW payload: GIF IMAGE tag only.
             appendU64(packet, makeGifTag(1u, GIF_FMT_IMAGE, 0u, true));
             appendU64(packet, 0ull);
+            // The image data arrives with the next DIRECT(HL); the VIF still decodes the NOP and
+            // DIRECTHL codes in between (dot hack sends CLUTs this way via DMA tags with TTE).
+            appendU32(packet, makeVifCmd(0x00u, 0u, 0u));
+            appendU32(packet, makeVifCmd(0x51u, 0u, 1u));
             for (uint32_t i = 0; i < 16u; ++i)
             {
                 packet.push_back(static_cast<uint8_t>(0xA0u + i));
@@ -2162,7 +2205,7 @@ void register_ps2_memory_tests()
                     }
                 }
             }
-            t.IsTrue(imageOk, "raw qwords after a DIRECT image tag should continue the PATH2 image upload");
+            t.IsTrue(imageOk, "the next DIRECT payload should continue the PATH2 image upload, not the VIF codes before it");
         });
 
         tc.Run("VIF1 DIRECT finds an image continuation after packed setup", [](TestCase &t)
@@ -2194,6 +2237,7 @@ void register_ps2_memory_tests()
             appendU64(packet, GS_REG_TEXA);
             appendU64(packet, makeGifTag(1u, GIF_FMT_IMAGE, 0u, true));
             appendU64(packet, 0ull);
+            appendU32(packet, makeVifCmd(0x50u, 0u, 1u)); // image data in its own DIRECT
             for (uint32_t i = 0; i < 16u; ++i)
                 packet.push_back(static_cast<uint8_t>(0xC0u + i));
 
@@ -2214,6 +2258,53 @@ void register_ps2_memory_tests()
                 }
             }
             t.IsTrue(imageOk, "raw image continuation after packed setup should not be decoded as VIF/GIF registers");
+        });
+
+        tc.Run("VIF1 DIRECT payload split across two transfers continues raw", [](TestCase &t)
+        {
+            PS2Memory mem;
+            t.IsTrue(mem.initialize(), "PS2Memory initialize should succeed");
+
+            GS gs;
+            gs.init(mem.getGSVRAM(), static_cast<uint32_t>(PS2_GS_VRAM_SIZE), &mem.gs());
+            GifArbiter arbiter([&](const uint8_t *data, uint32_t sizeBytes)
+            {
+                gs.processGIFPacket(data, sizeBytes);
+            });
+            mem.setGifArbiter(&arbiter);
+
+            gs.writeRegister(GS_REG_BITBLTBUF, (1ull << 16) | (1ull << 48));
+            gs.writeRegister(GS_REG_TRXPOS, 0ull);
+            gs.writeRegister(GS_REG_TRXREG, (4ull << 0) | (1ull << 32));
+            gs.writeRegister(GS_REG_TRXDIR, 0ull);
+
+            // DIRECT 2: IMAGE tag + 1 QW of image, but only the tag arrives in the first transfer.
+            std::vector<uint8_t> first;
+            appendU32(first, makeVifCmd(0x50u, 0u, 2u));
+            appendU64(first, makeGifTag(1u, GIF_FMT_IMAGE, 0u, true));
+            appendU64(first, 0ull);
+            mem.processVIF1Data(first.data(), static_cast<uint32_t>(first.size()));
+
+            std::vector<uint8_t> second;
+            for (uint32_t i = 0; i < 16u; ++i)
+                second.push_back(static_cast<uint8_t>(0xE0u + i));
+            mem.processVIF1Data(second.data(), static_cast<uint32_t>(second.size()));
+
+            const uint8_t *vramOut = mem.getGSVRAM();
+            bool imageOk = true;
+            for (uint32_t x = 0; x < 4u && imageOk; ++x)
+            {
+                const uint32_t off = GSPSMCT32::addrPSMCT32(0u, 1u, x, 0u);
+                for (uint32_t c = 0; c < 4u; ++c)
+                {
+                    if (vramOut[off + c] != static_cast<uint8_t>(0xE0u + x * 4u + c))
+                    {
+                        imageOk = false;
+                        break;
+                    }
+                }
+            }
+            t.IsTrue(imageOk, "the remainder of a truncated DIRECT payload should continue the image");
         });
 
         tc.Run("unaligned accesses throw", [](TestCase &t)

@@ -90,7 +90,11 @@ namespace
     constexpr uint32_t kGuestHeapDefaultBase = 0x00100000u;
     constexpr uint32_t kGuestHeapDefaultAlignment = 16u;
     constexpr uint32_t kGuestHeapSafetyPad = 0x1000u;
-    constexpr uint32_t kGuestHeapHardLimit = 0x01F00000u;
+    // Explicitly configured heaps (SetupHeap) may run to the end of RAM; the runtime's own guest
+    // structures live in PS2_RUNTIME_RESERVED_BASE..END instead of the top of RAM.
+    constexpr uint32_t kGuestHeapHardLimit = PS2_RAM_SIZE;
+    // Limit used until the game configures its heap, leaving the top 1MB for an end-of-RAM stack.
+    constexpr uint32_t kGuestHeapDefaultLimit = 0x01F00000u;
 
     constexpr uint32_t COP0_CAUSE_EXCCODE_MASK = 0x0000007Cu;
     constexpr uint32_t COP0_CAUSE_BD = 0x80000000u;
@@ -373,6 +377,64 @@ namespace
     }
 }
 
+// Optional frame capture for debugging without watching the window:
+//   PS2X_FRAME_DUMP_DIR   folder to write frame_<n>_tick<vsync>.png into (dumping is off when unset)
+//   PS2X_FRAME_DUMP_EVERY save every Nth newly presented frame (default 60, ~1 per second)
+//   PS2X_FRAME_DUMP_MAX   stop after this many files (default 300)
+// Alpha is forced opaque in the saved copy since GS alpha (0..0x80) is not display opacity.
+static void dumpPresentedFrame(const std::vector<uint8_t> &rgba, uint32_t width, uint32_t height, uint64_t tick)
+{
+    static const std::string s_dir = []
+    {
+        const char *env = std::getenv("PS2X_FRAME_DUMP_DIR");
+        return std::string(env ? env : "");
+    }();
+    if (s_dir.empty() || width == 0u || height == 0u || rgba.size() < static_cast<size_t>(width) * height * 4u)
+    {
+        return;
+    }
+    static const uint32_t s_every = []
+    {
+        const char *env = std::getenv("PS2X_FRAME_DUMP_EVERY");
+        const long value = env ? std::strtol(env, nullptr, 10) : 60;
+        return static_cast<uint32_t>(value > 0 ? value : 60);
+    }();
+    static const uint32_t s_max = []
+    {
+        const char *env = std::getenv("PS2X_FRAME_DUMP_MAX");
+        const long value = env ? std::strtol(env, nullptr, 10) : 300;
+        return static_cast<uint32_t>(value > 0 ? value : 300);
+    }();
+    static uint32_t s_frameIndex = 0u;
+    static uint32_t s_written = 0u;
+    const uint32_t frameIndex = s_frameIndex++;
+    if (frameIndex % s_every != 0u || s_written >= s_max)
+    {
+        return;
+    }
+
+    std::error_code ec;
+    std::filesystem::create_directories(s_dir, ec);
+    std::vector<uint8_t> opaque(rgba.begin(), rgba.begin() + static_cast<std::ptrdiff_t>(width) * height * 4);
+    for (size_t i = 3; i < opaque.size(); i += 4)
+    {
+        opaque[i] = 0xFFu;
+    }
+    Image image{};
+    image.data = opaque.data();
+    image.width = static_cast<int>(width);
+    image.height = static_cast<int>(height);
+    image.mipmaps = 1;
+    image.format = PIXELFORMAT_UNCOMPRESSED_R8G8B8A8;
+    const std::string path = (std::filesystem::path(s_dir) /
+                              ("frame_" + std::to_string(frameIndex) + "_tick" + std::to_string(tick) + ".png"))
+                                 .string();
+    if (ExportImage(image, path.c_str()))
+    {
+        ++s_written;
+    }
+}
+
 static void UploadFrame(Texture2D &tex, PS2Runtime *rt, uint32_t &outWidth, uint32_t &outHeight)
 {
     static uint64_t s_lastPresentationTick = std::numeric_limits<uint64_t>::max();
@@ -444,6 +506,7 @@ static void UploadFrame(Texture2D &tex, PS2Runtime *rt, uint32_t &outWidth, uint
         }
         ++s_uploadDebugCount;
     });
+    dumpPresentedFrame(s_scratch, width, height, currentTick);
     s_lastDisplayFbp = displayFbp;
     s_lastSourceFbp = sourceFbp;
     s_lastPreferred = usedPreferredDisplaySource;
@@ -500,11 +563,11 @@ PS2Runtime::PS2Runtime()
     m_guestHeapBlocks.clear();
     m_guestHeapBase = kGuestHeapDefaultBase;
     m_guestHeapEnd = kGuestHeapDefaultBase;
-    m_guestHeapLimit = std::min(kGuestHeapHardLimit, PS2_RAM_SIZE);
+    m_guestHeapLimit = kGuestHeapDefaultLimit;
     m_guestHeapSuggestedBase = kGuestHeapDefaultBase;
     m_guestHeapConfigured = false;
-    m_asyncCallbackStackFloor = std::min(kGuestHeapHardLimit, PS2_RAM_SIZE);
-    m_asyncCallbackStackTop = PS2_RAM_SIZE;
+    m_asyncCallbackStackFloor = PS2_RUNTIME_CALLBACK_STACK_FLOOR;
+    m_asyncCallbackStackTop = PS2_RUNTIME_CALLBACK_STACK_TOP;
 }
 
 void PS2Runtime::setDebugUiCallbacks(DebugUiCallback initCallback,
@@ -962,18 +1025,16 @@ bool PS2Runtime::loadELF(const std::string &elfPath)
         std::lock_guard<std::mutex> lock(m_guestHeapMutex);
         if (!m_guestHeapConfigured)
         {
-            const uint32_t hardLimit = std::min(kGuestHeapHardLimit, PS2_RAM_SIZE);
-            m_guestHeapSuggestedBase = std::min(suggestedHeapBase, hardLimit);
+            m_guestHeapSuggestedBase = std::min(suggestedHeapBase, kGuestHeapDefaultLimit);
             m_guestHeapBase = m_guestHeapSuggestedBase;
             m_guestHeapEnd = m_guestHeapSuggestedBase;
-            m_guestHeapLimit = hardLimit;
+            m_guestHeapLimit = kGuestHeapDefaultLimit;
         }
     }
     {
         std::lock_guard<std::mutex> lock(m_asyncCallbackStackMutex);
-        const uint32_t hardLimit = std::min(kGuestHeapHardLimit, PS2_RAM_SIZE);
-        m_asyncCallbackStackFloor = std::min(std::max(hardLimit, suggestedHeapBase), PS2_RAM_SIZE);
-        m_asyncCallbackStackTop = PS2_RAM_SIZE;
+        m_asyncCallbackStackFloor = PS2_RUNTIME_CALLBACK_STACK_FLOOR;
+        m_asyncCallbackStackTop = PS2_RUNTIME_CALLBACK_STACK_TOP;
     }
 
     LoadedModule module;
@@ -1112,7 +1173,12 @@ bool PS2Runtime::registerFunction(uint32_t address, RecompiledFunction func)
 bool PS2Runtime::hasFunction(uint32_t address) const
 {
     uint32_t slot = 0u;
-    return generatedFunctionTableSlot(address, slot) && g_ps2RecompiledFunctionTable[slot] != nullptr;
+    if (generatedFunctionTableSlot(address, slot) && g_ps2RecompiledFunctionTable[slot] != nullptr)
+    {
+        return true;
+    }
+    return m_functionLookupFallback != nullptr &&
+           m_functionLookupFallback(const_cast<PS2Runtime &>(*this), address) != nullptr;
 }
 
 const char *describeGuestBranchKind(PS2Runtime::GuestBranchKind kind)
@@ -1143,6 +1209,14 @@ PS2Runtime::RecompiledFunction PS2Runtime::lookupFunction(uint32_t address)
     {
         RecompiledFunction fn = g_ps2RecompiledFunctionTable[slot];
         if (fn != nullptr)
+        {
+            return fn;
+        }
+    }
+
+    if (m_functionLookupFallback != nullptr)
+    {
+        if (RecompiledFunction fn = m_functionLookupFallback(*this, address))
         {
             return fn;
         }
@@ -1628,12 +1702,12 @@ uint32_t PS2Runtime::clampGuestHeapBase(uint32_t guestBase) const
 
 uint32_t PS2Runtime::clampGuestHeapLimit(uint32_t guestLimit) const
 {
-    const uint32_t hardLimit = std::min(kGuestHeapHardLimit, PS2_RAM_SIZE);
-    if (guestLimit == 0u || guestLimit > hardLimit)
+    if (guestLimit == 0u)
     {
-        return hardLimit;
+        return kGuestHeapDefaultLimit;
     }
-    return guestLimit;
+    const uint32_t hardLimit = std::min(kGuestHeapHardLimit, PS2_RAM_SIZE);
+    return std::min(guestLimit, hardLimit);
 }
 
 void PS2Runtime::resetGuestHeapLocked(uint32_t guestBase, uint32_t guestLimit)

@@ -26,6 +26,19 @@ class GS;
 constexpr uint32_t PS2_RAM_SIZE = 32u * 1024u * 1024u; // 32MB
 constexpr uint32_t PS2_RAM_MASK = PS2_RAM_SIZE - 1u;   // Mask for 32MB alignment
 constexpr uint32_t PS2_RAM_BASE = 0x00000000;          // Physical base of RDRAM
+
+// Guest RAM the runtime keeps for its own HLE structures (RPC/TLS pools, async callback stacks).
+// 0x80000-0x100000 sits between the mirrored EE kernel area (below 0x80000) and the 0x100000
+// load address retail ELFs use, so it never overlaps a game's image, heap or stacks. Games are
+// free to grow their heap/stack up to the end of RAM, as on hardware.
+constexpr uint32_t PS2_RUNTIME_RESERVED_BASE = 0x00080000u;
+constexpr uint32_t PS2_RUNTIME_RESERVED_END = 0x00100000u;
+constexpr uint32_t PS2_RUNTIME_RPC_PACKET_POOL_BASE = PS2_RUNTIME_RESERVED_BASE;          // 0x10000 bytes
+constexpr uint32_t PS2_RUNTIME_RPC_SERVER_POOL_BASE = PS2_RUNTIME_RESERVED_BASE + 0x10000u; // 0x10000 bytes
+constexpr uint32_t PS2_RUNTIME_TLS_POOL_BASE = PS2_RUNTIME_RESERVED_BASE + 0x20000u;        // 0x10000 bytes
+constexpr uint32_t PS2_RUNTIME_BOOT_MODE_POOL_BASE = PS2_RUNTIME_RESERVED_BASE + 0x30000u;  // 0x1000 bytes
+constexpr uint32_t PS2_RUNTIME_CALLBACK_STACK_FLOOR = PS2_RUNTIME_RESERVED_BASE + 0x31000u;
+constexpr uint32_t PS2_RUNTIME_CALLBACK_STACK_TOP = PS2_RUNTIME_RESERVED_END;
 constexpr uint32_t PS2_SCRATCHPAD_BASE = 0x70000000;
 constexpr uint32_t PS2_SCRATCHPAD_ALIAS_BASE = 0xF0000000;
 constexpr uint32_t PS2_SCRATCHPAD_SIZE = 16u * 1024u;  // 16KB

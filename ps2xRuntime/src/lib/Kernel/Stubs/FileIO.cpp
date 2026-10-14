@@ -8,24 +8,27 @@ namespace ps2_stubs
         TODO_NAMED("sceFsDbChk", rdram, ctx, runtime);
     }
 
+    // libkernel's file I/O serialises sceOpen/sceRead/... on its own semaphores. Those functions
+    // are serviced natively here (see sceFsInit/sceFsReset), so the semaphore helpers have
+    // nothing to guard and succeed without effect.
     void sceFsIntrSigSema(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
     {
-        TODO_NAMED("sceFsIntrSigSema", rdram, ctx, runtime);
+        setReturnS32(ctx, 0);
     }
 
     void sceFsSemExit(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
     {
-        TODO_NAMED("sceFsSemExit", rdram, ctx, runtime);
+        setReturnS32(ctx, 0);
     }
 
     void sceFsSemInit(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
     {
-        TODO_NAMED("sceFsSemInit", rdram, ctx, runtime);
+        setReturnS32(ctx, 0);
     }
 
     void sceFsSigSema(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
     {
-        TODO_NAMED("sceFsSigSema", rdram, ctx, runtime);
+        setReturnS32(ctx, 0);
     }
 
     void close(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)

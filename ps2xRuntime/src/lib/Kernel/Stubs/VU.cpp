@@ -699,10 +699,11 @@ namespace ps2_stubs
         float m0[16]{}, m1[16]{}, out[16]{};
         if (readVuMatrix4f(rdram, m0Addr, m0) && readVuMatrix4f(rdram, m1Addr, m1))
         {
-            // out = m0 * m1 (first source . second source), matching the
-            // file's mulVuMatrix(lhs,rhs)=lhs.rhs convention and the RotMatrix
-            // / ViewScreenMatrix siblings (first operand on the left).
-            mulVuMatrix(m0, m1, out);
+            // libvu0 loads the first source's rows into vf4-vf7 and, for each row r of the
+            // second source, writes vf4*r.x + vf5*r.y + vf6*r.z + vf7*r.w. So
+            // out = second . first (row-vector convention: apply m1, then m0), which is also
+            // what RotMatrixX/Y/Z rely on (MulMatrix(m0, rot, m1) == m1 . rot).
+            mulVuMatrix(m1, m0, out);
             (void)writeVuMatrix4f(rdram, dstAddr, out);
         }
         setReturnS32(ctx, 0);

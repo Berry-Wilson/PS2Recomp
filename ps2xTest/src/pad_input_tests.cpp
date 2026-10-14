@@ -354,6 +354,48 @@ void register_pad_input_tests()
             closePadPort(ctx, rdram);
         });
 
+        tc.Run("pressure mode reports DualShock 2 mode byte 0x79", [](TestCase &t)
+               {
+            std::vector<uint8_t> rdram(PS2_RAM_SIZE, 0);
+            R5900Context ctx;
+
+            ps2_stubs::scePadInit(rdram.data(), &ctx, nullptr);
+            openPadPort(ctx, rdram);
+
+            setRegU32(ctx, 4, 0u);
+            setRegU32(ctx, 5, 0u);
+            setRegU32(ctx, 6, 1);
+            setRegU32(ctx, 7, 3);
+            ps2_stubs::scePadSetMainMode(rdram.data(), &ctx, nullptr);
+            setRegU32(ctx, 4, 0u);
+            setRegU32(ctx, 5, 0u);
+            ps2_stubs::scePadGetState(rdram.data(), &ctx, nullptr);
+
+            setRegU32(ctx, 4, 0u);
+            setRegU32(ctx, 5, 0u);
+            ps2_stubs::scePadEnterPressMode(rdram.data(), &ctx, nullptr);
+            t.Equals(static_cast<uint32_t>(getRegU32(&ctx, 2)), static_cast<uint32_t>(1), "scePadEnterPressMode should succeed");
+            setRegU32(ctx, 4, 0u);
+            setRegU32(ctx, 5, 0u);
+            ps2_stubs::scePadGetState(rdram.data(), &ctx, nullptr);
+
+            // Games check the mode byte after entering pressure mode and retry until it reads 0x79.
+            runPadRead(ctx, rdram);
+            const uint8_t *data = rdram.data() + kPadDataAddr;
+            t.Equals(data[1], static_cast<uint8_t>(0x79), "mode byte should be 0x79 in pressure mode");
+
+            setRegU32(ctx, 4, 0u);
+            setRegU32(ctx, 5, 0u);
+            ps2_stubs::scePadExitPressMode(rdram.data(), &ctx, nullptr);
+            setRegU32(ctx, 4, 0u);
+            setRegU32(ctx, 5, 0u);
+            ps2_stubs::scePadGetState(rdram.data(), &ctx, nullptr);
+            runPadRead(ctx, rdram);
+            t.Equals(data[1], static_cast<uint8_t>(0x73), "mode byte should return to 0x73 after scePadExitPressMode");
+
+            closePadPort(ctx, rdram);
+        });
+
         tc.Run("pad setters return success", [](TestCase &t)
                {
             std::vector<uint8_t> rdram(PS2_RAM_SIZE, 0);

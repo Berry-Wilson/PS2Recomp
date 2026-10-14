@@ -489,24 +489,16 @@ namespace ps2_syscalls
         const uint32_t stackSize = stackSizeSigned > 0
                                        ? static_cast<uint32_t>(stackSizeSigned)
                                        : 0u;
+        uint32_t endOfRamStackBase = PS2_RAM_SIZE;
         if (stack == 0xFFFFFFFFu)
         {
-            if (stackSizeSigned > 0)
+            // Stack occupies [RAM_SIZE - size, RAM_SIZE); like the EE kernel, hand back an sp at
+            // the top so the stack grows down inside its region rather than into the heap below.
+            if (stackSizeSigned > 0 && static_cast<uint32_t>(stackSizeSigned) < PS2_RAM_SIZE)
             {
-                const uint32_t requestedSize = static_cast<uint32_t>(stackSizeSigned);
-                if (requestedSize < PS2_RAM_SIZE)
-                {
-                    sp = PS2_RAM_SIZE - requestedSize;
-                }
-                else
-                {
-                    sp = PS2_RAM_SIZE;
-                }
+                endOfRamStackBase = PS2_RAM_SIZE - static_cast<uint32_t>(stackSizeSigned);
             }
-            else
-            {
-                sp = PS2_RAM_SIZE;
-            }
+            sp = PS2_RAM_SIZE;
         }
         else if (stack != 0u)
         {
@@ -523,7 +515,7 @@ namespace ps2_syscalls
         sp &= ~0xFu;
         if (stack == 0xFFFFFFFFu)
         {
-            initialStack = sp;
+            initialStack = endOfRamStackBase;
         }
         else if (stack != 0u)
         {
@@ -542,19 +534,30 @@ namespace ps2_syscalls
 
         const uint32_t heapBase = (heapBaseRaw + 0xFu) & ~0xFu;
 
-        // Silent Hill and other games often pass -1 (0xFFFFFFFF) to mean "rest of RAM".
+        // Silent Hill and other games often pass -1 (0xFFFFFFFF) to mean "rest of RAM": on the EE
+        // that is everything up to the bottom of the main thread's stack (crt0 calls SetupThread
+        // first). Fall back to the old 0x01F00000 when no stack above the heap is known.
         static constexpr uint32_t kDefaultGuestHeapEnd = 0x01F00000u;
-        uint32_t heapLimit = kDefaultGuestHeapEnd;
+        uint32_t restOfRamEnd = kDefaultGuestHeapEnd;
+        if (runtime)
+        {
+            if (const GuestThread *self = runtime->eeScheduler().currentThread();
+                self != nullptr && self->stack > heapBase && self->stack <= PS2_RAM_SIZE)
+            {
+                restOfRamEnd = self->stack;
+            }
+        }
+        uint32_t heapLimit = restOfRamEnd;
 
         if (heapSize != 0u && heapSize != 0xFFFFFFFFu)
         {
             const uint64_t candidate = static_cast<uint64_t>(heapBase) + static_cast<uint64_t>(heapSize);
-            heapLimit = static_cast<uint32_t>(std::min<uint64_t>(candidate, kDefaultGuestHeapEnd));
+            heapLimit = static_cast<uint32_t>(std::min<uint64_t>(candidate, restOfRamEnd));
         }
 
         if (heapLimit <= heapBase)
         {
-            heapLimit = kDefaultGuestHeapEnd;
+            heapLimit = restOfRamEnd;
         }
 
         if (runtime)

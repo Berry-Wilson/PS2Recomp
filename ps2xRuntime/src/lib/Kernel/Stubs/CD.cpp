@@ -752,7 +752,26 @@ namespace ps2_stubs
 
                 if (remaining == 0u)
                 {
-                    if (atEnd || (g_cdStreamingEndLbn != 0xFFFFFFFFu && g_cdStreamingLbn >= g_cdStreamingEndLbn))
+                    const bool fileExhausted =
+                        atEnd || (g_cdStreamingEndLbn != 0xFFFFFFFFu && g_cdStreamingLbn >= g_cdStreamingEndLbn);
+                    if (fileExhausted && state.sectorsRead < state.requestedSectors)
+                    {
+                        // A streaming read is not bounded by the file on a real drive: it keeps
+                        // returning the sectors that follow. Stream readers commonly request whole
+                        // banks past the end of a PSS and treat a short read as an error (retrying
+                        // forever), so deliver the tail as padding; the movie data's own end code
+                        // stops the decoder. The end stays at g_cdStreamingEndLbn, so later reads
+                        // pad as well.
+                        const uint32_t padSectors = state.requestedSectors - state.sectorsRead;
+                        const uint32_t padAddress = state.buffer + state.sectorsRead * kCdSectorSize;
+                        const uint32_t padOffset = padAddress & PS2_RAM_MASK;
+                        const size_t padBytes = std::min<size_t>(static_cast<size_t>(padSectors) * kCdSectorSize,
+                                                                 PS2_RAM_SIZE - padOffset);
+                        std::memset(rdram + padOffset, 0, padBytes);
+                        state.sectorsRead += padSectors;
+                        g_cdStreamTiming.consumedSectors += padSectors;
+                    }
+                    if (fileExhausted)
                     {
                         notifyMpegCdStreamEof(runtime);
                     }
@@ -837,11 +856,13 @@ namespace ps2_stubs
                     ++g_cdStReadTraceCount;
                 }
 
-                if (state.sectorsRead >= state.requestedSectors || hitStreamEnd)
+                if (state.sectorsRead >= state.requestedSectors)
                 {
                     finishCdStRead(rdram, ctx, state, 0);
                     return;
                 }
+                // At the end of the file the next iteration pads the rest of the request.
+                (void)hitStreamEnd;
 
                 // STMBLK is implemented by repeatedly consuming the stream ring.
                 // If a complete bank is still available, keep draining it before
@@ -895,7 +916,9 @@ namespace ps2_stubs
         {
             if (g_cdStreamingEndLbn != 0xFFFFFFFFu && g_cdStreamingLbn >= g_cdStreamingEndLbn)
             {
-                notifyMpegCdStreamEof(runtime);
+                // Past the end of the file: pad the request like a blocking read would.
+                continueCdStRead(rdram, ctx, runtime, state);
+                return;
             }
             setReturnS32(ctx, 0);
             return;

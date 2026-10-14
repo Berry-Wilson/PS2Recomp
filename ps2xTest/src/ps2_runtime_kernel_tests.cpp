@@ -668,7 +668,7 @@ void register_ps2_runtime_kernel_tests()
                       "the scheduler must publish guest execution only around the active guest call");
         });
 
-        tc.Run("thread lifecycle, nested suspend, WAIT-SUSPEND, and wakeup count are centralized", [](TestCase &t)
+        tc.Run("thread lifecycle, repeated suspend, WAIT-SUSPEND, and wakeup count are centralized", [](TestCase &t)
         {
             TestEnv env;
             EeScheduler &ee = env.runtime.eeScheduler();
@@ -679,16 +679,17 @@ void register_ps2_runtime_kernel_tests()
                                                                  0u, 20, 0u});
             t.Equals(ee.startThread(id, 0xCAFEu, env.ctx, false), KE_OK, "StartThread should make a dormant thread ready");
             t.IsTrue(ee.thread(id)->status == EeThreadStatus::Ready, "started thread should be in one ready queue");
+            // EE kernel suspension does not nest: repeated SuspendThread calls are undone by one
+            // ResumeThread (games suspend a worker every lap and resume it once).
             t.Equals(ee.suspendThread(id, false), KE_OK, "first suspend should remove the ready thread");
-            t.Equals(ee.suspendThread(id, false), KE_OK, "nested suspend should increment suspendCount");
-            t.IsTrue(ee.thread(id)->status == EeThreadStatus::Suspended && ee.thread(id)->suspendCount == 2,
-                     "nested suspension should have one suspended membership and count two");
-            t.Equals(ee.resumeThread(id, false), KE_OK, "first resume should only decrement the nested count");
+            t.Equals(ee.suspendThread(id, false), KE_OK, "a repeated suspend should be accepted");
             t.IsTrue(ee.thread(id)->status == EeThreadStatus::Suspended && ee.thread(id)->suspendCount == 1,
-                     "one outstanding suspend keeps the thread suspended");
-            t.Equals(ee.resumeThread(id, false), KE_OK, "final resume should restore readiness");
+                     "repeated suspension should leave one suspended membership and does not nest");
+            t.Equals(ee.resumeThread(id, false), KE_OK, "a single resume should restore readiness");
             t.IsTrue(ee.thread(id)->status == EeThreadStatus::Ready && ee.thread(id)->suspendCount == 0,
-                     "final resume should enqueue the thread exactly once");
+                     "resume should enqueue the thread exactly once");
+            constexpr int kKeNotSuspend = -415;
+            t.Equals(ee.resumeThread(id, false), kKeNotSuspend, "resuming a thread that is not suspended should fail");
 
             t.Equals(ee.wakeupThread(id, false), KE_OK, "wakeup against a non-sleeping thread should accumulate");
             t.Equals(ee.wakeupThread(id, false), KE_OK, "a second wakeup should accumulate independently");
@@ -889,6 +890,35 @@ void register_ps2_runtime_kernel_tests()
             t.Equals(ee.semaphore(gSchedulerSemaphoreId)->count, 0, "direct handoff must not increment count");
         });
 
+        tc.Run("SetupHeap rest-of-RAM extends to the main thread stack", [](TestCase &t)
+        {
+            TestEnv env;
+            constexpr uint32_t kMainStackSize = 0x00008000u;
+            constexpr uint32_t kStackBase = PS2_RAM_SIZE - kMainStackSize;
+            constexpr uint32_t kHeapBase = 0x00730600u;
+
+            // crt0 order: SetupThread(stack=-1) then SetupHeap(end, -1).
+            setRegU32(env.ctx, 4, 0x0037FAF0u);
+            setRegU32(env.ctx, 5, 0xFFFFFFFFu);
+            setRegU32(env.ctx, 6, kMainStackSize);
+            t.IsTrue(callSyscall(0x3Cu, env.rdram.data(), &env.ctx, &env.runtime), "SetupThread syscall should dispatch");
+
+            setRegU32(env.ctx, 4, kHeapBase);
+            setRegU32(env.ctx, 5, 0xFFFFFFFFu);
+            t.IsTrue(callSyscall(0x3Du, env.rdram.data(), &env.ctx, &env.runtime), "SetupHeap syscall should dispatch");
+            t.IsTrue(callSyscall(0x3Eu, env.rdram.data(), &env.ctx, &env.runtime), "EndOfHeap syscall should dispatch");
+            t.Equals(static_cast<uint32_t>(getRegS32(env.ctx, 2)), kStackBase,
+                     "rest-of-RAM heap should end at the bottom of the main thread stack");
+
+            // A game sizing one pool to just below its stack (as SLUS-20267 does) must get it.
+            const uint32_t poolSize = kStackBase - kHeapBase - 0x4000u;
+            const uint32_t pool = env.runtime.guestMalloc(poolSize);
+            t.Equals(pool, kHeapBase, "large rest-of-RAM pool should be allocated at the heap base");
+            t.IsTrue(pool + poolSize <= kStackBase, "heap pool must not overlap the main thread stack");
+            t.IsTrue(pool >= PS2_RUNTIME_RESERVED_END || pool + poolSize <= PS2_RUNTIME_RESERVED_BASE,
+                     "heap pool must not overlap the runtime reserved area");
+        });
+
         tc.Run("setup heap and allocator primitives track end-of-heap", [](TestCase &t)
         {
             TestEnv env;
@@ -1085,6 +1115,8 @@ void register_ps2_runtime_kernel_tests()
             constexpr uint32_t kInitialLoaderSp = PS2_RAM_SIZE - 0x10u;
             constexpr uint32_t kMainStackSize = 0x00020000u;
             constexpr uint32_t kExpectedStack = PS2_RAM_SIZE - kMainStackSize;
+            // The stack occupies the end of RAM; sp starts at its top and grows down inside it.
+            constexpr uint32_t kExpectedSp = PS2_RAM_SIZE;
             constexpr uint32_t kMainGp = 0x0036A7F0u;
 
             env.ctx.pc = 0x00100000u;
@@ -1094,12 +1126,12 @@ void register_ps2_runtime_kernel_tests()
             setRegU32(env.ctx, 6, kMainStackSize);
             t.IsTrue(callSyscall(0x3Cu, env.rdram.data(), &env.ctx, &env.runtime),
                      "SetupThread syscall should dispatch");
-            t.Equals(::getRegU32(&env.ctx, 2), kExpectedStack,
-                     "automatic main stack should start below the reserved top-of-RDRAM area");
+            t.Equals(::getRegU32(&env.ctx, 2), kExpectedSp,
+                     "automatic main stack sp should start at the top of its end-of-RAM region");
 
             // ReferThreadStatus can be called after many nested frames have moved $sp.
             // It must report the initial stack recorded by SetupThread, not this live snapshot.
-            constexpr uint32_t kTransientSp = kExpectedStack - 0x80u;
+            constexpr uint32_t kTransientSp = kExpectedSp - 0x80u;
             setRegU32(env.ctx, 29, kTransientSp);
             setRegU32(env.ctx, 4, 0u);
             setRegU32(env.ctx, 5, K_STATUS_ADDR);

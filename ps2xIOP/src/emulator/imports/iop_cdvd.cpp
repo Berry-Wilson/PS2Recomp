@@ -658,8 +658,13 @@ namespace ps2x::iop::detail
                 lastError = kCdvdErrorNone;
                 return true;
             }
+            // CD DMA writes whole sectors straight into physical IOP RAM, so only the RAM bounds
+            // matter, not allocation ownership: drivers commonly read ceil(size / 2048) sectors into
+            // a buffer allocated for the exact file size and let the tail spill past the block.
             const uint64_t byteCount64 = static_cast<uint64_t>(sectors) * kSectorSize;
-            if (byteCount64 > IopMemory::RamSize || !memory.ownsRamRange(destination, static_cast<size_t>(byteCount64)))
+            const uint32_t physicalDestination = IopMemory::physicalAddress(destination);
+            if (byteCount64 > IopMemory::RamSize || physicalDestination > IopMemory::RamSize ||
+                byteCount64 > IopMemory::RamSize - physicalDestination)
             {
                 lastError = kCdvdErrorRead;
                 return false;
