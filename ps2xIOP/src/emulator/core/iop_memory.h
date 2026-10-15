@@ -86,6 +86,8 @@ namespace ps2x::iop::detail
         // clears CHCR.start and sets the core's STATX DMA-ready bit (0x80).
         void completeSpuDma(int irq);
         [[nodiscard]] std::span<const uint8_t> ram() const noexcept { return m_ram; }
+        // Raw main RAM without ownership tracking (compiled-module verify snapshots).
+        [[nodiscard]] uint8_t *ramData() noexcept { return m_ram.data(); }
 
         [[nodiscard]] static uint32_t physicalAddress(uint32_t address) noexcept;
 

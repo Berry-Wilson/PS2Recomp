@@ -25,6 +25,68 @@
 #include <sstream>
 #include <utility>
 
+#include "iop_compiled.h"
+
+#include <cstdio>
+#include <filesystem>
+#include <fstream>
+#include <mutex>
+
+namespace
+{
+    struct RegisteredIopModule
+    {
+        std::string name;
+        uint32_t base = 0;
+        uint32_t textSize = 0;
+        uint64_t hash = 0;
+        ps2x::iop::detail::IopCompiledFn fn = nullptr;
+    };
+
+    std::vector<RegisteredIopModule> &registeredIopModules()
+    {
+        static std::vector<RegisteredIopModule> modules;
+        return modules;
+    }
+    std::string g_iopModuleDumpDir;
+    bool g_iopCompiledEnabled = true;
+    uint32_t g_iopCompiledVerifyPeriod = 0;
+}
+
+void registerIopCompiledModule(const char *name, uint32_t base, uint32_t textSize, uint64_t textHash,
+                               ps2x::iop::detail::IopCompiledFn fn)
+{
+    registeredIopModules().push_back({name ? name : "", base, textSize, textHash, fn});
+}
+
+void setIopModuleDumpDir(const char *directory)
+{
+    g_iopModuleDumpDir = directory ? directory : "";
+}
+
+void setIopCompiledEnabled(bool enabled)
+{
+    g_iopCompiledEnabled = enabled;
+}
+
+void setIopCompiledVerify(uint32_t period)
+{
+    g_iopCompiledVerifyPeriod = period;
+}
+
+uint64_t hashIopCode(const uint8_t *code, uint32_t size)
+{
+    uint64_t hash = 0xCBF29CE484222325ull;
+    for (uint32_t offset = 0; offset + 4u <= size; offset += 4u)
+    {
+        uint32_t word = 0;
+        std::memcpy(&word, code + offset, sizeof(word));
+        hash ^= word;
+        hash *= 0x100000001B3ull;
+    }
+    return hash;
+}
+
 namespace ps2x::iop::detail
 {
     namespace
@@ -128,6 +190,7 @@ namespace ps2x::iop::detail
             nextDmaDue = ~0ull;
             cachedThread = nullptr;
             cachedIdle = false;
+            activeCompiled.clear();
             pendingGuestCallbacks.clear();
             nextModuleId = 1;
             moduleCursor = kModuleLoadBase;
@@ -425,8 +488,11 @@ namespace ps2x::iop::detail
             while (!cpu.stopped && !cpu.yielded && totalInstructions - start < instructionBudget)
             {
                 const uint64_t readyBefore = kernel.readyEvents();
-                if (!step(cpu))
-                    break;
+                if (activeCompiled.empty() || !runCompiled(cpu, start + instructionBudget))
+                {
+                    if (!step(cpu))
+                        break;
+                }
                 bool serviced = kernel.readyEvents() != readyBefore;
                 if (!servicingDmaInterrupts && totalCycles >= nextDmaDue)
                 {
@@ -718,6 +784,116 @@ namespace ps2x::iop::detail
             }
         }
 
+        void onModuleImageLoaded(const std::string &name, uint32_t base, uint32_t size)
+        {
+            const uint32_t imageSize = std::min<uint32_t>(size, base < IopMemory::RamSize ? IopMemory::RamSize - base : 0u);
+            const uint8_t *ram = memory.ram().data();
+            if (!g_iopModuleDumpDir.empty() && imageSize != 0u)
+            {
+                std::error_code ec;
+                std::filesystem::create_directories(g_iopModuleDumpDir, ec);
+                std::string stem = name;
+                for (char &c : stem)
+                    if (c == ';' || c == ':' || c == '\\' || c == '/')
+                        c = '_';
+                char suffix[16];
+                std::snprintf(suffix, sizeof(suffix), "_%05x", base);
+                const std::filesystem::path path = std::filesystem::path(g_iopModuleDumpDir) / (stem + suffix);
+                std::ofstream bin(path.string() + ".bin", std::ios::binary);
+                bin.write(reinterpret_cast<const char *>(ram + base), imageSize);
+                std::ofstream info(path.string() + ".info");
+                info << name << ' ' << std::hex << base << ' ' << imageSize << '\n';
+            }
+            if (!g_iopCompiledEnabled)
+                return;
+            for (const auto &reg : registeredIopModules())
+            {
+                if (reg.base != base || reg.textSize == 0u || reg.textSize > imageSize)
+                    continue;
+                if (hashIopCode(ram + base, reg.textSize) != reg.hash)
+                {
+                    log(LogLevel::Warning, "[IOP] compiled module " + reg.name + " does not match the loaded image; interpreting");
+                    continue;
+                }
+                activeCompiled.push_back({base, base + reg.textSize, reg.fn});
+                log(LogLevel::Info, "[IOP] using compiled code for " + reg.name);
+            }
+        }
+
+        bool interruptWouldBeTaken(const CpuState &cpu) const
+        {
+            const uint32_t status = cpu.cop0[12];
+            return (status & 1u) != 0u && (status & 2u) == 0u && memory.interruptControl() != 0u &&
+                   (memory.interruptStatus() & memory.interruptMask()) != 0u;
+        }
+
+        // Runs compiled code for cpu.pc if it lies in an active compiled module. Returns true if
+        // at least one instruction was executed (otherwise the caller steps the interpreter).
+        bool runCompiled(CpuState &cpu, uint64_t instructionLimit)
+        {
+            const uint32_t pc = cpu.pc;
+            for (const ActiveCompiledModule &module : activeCompiled)
+            {
+                if (pc < module.begin || pc >= module.end)
+                    continue;
+                if (cpu.stopped || interruptWouldBeTaken(cpu))
+                    return false;
+                uint64_t cycleBound = nextDmaDue;
+                if (!pendingGuestCallbacks.empty())
+                    cycleBound = std::min(cycleBound, pendingGuestCallbacks.begin()->first);
+                const uint64_t before = totalInstructions;
+                const bool verify = g_iopCompiledVerifyPeriod != 0u && (++compiledRuns % g_iopCompiledVerifyPeriod) == 0u;
+                std::vector<uint8_t> ramBefore;
+                CpuState cpuBefore;
+                uint64_t cyclesBefore = totalCycles;
+                if (verify)
+                {
+                    ramBefore.assign(memory.ram().begin(), memory.ram().end());
+                    cpuBefore = cpu;
+                }
+                IopCompiledRun run{cpu, memory, memory.ram().data(), totalCycles, totalInstructions, cycleBound, instructionLimit};
+                module.fn(run);
+                const uint64_t executed = totalInstructions - before;
+                if (verify && executed != 0u)
+                    verifyCompiledRun(cpu, ramBefore, cpuBefore, cyclesBefore, before, executed, pc);
+                return executed != 0u;
+            }
+            return false;
+        }
+
+        // Replays a compiled run with the interpreter from the saved state and compares.
+        void verifyCompiledRun(CpuState &cpu, const std::vector<uint8_t> &ramBefore, const CpuState &cpuBefore,
+                               uint64_t cyclesBefore, uint64_t instructionsBefore, uint64_t executed, uint32_t entryPc)
+        {
+            const std::vector<uint8_t> ramCompiled(memory.ram().begin(), memory.ram().end());
+            const CpuState cpuCompiled = cpu;
+            const uint64_t cyclesCompiled = totalCycles;
+            std::memcpy(memory.ramData(), ramBefore.data(), ramBefore.size());
+            cpu = cpuBefore;
+            totalCycles = cyclesBefore;
+            totalInstructions = instructionsBefore;
+            for (uint64_t i = 0; i < executed; ++i)
+                (void)step(cpu);
+            std::string diff;
+            if (cpu.gpr != cpuCompiled.gpr) diff += " gpr";
+            if (cpu.hi != cpuCompiled.hi || cpu.lo != cpuCompiled.lo) diff += " hi/lo";
+            if (cpu.pc != cpuCompiled.pc) diff += " pc";
+            if (cpu.branchPending != cpuCompiled.branchPending || (cpu.branchPending && cpu.branchTarget != cpuCompiled.branchTarget)) diff += " branch";
+            if (cpu.pendingLoad != cpuCompiled.pendingLoad ||
+                (cpu.pendingLoad && (cpu.pendingLoadReg != cpuCompiled.pendingLoadReg || cpu.pendingLoadValue != cpuCompiled.pendingLoadValue)))
+                diff += " pendingLoad";
+            if (cpu.cop0 != cpuCompiled.cop0 || cpu.exception != cpuCompiled.exception) diff += " cop0";
+            if (totalCycles != cyclesCompiled) diff += " cycles";
+            if (std::memcmp(memory.ram().data(), ramCompiled.data(), ramCompiled.size()) != 0) diff += " ram";
+            if (!diff.empty() && compiledVerifyMismatches++ < 50)
+                std::fprintf(stderr, "[iop-verify] mismatch:%s (entry pc %x, %llu instructions, pc %x/%x)\n", diff.c_str(), entryPc,
+                             static_cast<unsigned long long>(executed), cpuCompiled.pc, cpu.pc);
+            static uint64_t verified = 0;
+            if ((++verified & 0x3FFu) == 0u)
+                std::fprintf(stderr, "[iop-verify] %llu compiled runs checked, %llu mismatches\n",
+                             static_cast<unsigned long long>(verified), static_cast<unsigned long long>(compiledVerifyMismatches));
+        }
+
         ModuleLoadResult loadImage(std::string path, std::span<const uint8_t> image, const void *arguments, uint32_t argumentSize)
         {
             ModuleLoadResult result{true, -1, -1};
@@ -743,6 +919,7 @@ namespace ps2x::iop::detail
             module.size = loaded.size;
             module.entry = loaded.entry;
             module.gp = loaded.gp;
+            onModuleImageLoaded(module.name, loaded.base, loaded.size);
 
             uint32_t args = 0u;
             if (arguments && argumentSize)
@@ -801,6 +978,10 @@ namespace ps2x::iop::detail
             kernel.terminateThreadsInRange(it->second.base, it->second.size);
             rpc.removeServersInRange(it->second.base, it->second.size);
             imports.eraseRange(it->second.base, it->second.size);
+            const uint32_t stoppedBase = it->second.base;
+            const uint32_t stoppedEnd = it->second.base + it->second.size;
+            std::erase_if(activeCompiled, [&](const ActiveCompiledModule &m)
+                          { return m.begin < stoppedEnd && m.end > stoppedBase; });
             modules.erase(it);
             kernel.cleanupDeadThreads();
             if (result)
@@ -829,6 +1010,16 @@ namespace ps2x::iop::detail
         // Earliest completion cycle in pendingDmaInterrupts (~0 when empty); lets the
         // per-instruction loop skip the map until something is actually due.
         uint64_t nextDmaDue = ~0ull;
+        // Compiled modules whose loaded text matched a registration (see iop_compiled.h).
+        struct ActiveCompiledModule
+        {
+            uint32_t begin = 0;
+            uint32_t end = 0;
+            IopCompiledFn fn = nullptr;
+        };
+        std::vector<ActiveCompiledModule> activeCompiled;
+        uint64_t compiledRuns = 0;
+        uint64_t compiledVerifyMismatches = 0;
         // Reusable scheduling decision (see runCycles).
         IopThread *cachedThread = nullptr;
         bool cachedIdle = false;
