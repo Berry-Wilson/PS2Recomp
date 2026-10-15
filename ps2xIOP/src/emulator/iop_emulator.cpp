@@ -126,6 +126,8 @@ namespace ps2x::iop::detail
             ioman.reset();
             pendingDmaInterrupts.clear();
             nextDmaDue = ~0ull;
+            cachedThread = nullptr;
+            cachedIdle = false;
             pendingGuestCallbacks.clear();
             nextModuleId = 1;
             moduleCursor = kModuleLoadBase;
@@ -406,7 +408,8 @@ namespace ps2x::iop::detail
             }
 
             const bool running = cpuCore.executeInstruction(cpu);
-            schedulePendingDma();
+            if (memory.hasDmaStart())
+                schedulePendingDma();
             ++totalInstructions;
             ++totalCycles;
             return running;
@@ -608,6 +611,36 @@ namespace ps2x::iop::detail
             servicingGuestCallbacks = false;
         }
 
+        // Earliest timer / DMA completion / guest callback event, given the kernel's next
+        // delayed-thread wake-up.
+        uint64_t nextSchedulerEvent(uint64_t kernelWake)
+        {
+            uint64_t bound = timrman.nextEventCycle(kernelWake);
+            bound = std::min(bound, nextDmaDue);
+            if (!pendingGuestCallbacks.empty())
+                bound = std::min(bound, pendingGuestCallbacks.begin()->first);
+            return bound;
+        }
+
+        // The EE advances the IOP in very small steps, so most runCycles calls would repeat the
+        // previous scheduling decision. It is reused while nothing that feeds the decision
+        // changed: no thread became ready or was created/removed, the resumed thread is still
+        // ready, and no timer, DMA completion, callback or delayed wake-up is due.
+        void cacheScheduleDecision(IopThread *thread)
+        {
+            cachedThread = thread;
+            cachedIdle = thread == nullptr;
+            cachedReadyEvents = kernel.readyEvents();
+            cachedThreadSetGeneration = kernel.threadSetGeneration();
+            cachedKernelWake = kernel.nextWakeCycle(~0ull);
+        }
+
+        void invalidateScheduleDecision()
+        {
+            cachedThread = nullptr;
+            cachedIdle = false;
+        }
+
         void runCycles(uint64_t cycles) noexcept
         {
             try
@@ -615,6 +648,36 @@ namespace ps2x::iop::detail
                 const uint64_t target = totalCycles + cycles;
                 while (totalCycles < target)
                 {
+                    if ((cachedThread != nullptr || cachedIdle) && kernel.readyEvents() == cachedReadyEvents &&
+                        kernel.threadSetGeneration() == cachedThreadSetGeneration &&
+                        (cachedIdle || cachedThread->state == IopThreadState::Ready))
+                    {
+                        const uint64_t bound = nextSchedulerEvent(cachedKernelWake);
+                        if (totalCycles < bound)
+                        {
+                            if (cachedIdle)
+                            {
+                                totalCycles = std::max(totalCycles + 1u, std::min(target, bound));
+                                continue;
+                            }
+                            IopThread &thread = *cachedThread;
+                            kernel.resumeThread(thread);
+                            const uint64_t before = totalCycles;
+                            runCpu(thread.cpu,
+                                   static_cast<uint32_t>(std::min<uint64_t>({kMaxEventFreeSlice, bound - totalCycles, target - totalCycles})),
+                                   true);
+                            kernel.endTimeslice(thread, kThreadReturnSentinel);
+                            if (totalCycles == before)
+                                ++totalCycles;
+                            if (thread.state != IopThreadState::Ready || thread.cpu.yielded ||
+                                kernel.readyEvents() != cachedReadyEvents ||
+                                kernel.threadSetGeneration() != cachedThreadSetGeneration)
+                                invalidateScheduleDecision();
+                            continue;
+                        }
+                    }
+                    invalidateScheduleDecision();
+
                     servicePendingDmaInterrupts();
                     servicePendingGuestCallbacks();
                     timrman.serviceDue(totalCycles, *this);
@@ -628,6 +691,7 @@ namespace ps2x::iop::detail
                             nextWake = std::min(nextWake, pendingGuestCallbacks.begin()->first);
                         nextWake = timrman.nextEventCycle(nextWake);
                         totalCycles = std::max(totalCycles + 1u, std::min(target, nextWake));
+                        cacheScheduleDecision(nullptr);
                         continue;
                     }
                     const uint64_t before = totalCycles;
@@ -644,6 +708,8 @@ namespace ps2x::iop::detail
                     kernel.endTimeslice(*next, kThreadReturnSentinel);
                     if (totalCycles == before)
                         ++totalCycles;
+                    if (next->state == IopThreadState::Ready && !next->cpu.yielded)
+                        cacheScheduleDecision(next);
                 }
             }
             catch (...)
@@ -763,6 +829,12 @@ namespace ps2x::iop::detail
         // Earliest completion cycle in pendingDmaInterrupts (~0 when empty); lets the
         // per-instruction loop skip the map until something is actually due.
         uint64_t nextDmaDue = ~0ull;
+        // Reusable scheduling decision (see runCycles).
+        IopThread *cachedThread = nullptr;
+        bool cachedIdle = false;
+        uint64_t cachedReadyEvents = 0;
+        uint64_t cachedThreadSetGeneration = 0;
+        uint64_t cachedKernelWake = ~0ull;
         std::multimap<uint64_t, ScheduledGuestCallback> pendingGuestCallbacks;
         uint32_t nextModuleId = 1;
         uint32_t moduleCursor = kModuleLoadBase;

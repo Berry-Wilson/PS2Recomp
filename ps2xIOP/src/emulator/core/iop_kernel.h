@@ -62,6 +62,16 @@ namespace ps2x::iop::detail
 
         [[nodiscard]] IopThread *beginNextReady(uint64_t currentCycle);
         [[nodiscard]] uint64_t readyEvents() const noexcept { return m_readyEvents; }
+        // Bumped when threads are created, removed or marked dead (thread pointers may change).
+        [[nodiscard]] uint64_t threadSetGeneration() const noexcept { return m_threadSetGeneration; }
+        // Makes `thread` the running thread, as beginNextReady does once it has picked it.
+        void resumeThread(IopThread &thread) noexcept
+        {
+            m_currentThread = &thread;
+            thread.state = IopThreadState::Running;
+            thread.cpu.stopped = false;
+            thread.cpu.yielded = false;
+        }
         [[nodiscard]] uint64_t nextWakeCycle(uint64_t fallback) const;
         void endTimeslice(IopThread &thread, uint32_t returnSentinel);
         void cleanupDeadThreads();
@@ -96,6 +106,8 @@ namespace ps2x::iop::detail
         std::map<int, IopThread> m_threads;
         // Bumped whenever a thread becomes ready or changes priority outside the scheduler.
         uint64_t m_readyEvents = 0;
+        uint64_t m_threadSetGeneration = 0;
+        bool m_deadThreadsPending = false;
         std::map<int, Semaphore> m_semaphores;
         std::map<int, EventFlag> m_eventFlags;
         uint32_t m_nextThreadId = 1;
