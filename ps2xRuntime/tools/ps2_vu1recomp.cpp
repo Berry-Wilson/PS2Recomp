@@ -148,6 +148,270 @@ namespace
         return seen;
     }
 
+    // --- FMAC flag liveness ---------------------------------------------------------------
+    // Upper ops that queue MAC/status flags (applyFmacDest/applyFmacDestAcc in execUpper).
+    bool isFlagWriter(uint32_t upper)
+    {
+        const uint8_t op = static_cast<uint8_t>(upper & 0x3Fu);
+        if (op < 0x3Cu)
+        {
+            if (op >= 0x30u)
+                return false;
+            return !((op >= 0x10u && op <= 0x17u) || op == 0x1Du || op == 0x1Fu || op == 0x2Bu || op == 0x2Fu);
+        }
+        const uint8_t sp = static_cast<uint8_t>((upper & 3u) | ((upper >> 4) & 0x7Cu));
+        return sp <= 0x0Fu || (sp >= 0x18u && sp <= 0x1Cu) || sp == 0x1Eu || (sp >= 0x20u && sp <= 0x2Au) ||
+               (sp >= 0x2Cu && sp <= 0x2Eu);
+    }
+
+    uint32_t lowerPrimaryOp(uint32_t lower) { return (lower & 0x80000000u) != 0u ? 0xFFu : (lower >> 25) & 0x7Fu; }
+    // FMEQ/FMAND/FMOR read MAC; FSEQ/FSAND/FSOR read status.
+    bool isFlagReader(uint32_t lower)
+    {
+        const uint32_t op = lowerPrimaryOp(lower);
+        return op == 0x18u || op == 0x1Au || op == 0x1Bu || op == 0x14u || op == 0x16u || op == 0x17u;
+    }
+    bool readsStickyStatus(uint32_t lower)
+    {
+        const uint32_t op = lowerPrimaryOp(lower);
+        const uint32_t imm12 = (((lower >> 21) & 1u) << 11) | (lower & 0x7FFu);
+        return op == 0x14u || op == 0x17u || (op == 0x16u && (imm12 & 0xFC0u) != 0u);
+    }
+
+    enum Pending : uint8_t { PendNone, PendUncond, PendCond, PendDynamic, PendEnd };
+    struct FlowState
+    {
+        uint32_t pc;
+        uint8_t pending;
+        uint32_t target;
+        auto key() const { return (static_cast<uint64_t>(pc) << 40) | (static_cast<uint64_t>(pending) << 32) | target; }
+    };
+
+    struct ImageAnalysis
+    {
+        std::map<uint32_t, A::Decoded> pairs;
+        std::set<uint64_t> states; // reachable FlowState keys
+        std::set<uint32_t> deadFlagWriters;
+        bool stickyObservable = false;
+        uint32_t writers = 0;
+    };
+
+    // Successors of executing pair `state.pc` entered with `state.pending`. Sets pathEnd when
+    // execution may leave the analysed code (program end, unknown jump, halt bits, untranslated PC).
+    void successors(const ImageAnalysis &an, const FlowState &state, std::vector<FlowState> &out, bool &pathEnd)
+    {
+        const auto it = an.pairs.find(state.pc);
+        if (it == an.pairs.end())
+        {
+            pathEnd = true;
+            return;
+        }
+        const A::Decoded &d = it->second;
+        const uint32_t next = (state.pc + 8u) & kPcMask;
+        auto push = [&](uint32_t pc, uint8_t pending, uint32_t target)
+        {
+            if (an.pairs.count(pc) == 0u)
+                pathEnd = true;
+            else
+                out.push_back({pc, pending, target});
+        };
+        if (d.dBit || d.tBit || d.upperUsage.reserved || d.lowerUsage.reserved)
+            pathEnd = true;
+        switch (state.pending)
+        {
+        case PendEnd:
+        case PendDynamic:
+            pathEnd = true;
+            return;
+        case PendUncond:
+        case PendCond:
+            if (lowerFlow(state.pc, d.lower).staticBranch || lowerFlow(state.pc, d.lower).jump || d.eBit)
+                pathEnd = true; // branch in a delay slot: not modelled
+            push(state.target, PendNone, 0u);
+            if (state.pending == PendCond)
+                push(next, PendNone, 0u);
+            return;
+        default:
+            break;
+        }
+        const Flow flow = lowerFlow(state.pc, d.lower);
+        if (d.eBit)
+            push(next, PendEnd, 0u);
+        else if (flow.staticBranch)
+            push(next, flow.conditional ? PendCond : PendUncond, flow.target);
+        else if (flow.jump)
+            push(next, PendDynamic, 0u);
+        else
+            push(next, PendNone, 0u);
+    }
+
+    // A flag write is visible 4 cycles after issue. Pair-distance >= 4 guarantees >= 4 cycles,
+    // so a writer W is unobservable if on every path another writer W' comes at least 4 pairs
+    // before any flag reader, and before the path leaves the analysed code.
+    bool flagsLive(const ImageAnalysis &an, uint32_t writerPc)
+    {
+        constexpr uint8_t kNoKiller = 0xFFu;
+        std::set<std::pair<uint64_t, uint8_t>> visited;
+        std::vector<std::pair<FlowState, uint8_t>> work;
+        for (uint64_t key : an.states)
+        {
+            if (static_cast<uint32_t>(key >> 40) != writerPc)
+                continue;
+            const FlowState start{writerPc, static_cast<uint8_t>((key >> 32) & 0xFFu), static_cast<uint32_t>(key & 0xFFFFFFFFu)};
+            std::vector<FlowState> next;
+            bool pathEnd = false;
+            successors(an, start, next, pathEnd);
+            if (pathEnd)
+                return true;
+            for (const auto &n : next)
+                work.push_back({n, kNoKiller});
+        }
+        while (!work.empty())
+        {
+            auto [state, killerDistance] = work.back();
+            work.pop_back();
+            if (killerDistance != kNoKiller && killerDistance >= 4u)
+                continue;
+            if (!visited.insert({state.key(), killerDistance}).second)
+                continue;
+            const A::Decoded &d = an.pairs.at(state.pc);
+            if (isFlagReader(d.lower))
+                return true;
+            uint8_t k = killerDistance;
+            if (k == kNoKiller && isFlagWriter(d.upper))
+                k = 0u;
+            std::vector<FlowState> next;
+            bool pathEnd = false;
+            successors(an, state, next, pathEnd);
+            if (pathEnd)
+                return true;
+            for (const auto &n : next)
+                work.push_back({n, k == kNoKiller ? kNoKiller : static_cast<uint8_t>(k + 1u)});
+        }
+        return false;
+    }
+
+    ImageAnalysis analyse(const VU1Interpreter &vu, const uint8_t *code, const std::set<uint32_t> &compiled, const std::set<uint32_t> &entries)
+    {
+        ImageAnalysis an;
+        for (uint32_t pc : compiled)
+            an.pairs.emplace(pc, A::decode(vu, code, pc));
+        std::vector<FlowState> work;
+        for (uint32_t entry : entries)
+            if (an.pairs.count(entry & kPcMask & ~7u) != 0u)
+                work.push_back({entry & kPcMask & ~7u, PendNone, 0u});
+        while (!work.empty())
+        {
+            const FlowState state = work.back();
+            work.pop_back();
+            if (!an.states.insert(state.key()).second)
+                continue;
+            std::vector<FlowState> next;
+            bool pathEnd = false;
+            successors(an, state, next, pathEnd);
+            for (const auto &n : next)
+                work.push_back(n);
+        }
+        for (const auto &[pc, d] : an.pairs)
+            if (readsStickyStatus(d.lower))
+                an.stickyObservable = true;
+        for (const auto &[pc, d] : an.pairs)
+        {
+            if (!isFlagWriter(d.upper))
+                continue;
+            ++an.writers;
+            if (!an.stickyObservable && !flagsLive(an, pc))
+                an.deadFlagWriters.insert(pc);
+        }
+        return an;
+    }
+
+    // Inline arithmetic for an FMAC op whose flags are unobservable. Mirrors execUpper's
+    // expression for each form and its result normalization; returns false if not handled.
+    bool emitInlineFmac(std::ostream &o, uint32_t upper)
+    {
+        enum Kind { Add, Sub, Mul, Madd, Msub };
+        enum Source { Bc, Q, I, Vt };
+        const uint8_t op = static_cast<uint8_t>(upper & 0x3Fu);
+        const bool accTarget = op >= 0x3Cu;
+        const uint8_t code = accTarget ? static_cast<uint8_t>((upper & 3u) | ((upper >> 4) & 0x7Cu)) : op;
+        Kind kind;
+        Source source;
+        if (code <= 0x03u) { kind = Add; source = Bc; }
+        else if (code <= 0x07u) { kind = Sub; source = Bc; }
+        else if (code <= 0x0Bu) { kind = Madd; source = Bc; }
+        else if (code <= 0x0Fu) { kind = Msub; source = Bc; }
+        else if (code >= 0x18u && code <= 0x1Bu) { kind = Mul; source = Bc; }
+        else
+        {
+            switch (code)
+            {
+            case 0x1C: kind = Mul; source = Q; break;
+            case 0x1E: kind = Mul; source = I; break;
+            case 0x20: kind = Add; source = Q; break;
+            case 0x21: kind = Madd; source = Q; break;
+            case 0x22: kind = Add; source = I; break;
+            case 0x23: kind = Madd; source = I; break;
+            case 0x24: kind = Sub; source = Q; break;
+            case 0x25: kind = Msub; source = Q; break;
+            case 0x26: kind = Sub; source = I; break;
+            case 0x27: kind = Msub; source = I; break;
+            case 0x28: kind = Add; source = Vt; break;
+            case 0x29: kind = Madd; source = Vt; break;
+            case 0x2A: kind = Mul; source = Vt; break;
+            case 0x2C: kind = Sub; source = Vt; break;
+            case 0x2D: kind = Msub; source = Vt; break;
+            default: return false;
+            }
+        }
+        const unsigned dest = (upper >> 21) & 0xFu;
+        const unsigned ft = (upper >> 16) & 0x1Fu;
+        const unsigned fs = (upper >> 11) & 0x1Fu;
+        const unsigned fd = (upper >> 6) & 0x1Fu;
+        const bool productSum = kind == Madd || kind == Msub;
+        static const char *names[] = {"ADD", "SUB", "MUL", "MADD", "MSUB"};
+        o << "    { // " << names[kind] << (accTarget ? "A" : "") << " inline (flags unobserved)\n";
+        if (source == Bc)
+            o << "        const float b = vu1NormalizeOperand(st.vf[" << ft << "][" << (upper & 3u) << "]);\n";
+        else if (source == Q)
+            o << "        const float b = vu1NormalizeOperand(st.q);\n";
+        else if (source == I)
+            o << "        const float b = vu1NormalizeOperand(st.i);\n";
+        o << "        float r[4] = {0.0f, 0.0f, 0.0f, 0.0f};";
+        if (productSum)
+            o << " float p[4] = {0.0f, 0.0f, 0.0f, 0.0f};";
+        o << " bool inRange = true;\n";
+        for (uint32_t c = 0; c < 4u; ++c)
+        {
+            if ((dest & laneForComponent(c)) == 0u)
+                continue;
+            o << "        { const float s = vu1NormalizeOperand(st.vf[" << fs << "][" << c << "]);";
+            const std::string t = source == Vt ? "vu1NormalizeOperand(st.vf[" + std::to_string(ft) + "][" + std::to_string(c) + "])" : "b";
+            switch (kind)
+            {
+            case Add: o << " r[" << c << "] = s + " << t << "; inRange = inRange && vu1NormalizeSingleRounding(r[" << c << "]);"; break;
+            case Sub: o << " r[" << c << "] = s - " << t << "; inRange = inRange && vu1NormalizeSingleRounding(r[" << c << "]);"; break;
+            case Mul: o << " r[" << c << "] = s * " << t << "; inRange = inRange && vu1NormalizeSingleRounding(r[" << c << "]);"; break;
+            case Madd:
+                o << " p[" << c << "] = s * " << t << "; r[" << c << "] = vu1NormalizeOperand(st.acc[" << c << "]) + p[" << c
+                  << "]; inRange = inRange && vu1ProductSumInRange(r[" << c << "], p[" << c << "]);";
+                break;
+            case Msub:
+                o << " p[" << c << "] = s * " << t << "; r[" << c << "] = vu1NormalizeOperand(st.acc[" << c << "]) - p[" << c
+                  << "]; inRange = inRange && vu1ProductSumInRange(r[" << c << "], p[" << c << "]);";
+                break;
+            }
+            o << " }\n";
+        }
+        o << "        if (!inRange) A::normalizeFmacValues(vu, " << hex32(upper) << ", r, " << dest << "u);\n";
+        o << "       ";
+        for (uint32_t c = 0; c < 4u; ++c)
+            if ((dest & laneForComponent(c)) != 0u)
+                o << (accTarget ? " st.acc[" : " st.vf[") << (accTarget ? "" : std::to_string(fd) + "][") << c << "] = r[" << c << "];";
+        o << "\n    }\n";
+        return true;
+    }
+
     void emitStallTerms(std::vector<std::string> &terms, const A::Usage &usage)
     {
         for (uint32_t index = 0; index < usage.vfReadCount; ++index)
@@ -167,7 +431,8 @@ namespace
                 terms.push_back("A::accReady(vu, " + std::to_string(c) + ")");
     }
 
-    void emitPair(std::ostream &o, const VU1Interpreter &vu, const uint8_t *code, uint32_t pc, const std::set<uint32_t> &compiled)
+    void emitPair(std::ostream &o, const VU1Interpreter &vu, const uint8_t *code, uint32_t pc, const std::set<uint32_t> &compiled,
+                  const ImageAnalysis &an, uint32_t &inlined)
     {
         const A::Decoded d = A::decode(vu, code, pc);
         o << label(pc) << ":\n{\n";
@@ -231,10 +496,17 @@ namespace
 
         const bool upperNop = isUpperNop(d.upper);
         const bool lowerNop = isLowerNop(d.lower);
+        auto emitUpper = [&]()
+        {
+            if (an.deadFlagWriters.count(pc) != 0u && emitInlineFmac(o, d.upper))
+                ++inlined;
+            else
+                o << "    A::execUpper(vu, " << hex32(d.upper) << ");\n";
+        };
         if (d.iBit)
         {
             if (!upperNop)
-                o << "    A::execUpper(vu, " << hex32(d.upper) << ");\n";
+                emitUpper();
             o << "    { float immediate; const uint32_t bits = " << hex32(d.lower)
               << "; std::memcpy(&immediate, &bits, sizeof(immediate)); st.i = A::normalizeOperand(vu, immediate); }\n";
         }
@@ -252,7 +524,7 @@ namespace
         else
         {
             if (!upperNop)
-                o << "    A::execUpper(vu, " << hex32(d.upper) << ");\n";
+                emitUpper();
             if (!lowerNop)
                 o << "    A::execLower(vu, " << hex32(d.lower) << ", " << hex32(d.upper) << ");\n";
         }
@@ -357,6 +629,7 @@ int main(int argc, char **argv)
 
     VU1Interpreter vu(VU1Interpreter::Unit::VU1);
     std::vector<std::string> images;
+    std::vector<uint32_t> statusMasks;
     for (const auto &entry : std::filesystem::directory_iterator(dumpDir))
     {
         if (entry.path().extension() != ".bin")
@@ -385,6 +658,7 @@ int main(int argc, char **argv)
             continue;
 
         const std::set<uint32_t> pairs = reachablePairs(vu, code.data(), entries);
+        const ImageAnalysis analysis = analyse(vu, code.data(), pairs, entries);
         char fnName[64];
         std::snprintf(fnName, sizeof(fnName), "vu1img_%016llx", static_cast<unsigned long long>(hash));
         std::ofstream o(outDir / (std::string("vu1_") + (fnName + 7) + ".cpp"));
@@ -397,14 +671,18 @@ int main(int argc, char **argv)
         o << "Vu1CompiledResult " << fnName << "(VU1Interpreter &vu, uint64_t budgetEnd)\n{\n";
         o << "VU1State &st = A::state(vu);\nuint64_t &cyc = A::cycle(vu);\nconst uint32_t pcMask = A::microAddressMask(vu);\n";
         o << "goto dispatch;\n";
+        uint32_t inlined = 0u;
         for (uint32_t pc : pairs)
-            emitPair(o, vu, code.data(), pc, pairs);
+            emitPair(o, vu, code.data(), pc, pairs, analysis, inlined);
         o << "dispatch:\n    switch (st.pc)\n    {\n";
         for (uint32_t pc : pairs)
             o << "    case " << pc << "u: goto " << label(pc) << ";\n";
         o << "    default: return Vu1CompiledResult::Fallback;\n    }\n}\n";
         images.push_back(fnName);
-        std::cout << name << ": " << pairs.size() << " pairs from " << entries.size() << " entries\n";
+        statusMasks.push_back(inlined != 0u ? 0x03Fu : 0xFFFu);
+        std::cout << name << ": " << pairs.size() << " pairs from " << entries.size() << " entries; flag writers "
+                  << analysis.writers << ", unobserved " << analysis.deadFlagWriters.size() << ", inlined " << inlined
+                  << (analysis.stickyObservable ? " (sticky status observable: no flag elimination)" : "") << "\n";
     }
 
     std::ofstream reg(outDir / "vu1_images.cpp");
@@ -412,8 +690,9 @@ int main(int argc, char **argv)
     for (const auto &fn : images)
         reg << "Vu1CompiledResult " << fn << "(VU1Interpreter &vu, uint64_t budgetEnd);\n";
     reg << "\nvoid registerGeneratedVu1Images()\n{\n";
-    for (const auto &fn : images)
-        reg << "    registerVu1CompiledImage(0x" << fn.substr(7) << "ull, &" << fn << ");\n";
+    for (size_t i = 0; i < images.size(); ++i)
+        reg << "    registerVu1CompiledImage(0x" << images[i].substr(7) << "ull, &" << images[i] << ", 0x" << std::hex
+            << statusMasks[i] << std::dec << "u);\n";
     reg << "}\n";
     std::cout << images.size() << " images\n";
     return 0;

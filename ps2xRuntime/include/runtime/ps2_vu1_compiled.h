@@ -13,7 +13,9 @@
 
 #include "runtime/ps2_vu1.h"
 
+#include <cmath>
 #include <cstdint>
+#include <cstring>
 
 class GS;
 class PS2Memory;
@@ -27,7 +29,9 @@ enum class Vu1CompiledResult : int
 
 using Vu1CompiledFn = Vu1CompiledResult (*)(VU1Interpreter &vu, uint64_t budgetEnd);
 
-void registerVu1CompiledImage(uint64_t imageHash, Vu1CompiledFn fn);
+// statusVerifyMask: status bits verify mode compares at program end. The translator clears
+// the sticky bits (0xFC0) when it proved them unobservable and skipped flag updates.
+void registerVu1CompiledImage(uint64_t imageHash, Vu1CompiledFn fn, uint32_t statusVerifyMask = 0xFFFu);
 // Writes every newly seen VU1 code image (<hash>.bin) and MSCAL entry PCs (<hash>.entries)
 // to the directory; empty disables dumping.
 void setVu1ImageDumpDir(const char *directory);
@@ -40,9 +44,65 @@ void setVu1CompiledVerify(bool enabled);
 uint64_t hashVu1CodeImage(const uint8_t *code, uint32_t size);
 
 // Access used by generated code and the translator (friend of VU1Interpreter).
+// Operand normalization, identical to VU1Interpreter::normalizeOperand.
+inline float vu1NormalizeOperand(float value)
+{
+    uint32_t bits;
+    std::memcpy(&bits, &value, sizeof(bits));
+    const uint32_t exponent = (bits >> 23) & 0xFFu;
+    if (exponent == 0u)
+        bits &= 0x80000000u;
+    else if (exponent == 0xFFu)
+        bits = (bits & 0x80000000u) | 0x7F7FFFFFu;
+    std::memcpy(&value, &bits, sizeof(value));
+    return value;
+}
+
+// Applies the interpreter's FMAC result normalization to a single-rounding result (add/sub/mul
+// of normalized operands under round-toward-zero) when it can be decided from the float alone:
+// normal values below FLT_MAX are unchanged, zero/denormal results become a zero with the
+// result's sign (the exact result has the same sign and is zero or below FLT_MIN). Returns
+// false (value untouched) when the exact recomputation is needed.
+inline bool vu1NormalizeSingleRounding(float &result)
+{
+    uint32_t bits;
+    std::memcpy(&bits, &result, sizeof(bits));
+    const uint32_t exponent = (bits >> 23) & 0xFFu;
+    if (exponent == 0u)
+    {
+        bits &= 0x80000000u;
+        std::memcpy(&result, &bits, sizeof(result));
+        return true;
+    }
+    return exponent != 0xFFu && (bits & 0x7FFFFFFFu) != 0x7F7FFFFFu;
+}
+
+// Same for multiply-accumulate results (acc +- product): the exact acc +- product the
+// interpreter recomputes is within 25% of the float result when there is no heavy
+// cancellation (|r| >= |p| * 2^-20) and both are well inside the float range, so its
+// normalization cannot change the value.
+inline bool vu1ProductSumInRange(float result, float product)
+{
+    uint32_t rbits, pbits;
+    std::memcpy(&rbits, &result, sizeof(rbits));
+    std::memcpy(&pbits, &product, sizeof(pbits));
+    const uint32_t rexp = (rbits >> 23) & 0xFFu;
+    const uint32_t pexp = (pbits >> 23) & 0xFFu;
+    return rexp >= 5u && rexp <= 0xFCu && pexp <= 0xFCu &&
+           std::fabs(result) >= std::fabs(product) * 9.5367431640625e-7f;
+}
+
 class Vu1CompiledAccess
 {
 public:
+    // Value normalization of an FMAC result vector exactly as the interpreter does it (flags
+    // are computed and discarded); used when a fast range check fails.
+    static void normalizeFmacValues(VU1Interpreter &vu, uint32_t upper, float *result, uint8_t dest)
+    {
+        vu.m_currentUpperInstruction = upper;
+        uint8_t laneFlags[4];
+        vu.normalizeFmacResult(result, dest, laneFlags);
+    }
     using Decoded = VU1Interpreter::DecodedInstructionPair;
     using Usage = VU1Interpreter::InstructionUsage;
 

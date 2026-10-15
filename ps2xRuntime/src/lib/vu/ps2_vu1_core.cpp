@@ -87,9 +87,15 @@ void setVu1ImmediateWriteback(bool enabled)
 
 namespace
 {
-    std::unordered_map<uint64_t, Vu1CompiledFn> &compiledImages()
+    struct CompiledImage
     {
-        static std::unordered_map<uint64_t, Vu1CompiledFn> images;
+        Vu1CompiledFn fn = nullptr;
+        uint32_t statusVerifyMask = 0xFFFu;
+    };
+
+    std::unordered_map<uint64_t, CompiledImage> &compiledImages()
+    {
+        static std::unordered_map<uint64_t, CompiledImage> images;
         return images;
     }
     bool g_vu1CompiledEnabled = true;
@@ -121,9 +127,9 @@ namespace
     }
 }
 
-void registerVu1CompiledImage(uint64_t imageHash, Vu1CompiledFn fn)
+void registerVu1CompiledImage(uint64_t imageHash, Vu1CompiledFn fn, uint32_t statusVerifyMask)
 {
-    compiledImages()[imageHash] = fn;
+    compiledImages()[imageHash] = CompiledImage{fn, statusVerifyMask};
 }
 
 void setVu1ImageDumpDir(const char *directory)
@@ -173,7 +179,7 @@ void VU1Interpreter::refreshCompiledImage(const uint8_t *vuCode, uint32_t codeSi
     m_imageHash = hashVu1CodeImage(vuCode, codeSize);
     const auto &images = compiledImages();
     const auto image = images.find(m_imageHash);
-    m_compiledImage = image != images.end() ? reinterpret_cast<const void *>(image->second) : nullptr;
+    m_compiledImage = image != images.end() ? reinterpret_cast<const void *>(image->second.fn) : nullptr;
 }
 
 VU1Interpreter::VU1Interpreter(Unit unit)
@@ -2150,7 +2156,15 @@ void VU1Interpreter::run(uint8_t *vuCode, uint32_t codeSize,
         check(std::memcmp(a.acc, b.acc, sizeof(a.acc)) == 0, "acc");
         check(std::memcmp(&a.q, &b.q, 4) == 0 && std::memcmp(&a.p, &b.p, 4) == 0 && std::memcmp(&a.i, &b.i, 4) == 0, "q/p/i");
         check(a.pc == b.pc, "pc");
-        check(a.mac == b.mac && a.status == b.status && a.clip == b.clip, "flags");
+        // Flags are compared when the program ended: a compiled program may skip flag updates
+        // the translator proved unobservable, which a mid-program snapshot could still show.
+        if (programEnded)
+        {
+            const auto image = compiledImages().find(m_imageHash);
+            const uint32_t statusMask = image != compiledImages().end() ? image->second.statusVerifyMask : 0xFFFu;
+            check(a.mac == b.mac && (a.status & statusMask) == (b.status & statusMask), "flags");
+        }
+        check(a.clip == b.clip, "clip");
         check(a.cycles == b.cycles, "cycles");
         check(a.ebit == b.ebit && a.branchPending == b.branchPending, "control");
         check(std::memcmp(dataAfter.data(), vuData, dataSize) == 0, "data");
