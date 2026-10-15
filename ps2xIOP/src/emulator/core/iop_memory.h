@@ -2,6 +2,7 @@
 
 #include <cstddef>
 #include <cstdint>
+#include <cstring>
 #include <optional>
 #include <span>
 #include <string>
@@ -43,7 +44,19 @@ namespace ps2x::iop::detail
 
         [[nodiscard]] uint8_t read8(uint32_t address) const;
         [[nodiscard]] uint16_t read16(uint32_t address) const;
-        [[nodiscard]] uint32_t read32(uint32_t address) const;
+        // Inline fast path for aligned RAM words (instruction fetch, import-stub checks).
+        [[nodiscard]] uint32_t read32(uint32_t address) const
+        {
+            const uint32_t phys = address & 0x1FFFFFFFu;
+            if ((phys & 3u) == 0u && phys < RamSize)
+            {
+                uint32_t value;
+                std::memcpy(&value, m_ram.data() + phys, sizeof(value));
+                return value;
+            }
+            return read32Slow(address);
+        }
+        [[nodiscard]] uint32_t read32Slow(uint32_t address) const;
         void write8(uint32_t address, uint8_t value);
         void write16(uint32_t address, uint16_t value);
         void write32(uint32_t address, uint32_t value);
@@ -68,6 +81,7 @@ namespace ps2x::iop::detail
         void setInterruptControl(uint32_t value) noexcept { m_interruptControl = value & 1u; }
 
         [[nodiscard]] std::optional<DmaStart> takeDmaStart() noexcept;
+        [[nodiscard]] bool hasDmaStart() const noexcept { return m_dmaStart.has_value(); }
         // Ends an SPU2 DMA transfer when its completion interrupt (0x24/0x28) is delivered:
         // clears CHCR.start and sets the core's STATX DMA-ready bit (0x80).
         void completeSpuDma(int irq);

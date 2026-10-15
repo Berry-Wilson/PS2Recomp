@@ -43,6 +43,7 @@ namespace ps2x::iop::detail
     void IopImportRegistry::reset()
     {
         m_libraries.clear();
+        m_stubCache.clear();
     }
 
     std::optional<IopImportCall> IopImportRegistry::decode(uint32_t pc) const
@@ -53,6 +54,25 @@ namespace ps2x::iop::detail
         if ((delay & 0xFFFF0000u) != 0x24000000u)
             return std::nullopt;
 
+        const uint32_t physicalPc = IopMemory::physicalAddress(pc);
+        if (const auto cached = m_stubCache.find(physicalPc); cached != m_stubCache.end())
+        {
+            const CachedStub &stub = cached->second;
+            if (stub.delay == delay && m_memory.read32(stub.table) == kImportMagic &&
+                m_memory.read32(stub.table + 12u) == stub.name[0] && m_memory.read32(stub.table + 16u) == stub.name[1])
+                return stub.call;
+            m_stubCache.erase(cached);
+        }
+
+        uint32_t table = 0u;
+        std::optional<IopImportCall> call = decodeUncached(pc, delay, table);
+        if (call)
+            m_stubCache[physicalPc] = CachedStub{table, delay, {m_memory.read32(table + 12u), m_memory.read32(table + 16u)}, *call};
+        return call;
+    }
+
+    std::optional<IopImportCall> IopImportRegistry::decodeUncached(uint32_t pc, uint32_t delay, uint32_t &tableOut) const
+    {
         const uint32_t physicalPc = IopMemory::physicalAddress(pc);
         const uint32_t searchBegin = physicalPc > 0x10000u ? physicalPc - 0x10000u : 0u;
         for (uint32_t candidate = physicalPc & ~3u; candidate >= searchBegin + 20u; candidate -= 4u)
@@ -89,6 +109,7 @@ namespace ps2x::iop::detail
             }
             if (valid)
             {
+                tableOut = table;
                 return IopImportCall{
                     trimLibraryName(name),
                     static_cast<uint16_t>(delay & 0xFFFFu),
@@ -184,6 +205,7 @@ namespace ps2x::iop::detail
 
     void IopImportRegistry::eraseRange(uint32_t base, uint32_t size)
     {
+        m_stubCache.clear();
         for (auto library = m_libraries.begin(); library != m_libraries.end();)
         {
             if (library->first >= base && library->first < base + size)

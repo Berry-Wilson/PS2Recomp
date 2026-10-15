@@ -67,7 +67,7 @@ namespace ps2x::iop::detail
         return static_cast<uint16_t>(read8(address) | (static_cast<uint16_t>(read8(address + 1u)) << 8u));
     }
 
-    uint32_t IopMemory::read32(uint32_t address) const
+    uint32_t IopMemory::read32Slow(uint32_t address) const
     {
         const uint32_t phys = physicalAddress(address);
         if ((phys & 3u) == 0u && phys + 3u < RamSize)

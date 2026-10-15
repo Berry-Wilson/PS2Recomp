@@ -125,6 +125,7 @@ namespace ps2x::iop::detail
             timrman.reset();
             ioman.reset();
             pendingDmaInterrupts.clear();
+            nextDmaDue = ~0ull;
             pendingGuestCallbacks.clear();
             nextModuleId = 1;
             moduleCursor = kModuleLoadBase;
@@ -176,8 +177,20 @@ namespace ps2x::iop::detail
 
         void schedulePendingDma()
         {
+            if (!memory.hasDmaStart())
+                return;
             if (const auto dma = memory.takeDmaStart())
+            {
                 pendingDmaInterrupts[dma->irq] = totalCycles + dma->delayCycles;
+                refreshNextDmaDue();
+            }
+        }
+
+        void refreshNextDmaDue()
+        {
+            nextDmaDue = ~0ull;
+            for (const auto &[irq, completionCycle] : pendingDmaInterrupts)
+                nextDmaDue = std::min(nextDmaDue, completionCycle);
         }
 
         bool readRam(uint32_t address, void *destination, size_t size) const
@@ -379,7 +392,8 @@ namespace ps2x::iop::detail
             if (checkInterrupt(cpu))
                 return true;
 
-            if (const auto import = imports.decode(cpu.pc))
+            // Import stubs are "jr ra" with the ordinal in the delay slot; skip the decoder otherwise.
+            if (const auto import = memory.read32(cpu.pc) == 0x03E00008u ? imports.decode(cpu.pc) : std::nullopt)
             {
                 const ImportDisposition disposition = dispatchImport(*import, cpu);
                 ++totalInstructions;
@@ -398,19 +412,32 @@ namespace ps2x::iop::detail
             return running;
         }
 
-        uint32_t runCpu(CpuState &cpu, uint32_t instructionBudget)
+        // endAfterService: return as soon as a thread became ready (kernel call, DMA interrupt or
+        // guest callback), so the thread scheduler can switch to it (scheduler slices).
+        uint32_t runCpu(CpuState &cpu, uint32_t instructionBudget, bool endAfterService = false)
         {
             CpuState *previous = activeCpu;
             activeCpu = &cpu;
             const uint64_t start = totalInstructions;
             while (!cpu.stopped && !cpu.yielded && totalInstructions - start < instructionBudget)
             {
+                const uint64_t readyBefore = kernel.readyEvents();
                 if (!step(cpu))
                     break;
-                if (!servicingDmaInterrupts && !pendingDmaInterrupts.empty())
+                bool serviced = kernel.readyEvents() != readyBefore;
+                if (!servicingDmaInterrupts && totalCycles >= nextDmaDue)
+                {
                     servicePendingDmaInterrupts();
-                if (!servicingGuestCallbacks && !pendingGuestCallbacks.empty())
+                    serviced = true;
+                }
+                if (!servicingGuestCallbacks && !pendingGuestCallbacks.empty() &&
+                    pendingGuestCallbacks.begin()->first <= totalCycles)
+                {
                     servicePendingGuestCallbacks();
+                    serviced = true;
+                }
+                if (serviced && endAfterService)
+                    break;
             }
             activeCpu = previous;
             return static_cast<uint32_t>(totalInstructions - start);
@@ -522,6 +549,7 @@ namespace ps2x::iop::detail
                 completed.push_back(it->first);
                 it = pendingDmaInterrupts.erase(it);
             }
+            refreshNextDmaDue();
             try
             {
                 for (const int irq : completed)
@@ -536,6 +564,7 @@ namespace ps2x::iop::detail
                 throw;
             }
             servicingDmaInterrupts = false;
+            refreshNextDmaDue();
         }
 
         void servicePendingGuestCallbacks()
@@ -602,7 +631,16 @@ namespace ps2x::iop::detail
                         continue;
                     }
                     const uint64_t before = totalCycles;
-                    runCpu(next->cpu, static_cast<uint32_t>(std::min<uint64_t>(kDefaultSlice, target - totalCycles)));
+                    // Run until the next scheduled event instead of a fixed short slice: timers,
+                    // delayed threads, guest callbacks and DMA completions are only checked here.
+                    uint64_t sliceEnd = timrman.nextEventCycle(kernel.nextWakeCycle(target));
+                    sliceEnd = std::min(sliceEnd, nextDmaDue);
+                    if (!pendingGuestCallbacks.empty())
+                        sliceEnd = std::min(sliceEnd, pendingGuestCallbacks.begin()->first);
+                    const uint64_t sliceCycles = sliceEnd > totalCycles ? sliceEnd - totalCycles : 1u;
+                    runCpu(next->cpu,
+                           static_cast<uint32_t>(std::min<uint64_t>({kMaxEventFreeSlice, sliceCycles, target - totalCycles})),
+                           true);
                     kernel.endTimeslice(*next, kThreadReturnSentinel);
                     if (totalCycles == before)
                         ++totalCycles;
@@ -722,6 +760,9 @@ namespace ps2x::iop::detail
         IopLoadcore loadcore;
         std::map<int, Module> modules;
         std::map<int, uint64_t> pendingDmaInterrupts;
+        // Earliest completion cycle in pendingDmaInterrupts (~0 when empty); lets the
+        // per-instruction loop skip the map until something is actually due.
+        uint64_t nextDmaDue = ~0ull;
         std::multimap<uint64_t, ScheduledGuestCallback> pendingGuestCallbacks;
         uint32_t nextModuleId = 1;
         uint32_t moduleCursor = kModuleLoadBase;

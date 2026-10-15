@@ -61,6 +61,7 @@ namespace ps2x::iop::detail
         void delayCurrentUntil(uint64_t wakeCycle, IopCpuState &cpu);
 
         [[nodiscard]] IopThread *beginNextReady(uint64_t currentCycle);
+        [[nodiscard]] uint64_t readyEvents() const noexcept { return m_readyEvents; }
         [[nodiscard]] uint64_t nextWakeCycle(uint64_t fallback) const;
         void endTimeslice(IopThread &thread, uint32_t returnSentinel);
         void cleanupDeadThreads();
@@ -93,6 +94,8 @@ namespace ps2x::iop::detail
 
         IopMemory &m_memory;
         std::map<int, IopThread> m_threads;
+        // Bumped whenever a thread becomes ready or changes priority outside the scheduler.
+        uint64_t m_readyEvents = 0;
         std::map<int, Semaphore> m_semaphores;
         std::map<int, EventFlag> m_eventFlags;
         uint32_t m_nextThreadId = 1;

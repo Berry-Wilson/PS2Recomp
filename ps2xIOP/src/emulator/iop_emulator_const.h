@@ -10,6 +10,9 @@ constexpr uint64_t kIopClockHz = 36'864'000ull;
 constexpr uint64_t kVblankPeriodCycles = (kIopClockHz * 1001ull + 30'000ull) / 60'000ull;
 constexpr uint64_t kVblankEndPhaseCycles = kVblankPeriodCycles / 16ull;
 constexpr uint32_t kDefaultSlice = 256u;
+// Upper bound for a scheduler slice when no timer, wake-up, callback or DMA completion is
+// due sooner; slices also end as soon as an interrupt or callback has been serviced.
+constexpr uint32_t kMaxEventFreeSlice = 4096u;
 constexpr uint32_t kMaxCallInstructions = 2'000'000u;
 constexpr uint32_t kModuleLoadBase = 0x00010000u;
 constexpr uint32_t kStackGuardBytes = 64u;

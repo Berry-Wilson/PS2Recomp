@@ -99,6 +99,7 @@ namespace ps2x::iop::detail
             thread.cpu.gpr[29] = alignUp(thread.stackBase + thread.stackSize, 16u) - 16u;
             thread.cpu.gpr[31] = kThreadReturnSentinel;
             thread.state = IopThreadState::Ready;
+            ++m_readyEvents;
             setV0(0);
             return true;
         }
@@ -143,6 +144,7 @@ namespace ps2x::iop::detail
                 return true;
             }
             it->second.priority = std::clamp<uint32_t>(cpu.gpr[5], 1u, 126u);
+            ++m_readyEvents;
             setV0(0);
             return true;
         }
@@ -167,6 +169,7 @@ namespace ps2x::iop::detail
                 it->second.state == IopThreadState::EventFlag)
             {
                 it->second.state = IopThreadState::Ready;
+                ++m_readyEvents;
             }
             setV0(0);
             return true;
@@ -202,7 +205,10 @@ namespace ps2x::iop::detail
                 return true;
             }
             if (it->second.state == IopThreadState::Sleep)
+            {
                 it->second.state = IopThreadState::Ready;
+                ++m_readyEvents;
+            }
             else
                 ++it->second.wakeupCount;
             setV0(0);
@@ -250,7 +256,10 @@ namespace ps2x::iop::detail
                 return true;
             }
             if (it->second.state == IopThreadState::Suspended)
+            {
                 it->second.state = IopThreadState::Ready;
+                ++m_readyEvents;
+            }
             setV0(0);
             return true;
         }
@@ -467,6 +476,7 @@ namespace ps2x::iop::detail
         {
             --semaphore->second.current;
             best->state = IopThreadState::Ready;
+            ++m_readyEvents;
             best->waitId = 0;
         }
     }
@@ -493,6 +503,7 @@ namespace ps2x::iop::detail
             if ((thread.waitMode & 0x10u) != 0u)
                 event.bits = 0u;
             thread.state = IopThreadState::Ready;
+            ++m_readyEvents;
             thread.waitId = 0;
             thread.waitBits = 0;
             thread.waitMode = 0;
@@ -554,6 +565,7 @@ namespace ps2x::iop::detail
                 if (thread.state == IopThreadState::EventFlag && thread.waitId == id)
                 {
                     thread.state = IopThreadState::Ready;
+                    ++m_readyEvents;
                     thread.waitId = 0;
                     thread.cpu.gpr[2] = static_cast<uint32_t>(-1);
                 }
