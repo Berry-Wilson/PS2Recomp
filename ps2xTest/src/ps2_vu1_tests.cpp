@@ -4,6 +4,7 @@
 #include "runtime/gs/ps2_gs_psmct32.h"
 #include "runtime/ps2_memory.h"
 #include "runtime/ps2_vu1.h"
+#include "runtime/ps2_vu1_options.h"
 
 #include <cmath>
 #include <cstdint>
@@ -577,6 +578,47 @@ void register_ps2_vu1_tests()
                      "dependent ADD should consume the completed x lane");
             t.Equals(vu1.state().cycles, static_cast<uint64_t>(8u),
                      "dependency stall and the dependent FMAC writeback must both consume cycles");
+        });
+
+        tc.Run("immediate writeback matches delayed writeback results and cycles at program end", [](TestCase &t)
+        {
+            auto runProgram = [&](bool immediate, float out[3][4], uint64_t &cycles)
+            {
+                Vu1Fixture fx;
+                t.IsTrue(fx.initialize(), "VU1 fixture should initialize");
+                writeVuInstructionPair(fx.code, 0u, 0u, makeVuUpper(0x28u, 0xFu, 2u, 1u, 3u));   // ADD vf3, vf1, vf2
+                writeVuInstructionPair(fx.code, 8u, 0u, makeVuUpper(0x28u, 0xCu, 2u, 3u, 4u));   // ADD.xy vf4, vf3, vf2
+                writeVuInstructionPair(fx.code, 16u, 0u, makeVuUpperSpecial(0x28u, 0xFu, 4u, 3u)); // ADDA acc, vf3, vf4
+                writeVuInstructionPair(fx.code, 24u, 0u, makeVuUpper(0x29u, 0xFu, 2u, 1u, 5u));  // MADD vf5, vf1, vf2
+                writeVuInstructionPair(fx.code, 32u, 0u, 0x400002FFu);                           // NOP[E]
+                writeVuInstructionPair(fx.code, 40u, 0u, 0x000002FFu);                           // NOP (delay slot)
+
+                setVu1ImmediateWriteback(immediate);
+                VU1Interpreter vu1;
+                for (uint32_t i = 0; i < 4u; ++i)
+                {
+                    vu1.state().vf[1][i] = 1.5f + static_cast<float>(i);
+                    vu1.state().vf[2][i] = -0.25f * static_cast<float>(i + 1u);
+                }
+                vu1.execute(fx.code, PS2_VU1_CODE_SIZE, fx.data, PS2_VU1_DATA_SIZE, fx.gs, &fx.mem, 0u, 0u, 0u, 1000u);
+                setVu1ImmediateWriteback(false);
+                for (uint32_t r = 0; r < 3u; ++r)
+                    for (uint32_t i = 0; i < 4u; ++i)
+                        out[r][i] = vu1.state().vf[3u + r][i];
+                cycles = vu1.state().cycles;
+            };
+
+            float delayed[3][4]{};
+            float immediate[3][4]{};
+            uint64_t delayedCycles = 0u;
+            uint64_t immediateCycles = 0u;
+            runProgram(false, delayed, delayedCycles);
+            runProgram(true, immediate, immediateCycles);
+            t.IsTrue(delayedCycles > 5u, "the dependent program should stall");
+            t.Equals(immediateCycles, delayedCycles, "immediate writeback must not change VU1 timing");
+            for (uint32_t r = 0; r < 3u; ++r)
+                for (uint32_t i = 0; i < 4u; ++i)
+                    t.Equals(immediate[r][i], delayed[r][i], "immediate writeback must produce the same registers");
         });
 
         tc.Run("ACC forwarding feeds the next upper instruction without a dependency stall", [](TestCase &t)
