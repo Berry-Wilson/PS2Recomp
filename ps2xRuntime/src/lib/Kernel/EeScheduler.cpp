@@ -843,7 +843,10 @@ void EeScheduler::transferIfRequested(bool interruptSafe)
 int EeScheduler::createSemaphore(int initCount, int maxCount, uint32_t attr, uint32_t option)
 {
     assertExecutor();
-    if (maxCount <= 0 || initCount < 0 || initCount > maxCount)
+    // The EE kernel only validates init_count: games create semaphores with max_count 0
+    // (dot hack's ccPcmSound), which behave as unbounded. Rejecting them leaves the game
+    // waiting on id -1, which fails immediately and turns blocking loops into spins.
+    if (initCount < 0 || (maxCount > 0 && initCount > maxCount))
     {
         return KE_ERROR;
     }
@@ -903,7 +906,7 @@ int EeScheduler::signalSemaphore(int id, bool interruptSafe)
         publishSnapshot();
         return id;
     }
-    if (object->count == object->maxCount)
+    if (object->maxCount > 0 && object->count >= object->maxCount)
     {
         return KE_SEMA_OVF;
     }

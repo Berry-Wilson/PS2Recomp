@@ -630,6 +630,39 @@ void register_ps2_runtime_kernel_tests()
             t.Equals(semaphore->option, semaParam.option, "semaphore option must be decoded from offset 0x14");
         });
 
+        tc.Run("CreateSema accepts max_count 0 as an unbounded semaphore", [](TestCase &t)
+        {
+            // The EE kernel only validates init_count; dot hack creates its PCM stream semaphore
+            // with max_count 0 and blocks on it, so it must exist and count signals.
+            TestEnv env;
+            EeSemaStatus semaParam{};
+            semaParam.max_count = 0;
+            semaParam.init_count = 0;
+            std::memcpy(env.rdram.data() + K_PARAM_ADDR, &semaParam, sizeof(semaParam));
+            setRegU32(env.ctx, 4, K_PARAM_ADDR);
+            CreateSema(env.rdram.data(), &env.ctx, &env.runtime);
+            const int semaId = getRegS32(env.ctx, 2);
+            t.IsTrue(semaId > 0, "max_count 0 must still create a semaphore");
+
+            for (int i = 0; i < 2; ++i)
+            {
+                setRegU32(env.ctx, 4, static_cast<uint32_t>(semaId));
+                SignalSema(env.rdram.data(), &env.ctx, &env.runtime);
+                t.Equals(getRegS32(env.ctx, 2), semaId, "signalling an unbounded semaphore must not overflow");
+            }
+            t.Equals(env.runtime.eeScheduler().semaphore(semaId)->count, 2, "both signals must be counted");
+
+            setRegU32(env.ctx, 4, static_cast<uint32_t>(semaId));
+            PollSema(env.rdram.data(), &env.ctx, &env.runtime);
+            t.Equals(getRegS32(env.ctx, 2), semaId, "PollSema should take one count");
+
+            semaParam.init_count = -1;
+            std::memcpy(env.rdram.data() + K_PARAM_ADDR, &semaParam, sizeof(semaParam));
+            setRegU32(env.ctx, 4, K_PARAM_ADDR);
+            CreateSema(env.rdram.data(), &env.ctx, &env.runtime);
+            t.Equals(getRegS32(env.ctx, 2), KE_ERROR, "a negative init_count is still rejected");
+        });
+
         tc.Run("EE scheduler selects absolute priority then FIFO", [](TestCase &t)
         {
             TestEnv env;

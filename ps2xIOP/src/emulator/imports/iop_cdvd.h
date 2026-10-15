@@ -3,6 +3,7 @@
 #include <cstdint>
 #include <memory>
 #include <optional>
+#include <string_view>
 
 namespace ps2x::iop
 {
@@ -35,6 +36,13 @@ namespace ps2x::iop::detail
 
         [[nodiscard]] bool dispatchImport(uint16_t ordinal, IopCpuState &cpu);
         [[nodiscard]] std::optional<CompletionCallback> takeCompletionCallback() noexcept;
+
+        // ioman access to "cdrom0:" files; negative results are -errno.
+        [[nodiscard]] int32_t openFile(std::string_view guestPath);
+        int32_t closeFile(int32_t fd);
+        [[nodiscard]] int32_t readFile(int32_t fd, uint32_t destination, uint32_t size);
+        [[nodiscard]] int32_t seekFile(int32_t fd, int32_t offset, uint32_t whence);
+        [[nodiscard]] uint32_t errorCode() const noexcept;
 
     private:
         class Impl;

@@ -202,6 +202,8 @@ namespace ps2x::iop::detail
             nodes.clear();
             metadataSectors.clear();
             imageHandle = 0u;
+            openFiles.clear();
+            nextFileDescriptor = 1;
         }
 
         bool dispatchImport(uint16_t ordinal, IopCpuState &cpu)
@@ -355,7 +357,90 @@ namespace ps2x::iop::detail
             return result;
         }
 
+        // ioman "cdrom0:" files. Native CDVDMAN registers this device with ioman; the HLE
+        // cdvdman serves it straight from the virtual disc.
+        int32_t openFile(std::string_view guestPath)
+        {
+            IsoNode *node = findVirtualIsoNode(guestPath);
+            if (!node || node->directory)
+                return kErrorNoEntry;
+            const int32_t fd = nextFileDescriptor++;
+            openFiles[fd] = OpenFile{static_cast<size_t>(node - nodes.data()), 0u};
+            return fd;
+        }
+
+        int32_t closeFile(int32_t fd)
+        {
+            return openFiles.erase(fd) != 0u ? 0 : kErrorBadFile;
+        }
+
+        int32_t readFile(int32_t fd, uint32_t destination, uint32_t size)
+        {
+            const auto file = openFiles.find(fd);
+            if (file == openFiles.end())
+                return kErrorBadFile;
+            IsoNode &node = nodes[file->second.node];
+            const uint32_t position = std::min(file->second.position, node.size);
+            const uint32_t count = std::min(size, node.size - position);
+            if (count == 0u)
+                return 0;
+            if (node.handle == 0u)
+                node.handle = host.openHostFile(node.hostPath.string());
+            std::vector<uint8_t> bytes(count, 0u);
+            size_t bytesRead = 0u;
+            if (node.handle == 0u ||
+                !host.readHostFile(node.handle, position, bytes.data(), bytes.size(), bytesRead) ||
+                bytesRead != bytes.size() || !memory.writeRam(destination, bytes.data(), bytes.size()))
+            {
+                return kErrorIo;
+            }
+            file->second.position = position + count;
+            return static_cast<int32_t>(count);
+        }
+
+        int32_t seekFile(int32_t fd, int32_t offset, uint32_t whence)
+        {
+            const auto file = openFiles.find(fd);
+            if (file == openFiles.end())
+                return kErrorBadFile;
+            int64_t base = 0;
+            switch (whence)
+            {
+            case 0: // SEEK_SET
+                break;
+            case 1: // SEEK_CUR
+                base = file->second.position;
+                break;
+            case 2: // SEEK_END
+                base = nodes[file->second.node].size;
+                break;
+            default:
+                return kErrorInvalid;
+            }
+            const int64_t position = base + offset;
+            if (position < 0 || position > std::numeric_limits<int32_t>::max())
+                return kErrorInvalid;
+            file->second.position = static_cast<uint32_t>(position);
+            return static_cast<int32_t>(position);
+        }
+
+        uint32_t errorCode() const noexcept
+        {
+            return lastError;
+        }
+
     private:
+        static constexpr int32_t kErrorNoEntry = -2;
+        static constexpr int32_t kErrorIo = -5;
+        static constexpr int32_t kErrorBadFile = -9;
+        static constexpr int32_t kErrorInvalid = -22;
+
+        struct OpenFile
+        {
+            size_t node = 0u;
+            uint32_t position = 0u;
+        };
+
         int ensureInterruptEventFlag()
         {
             if (interruptEventFlagId == 0)
@@ -730,6 +815,8 @@ namespace ps2x::iop::detail
         uint32_t volumeSectors = 0u;
         std::vector<IsoNode> nodes;
         std::unordered_map<uint32_t, std::array<uint8_t, kSectorSize>> metadataSectors;
+        std::unordered_map<int32_t, OpenFile> openFiles;
+        int32_t nextFileDescriptor = 1;
     };
 
     IopCdvd::IopCdvd(IopHost &host, IopMemory &memory, IopKernel &kernel)
@@ -752,5 +839,30 @@ namespace ps2x::iop::detail
     std::optional<IopCdvd::CompletionCallback> IopCdvd::takeCompletionCallback() noexcept
     {
         return m_impl->takeCompletionCallback();
+    }
+
+    int32_t IopCdvd::openFile(std::string_view guestPath)
+    {
+        return m_impl->openFile(guestPath);
+    }
+
+    int32_t IopCdvd::closeFile(int32_t fd)
+    {
+        return m_impl->closeFile(fd);
+    }
+
+    int32_t IopCdvd::readFile(int32_t fd, uint32_t destination, uint32_t size)
+    {
+        return m_impl->readFile(fd, destination, size);
+    }
+
+    int32_t IopCdvd::seekFile(int32_t fd, int32_t offset, uint32_t whence)
+    {
+        return m_impl->seekFile(fd, offset, whence);
+    }
+
+    uint32_t IopCdvd::errorCode() const noexcept
+    {
+        return m_impl->errorCode();
     }
 }

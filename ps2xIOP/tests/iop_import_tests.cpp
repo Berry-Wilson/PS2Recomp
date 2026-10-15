@@ -3,6 +3,7 @@
 #include "emulator/core/iop_memory.h"
 #include "emulator/imports/iop_cdvd.h"
 #include "emulator/imports/iop_imports.h"
+#include "emulator/imports/iop_ioman.h"
 #include "emulator/imports/iop_loadcore.h"
 #include "emulator/imports/iop_timrman.h"
 #include "emulator/services/iop_rpc.h"
@@ -305,6 +306,71 @@ namespace
         return passed;
     }
 
+    bool testIomanReadsCdromFiles()
+    {
+        // SEWORDS.IRX loads BGM/voice banks with ioman open/lseek/read on "cdrom0:" paths.
+        const auto suffix = std::to_string(
+            static_cast<unsigned long long>(std::chrono::steady_clock::now().time_since_epoch().count()));
+        const std::filesystem::path root =
+            std::filesystem::temp_directory_path() / ("ps2x-iop-ioman-cdrom-" + suffix);
+        std::error_code error;
+        std::filesystem::create_directories(root / "VOICE", error);
+        if (!expect(!error, "could not create the temporary CD root"))
+            return false;
+        {
+            std::ofstream file(root / "VOICE" / "BGM.BIN", std::ios::binary);
+            file.write("0123456789", 10);
+        }
+
+        CdRootHost host(root);
+        IopMemory memory;
+        IopKernel kernel(memory);
+        kernel.reset();
+        IopCdvd cdvd(host, memory, kernel);
+        cdvd.reset();
+        IopIoman ioman(memory, cdvd);
+        RecordingExecutor executor;
+
+        constexpr uint32_t pathAddress = 0x2400u;
+        constexpr uint32_t bufferAddress = 0x2800u;
+        const char path[] = "cdrom0:\\VOICE\\BGM.BIN;1";
+        (void)memory.writeRam(pathAddress, path, sizeof(path));
+
+        IopCpuState cpu{};
+        cpu.gpr[4] = pathAddress;
+        cpu.gpr[5] = 1u; // O_RDONLY
+        bool passed = expect(ioman.dispatchImport(4u, cpu, executor), "ioman open was not handled");
+        const uint32_t fd = cpu.gpr[2];
+        passed = passed && expect(static_cast<int32_t>(fd) >= 0, "ioman open failed for a cdrom0: file");
+
+        cpu.gpr[4] = fd;
+        cpu.gpr[5] = 0u;
+        cpu.gpr[6] = 2u; // SEEK_END
+        passed = passed && expect(ioman.dispatchImport(8u, cpu, executor) && cpu.gpr[2] == 10u,
+                                  "ioman lseek(SEEK_END) did not return the file size");
+        cpu.gpr[4] = fd;
+        cpu.gpr[5] = 3u;
+        cpu.gpr[6] = 0u; // SEEK_SET
+        passed = passed && expect(ioman.dispatchImport(8u, cpu, executor) && cpu.gpr[2] == 3u,
+                                  "ioman lseek(SEEK_SET) did not move the position");
+
+        cpu.gpr[4] = fd;
+        cpu.gpr[5] = bufferAddress;
+        cpu.gpr[6] = 16u;
+        passed = passed && expect(ioman.dispatchImport(6u, cpu, executor) && cpu.gpr[2] == 7u,
+                                  "ioman read did not stop at the end of the file");
+        passed = passed && expect(memory.readString(bufferAddress, 7u) == "3456789", "ioman read returned the wrong bytes");
+
+        cpu.gpr[4] = fd;
+        passed = passed && expect(ioman.dispatchImport(5u, cpu, executor) && cpu.gpr[2] == 0u, "ioman close failed");
+        cpu.gpr[4] = fd;
+        passed = passed && expect(ioman.dispatchImport(5u, cpu, executor) && static_cast<int32_t>(cpu.gpr[2]) < 0,
+                                  "ioman close accepted a closed descriptor");
+
+        std::filesystem::remove_all(root, error);
+        return passed;
+    }
+
     bool testCdvdReadSpillsPastAllocation()
     {
         // Drivers read ceil(size / 2048) sectors into a buffer allocated for the exact file size;
@@ -422,7 +488,7 @@ namespace
 
 int main()
 {
-    if (!testLoadcoreRebootLibraryMode() || !testCdvdSpecialControl() || !testCdvdSearchFile() || !testCdvdReadSpillsPastAllocation() ||
+    if (!testLoadcoreRebootLibraryMode() || !testCdvdSpecialControl() || !testCdvdSearchFile() || !testIomanReadsCdromFiles() || !testCdvdReadSpillsPastAllocation() ||
         !testTimrmanPeriodicCallback())
         return 1;
     std::cout << "ps2xIOP import tests passed\n";

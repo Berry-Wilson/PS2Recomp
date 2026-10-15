@@ -3986,6 +3986,31 @@ void register_ps2_gs_tests()
             }
         });
 
+        tc.Run("sceGsExecLoadImage uses vram_addr as the BITBLTBUF block pointer", [](TestCase &t)
+        {
+            PS2Runtime runtime;
+            t.IsTrue(runtime.memory().initialize(), "runtime memory initialize should succeed");
+            uint8_t *const rdram = runtime.memory().getRDRAM();
+            constexpr uint32_t kImageAddr = 0x4000u;
+            constexpr uint32_t kSrcAddr = 0x5000u;
+
+            // 16x16 CT32 CLUT at block 0x3300, as ccBltData::LoadData uploads it.
+            const GsImageMem image{0u, 0u, 16u, 16u, 0x3300u, 1u, 0u};
+            writeGsImageTest(rdram, kImageAddr, image);
+            std::memset(rdram + kSrcAddr, 0x7F, 16u * 16u * 4u);
+
+            R5900Context ctx{};
+            setRegU32(ctx, 4, kImageAddr);
+            setRegU32(ctx, 5, kSrcAddr);
+            ps2_stubs::sceGsExecLoadImage(rdram, &ctx, &runtime);
+            t.Equals(static_cast<int32_t>(getRegU32Test(ctx, 2)), 0, "upload should succeed");
+
+            uint64_t bitbltbuf = 0u;
+            std::memcpy(&bitbltbuf, rdram + runtime.guestHeapBase() + 16u, sizeof(bitbltbuf));
+            t.Equals(static_cast<uint32_t>((bitbltbuf >> 32) & 0x3FFFu), 0x3300u,
+                     "DBP should equal vram_addr (already in 64-word blocks)");
+        });
+
         tc.Run("sceGifPkRefLoadImage seeds A+D GIFtag nloop once (no double-count)", [](TestCase &t)
         {
             std::vector<uint8_t> rdram(PS2_RAM_SIZE, 0u);
