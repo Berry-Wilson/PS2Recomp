@@ -216,6 +216,9 @@ private:
     std::array<PendingVfWrite, kMaxPendingVfWrites> m_vfWritePipeline{};
     std::array<PendingViWrite, kMaxPendingViWrites> m_viWritePipeline{};
     std::array<PendingAccWrite, kMaxPendingAccWrites> m_accWritePipeline{};
+    // Earliest readyCycle of any queued pipeline entry; commitReadyPipelines() runs every cycle
+    // and returns immediately before this.
+    uint64_t m_nextCommitCycle = ~0ull;
     XgkickPipeline m_xgkick{};
     std::array<std::array<uint64_t, 4>, 32> m_vfReady{};
     std::array<uint64_t, 16> m_viReady{};
@@ -278,6 +281,7 @@ private:
 
     void resetScheduler();
     void commitReadyPipelines();
+    void commitReadyPipelinesNow();
     void advanceOneCycle();
     void advanceTo(uint64_t targetCycle);
     void flushPipelines();

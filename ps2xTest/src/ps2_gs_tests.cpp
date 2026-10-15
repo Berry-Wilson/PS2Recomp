@@ -557,8 +557,13 @@ void register_ps2_gs_tests()
             std::memcpy(&xyoffset10Addr, rdram.data() + kEnvAddr + kXYOffset1AddrOffset, sizeof(xyoffset10Addr));
 
             t.Equals((dispfb0 >> 9) & 0x3Fu, 10ull, "dbuff display env should seed FBW from width");
-            t.Equals((display0 >> 32) & 0x0FFFull, 639ull, "dbuff display env should seed DW from width");
-            t.Equals((display0 >> 44) & 0x07FFull, 447ull, "dbuff display env should seed DH from height");
+            // DW is in video clocks: in NTSC/PAL a 640-pixel buffer is magnified x4 (MAGH=3, DW=2559),
+            // so check the width it scans out in pixels.
+            t.Equals((((display0 >> 32) & 0x0FFFull) + 1ull) / (((display0 >> 23) & 0xFull) + 1ull), 640ull,
+                     "dbuff display env should seed DW/MAGH for the buffer width");
+            // The test runs in interlaced frame mode (from an earlier sceGsResetGraph), where libgs
+            // doubles the supplied height.
+            t.Equals((display0 >> 44) & 0x07FFull, 895ull, "interlaced frame mode should double the supplied height");
             t.Equals((frame10 >> 16) & 0x3Full, 10ull, "dbuff draw env should seed FRAME FBW from width");
             t.Equals(frame10Addr, 0x4Cull, "dbuff draw env should seed FRAME_1 register id");
             t.Equals(xyoffset10 & 0xFFFFull, 0x6C00ull, "dbuff draw env should seed OFX in 12.4 fixed point");
@@ -579,7 +584,8 @@ void register_ps2_gs_tests()
 
             t.Equals(runtime.memory().gs().dispfb1 & 0x1FFull, 151ull,
                      "sceGsSwapDBuffDc should program GS to the selected display page");
-            t.Equals((runtime.memory().gs().display1 >> 32) & 0x0FFFull, 639ull,
+            t.Equals((((runtime.memory().gs().display1 >> 32) & 0x0FFFull) + 1ull) /
+                         (((runtime.memory().gs().display1 >> 23) & 0xFull) + 1ull), 640ull,
                      "sceGsSwapDBuffDc should preserve the display width from the seeded env");
         });
 

@@ -5,12 +5,18 @@
 #include "game_overrides.h"
 #include "ps2_runtime_macros.h"
 #include "runtime/gs/gs_frontend.h"
+#ifdef PS2X_GS_PARALLEL
+#include "runtime/gs/gs_parallel_backend.h"
+#endif
 #include "runtime/ee_scheduler.h"
 #include "ThreadNaming.h"
 #include "Kernel/Stubs/Audio.h"
 #include "Kernel/Stubs/GS.h"
 #include "Kernel/Stubs/MPEG.h"
 #include "ps2_host_backend.h"
+#ifdef PS2X_GS_PARALLEL
+#include "rlgl.h" // after raylib.h, which defines RL_MATRIX_TYPE
+#endif
 #include "ps2_iop_host.h"
 #include "ps2x/iop/iop_subsystem.h"
 
@@ -456,7 +462,21 @@ static void UploadFrame(Texture2D &tex, PS2Runtime *rt, uint32_t &outWidth, uint
         s_lastPresentationTick = currentTick;
         s_hasLatchedInitialFrame = true;
     }
-    else if (s_hasUploadedFrame)
+#ifdef PS2X_GS_PARALLEL
+    // parallel-gs in GL-interop mode presents a shared GL texture that run() draws directly;
+    // in readback mode the frame arrives as pixels and takes the normal upload path below.
+    {
+        float aspect = 0.0f;
+        uint32_t gpuWidth = 0u, gpuHeight = 0u;
+        if (rt->gs().getLatchedGpuFrame(gpuWidth, gpuHeight, aspect))
+        {
+            outWidth = gpuWidth;
+            outHeight = gpuHeight;
+            return;
+        }
+    }
+#endif
+    if (!needsLatch && s_hasUploadedFrame)
     {
         outWidth = (s_lastWidth != 0u) ? s_lastWidth : FB_WIDTH;
         outHeight = (s_lastHeight != 0u) ? s_lastHeight : DEFAULT_DISPLAY_HEIGHT;
@@ -612,6 +632,7 @@ PS2Runtime::~PS2Runtime()
 
         if (IsWindowReady())
         {
+            m_gs.shutdownBackend();
             CloseWindow();
         }
 
@@ -728,8 +749,8 @@ bool PS2Runtime::syncCoreSubsystems()
     }
 
     m_gs.init(gsVram, static_cast<uint32_t>(PS2_GS_VRAM_SIZE), &m_memory.gs());
-    m_gifArbiter.setProcessPacketFn([this](const uint8_t *data, uint32_t size)
-                                    { m_gs.processGIFPacket(data, size); });
+    m_gifArbiter.setProcessPacketFn([this](GifPathId path, const uint8_t *data, uint32_t size)
+                                    { m_gs.processGIFPacket(data, size, static_cast<uint32_t>(path)); });
     m_memory.setGifArbiter(&m_gifArbiter);
     m_memory.setVu1MscalCallback([this](uint32_t startPC, uint32_t top, uint32_t itop)
                                  {
@@ -798,6 +819,10 @@ bool PS2Runtime::initialize(const char *title)
         InitWindow(HOST_WINDOW_WIDTH, HOST_WINDOW_HEIGHT, title);
         InitAudioDevice();
         m_audioBackend.setAudioReady(IsAudioDeviceReady());
+#endif
+#ifdef PS2X_GS_PARALLEL
+        // Needs the window's current OpenGL context to share the Vulkan scanout image.
+        m_gs.setRasterBackend(CreateParallelGSBackend(m_memory.gs()));
 #endif
         SetTargetFPS(60);
         if (m_debugUiInitCallback)
@@ -2498,14 +2523,28 @@ void PS2Runtime::run()
         uint32_t presentHeight = DEFAULT_DISPLAY_HEIGHT;
         UploadFrame(frameTex, this, presentWidth, presentHeight);
 
+        Texture2D presentationTexture = frameTex;
+        float aspectRatio = 0.0f;
+#ifdef PS2X_GS_PARALLEL
+        uint32_t gpuWidth = 0u, gpuHeight = 0u;
+        auto gpuFrame = m_gs.getLatchedGpuFrame(gpuWidth, gpuHeight, aspectRatio);
+        if (gpuFrame)
+        {
+            presentWidth = gpuWidth;
+            presentHeight = gpuHeight;
+            presentationTexture = Texture2D{gpuFrame->AcquireTexture(), int(presentWidth), int(presentHeight), 1, PIXELFORMAT_UNCOMPRESSED_R8G8B8A8};
+        }
+#endif
+
         BeginDrawing();
         ClearBackground(BLACK);
         const float srcWidth = static_cast<float>(std::max<uint32_t>(1u, presentWidth));
         const float srcHeight = static_cast<float>(std::max<uint32_t>(1u, presentHeight));
         const float screenWidth = static_cast<float>(GetScreenWidth());
         const float screenHeight = static_cast<float>(GetScreenHeight());
-        const float scale = std::min(screenWidth / srcWidth, screenHeight / srcHeight);
-        const float dstWidth = srcWidth * scale;
+        const float displayWidth = aspectRatio > 0.0f ? srcHeight * aspectRatio : srcWidth;
+        const float scale = std::min(screenWidth / displayWidth, screenHeight / srcHeight);
+        const float dstWidth = displayWidth * scale;
         const float dstHeight = srcHeight * scale;
         const Rectangle srcRect{0.0f, 0.0f, srcWidth, srcHeight};
         const Rectangle dstRect{
@@ -2513,7 +2552,15 @@ void PS2Runtime::run()
             (screenHeight - dstHeight) * 0.5f,
             dstWidth,
             dstHeight};
-        DrawTexturePro(frameTex, srcRect, dstRect, Vector2{0.0f, 0.0f}, 0.0f, WHITE);
+        if (presentationTexture.id)
+            DrawTexturePro(presentationTexture, srcRect, dstRect, Vector2{0.0f, 0.0f}, 0.0f, WHITE);
+#ifdef PS2X_GS_PARALLEL
+        if (gpuFrame)
+        {
+            rlDrawRenderBatchActive(); // GL must sample the shared texture before it is released.
+            gpuFrame->ReleaseTexture();
+        }
+#endif
         if (m_debugUiInitialized && m_debugUiDrawCallback)
         {
             m_debugUiDrawCallback(*this, m_debugUiUserData);
@@ -2540,6 +2587,7 @@ void PS2Runtime::run()
         m_debugUiInitialized = false;
     }
     UnloadTexture(frameTex);
+    m_gs.shutdownBackend();
     CloseWindow();
 
     RUNTIME_LOG("[run] exiting loop");

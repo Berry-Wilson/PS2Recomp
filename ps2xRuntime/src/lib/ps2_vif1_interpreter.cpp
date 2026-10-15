@@ -97,20 +97,13 @@ void resetVif1DirectContinuation()
 static void feedVif1Path2(PS2Memory &mem, const uint8_t *data, uint32_t qwCount, bool directHl)
 {
     // An IMAGE transfer started by an earlier DIRECT continues with this payload: the GIF keeps
-    // its NLOOP state across VIF DIRECT commands.
+    // its NLOOP state per path across VIF DIRECT commands, so the data is passed on raw and the
+    // GS side (CPU decoder or parallel-gs) continues the transfer.
     uint32_t consumedQw = 0u;
     if (mem.m_vif1PendingPath2ImageQwc != 0u && qwCount != 0u)
     {
         const uint32_t chunkQw = std::min<uint32_t>(mem.m_vif1PendingPath2ImageQwc, qwCount);
-        std::vector<uint8_t> imagePacket(16u + static_cast<size_t>(chunkQw) * 16u, 0u);
-        const uint64_t imageTag =
-            static_cast<uint64_t>(chunkQw & 0x7FFFu) |
-            ((mem.m_vif1PendingPath2ImageQwc == chunkQw) ? (1ull << 15) : 0ull) |
-            (static_cast<uint64_t>(kGifFmtImage) << 58);
-        std::memcpy(imagePacket.data(), &imageTag, sizeof(imageTag));
-        std::memcpy(imagePacket.data() + 16u, data, static_cast<size_t>(chunkQw) * 16u);
-        mem.submitGifPacket(GifPathId::Path2, imagePacket.data(), static_cast<uint32_t>(imagePacket.size()), true,
-                        mem.m_vif1PendingPath2DirectHl || directHl);
+        mem.submitGifPacket(GifPathId::Path2, data, chunkQw * 16u, true, mem.m_vif1PendingPath2DirectHl || directHl);
         mem.m_vif1PendingPath2ImageQwc -= chunkQw;
         if (mem.m_vif1PendingPath2ImageQwc == 0u)
             mem.m_vif1PendingPath2DirectHl = false;

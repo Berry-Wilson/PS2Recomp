@@ -5,6 +5,36 @@
 #include "runtime/gs/ps2_gs_psmct16.h"
 #include "runtime/ee_scheduler.h"
 
+namespace ps2_syscalls
+{
+    void configureGsCrt(GSRegisters &gs, uint32_t interlaced, uint32_t videoMode, uint32_t frameMode); // Syscalls/System.cpp
+}
+
+namespace
+{
+    // DISPLAYn as libgs computes it. In NTSC/PAL its width and X origin are in video clocks
+    // (2560 per line): a W-pixel framebuffer is magnified by MAGH = ceil(2560/W) - 1 so it spans
+    // the line. Hardware-accurate scanout (parallel-gs) honours this; the CPU presenter ignores it.
+    uint64_t makeDefaultDisplay(uint32_t width, uint32_t height, int32_t dx = 0, int32_t dy = 0)
+    {
+        if (width == 0u)
+            width = 640u;
+        if (height == 0u)
+            height = 448u;
+        if (g_gparam.omode == 2 || g_gparam.omode == 3)
+        {
+            const uint32_t magnification = (width + 2559u) / width;
+            const int32_t originX = g_gparam.omode == 2 ? 636 : 656;
+            const int32_t originY = g_gparam.omode == 2 ? 25 : 36;
+            const uint32_t displayHeight = (g_gparam.interlace && g_gparam.ffmode) ? height * 2u : height;
+            return makeDisplay(static_cast<uint32_t>(originX + dx * static_cast<int32_t>(magnification)),
+                               static_cast<uint32_t>(originY * (g_gparam.interlace ? 2 : 1) + dy),
+                               magnification - 1u, 0u, width * magnification - 1u, displayHeight - 1u);
+        }
+        return makeDisplay(static_cast<uint32_t>(dx), static_cast<uint32_t>(dy), 0u, 0u, width - 1u, height - 1u);
+    }
+}
+
 namespace ps2_stubs
 {
     namespace
@@ -802,10 +832,12 @@ namespace ps2_stubs
             g_gparam.omode = static_cast<uint8_t>(omode & 0xFF);
             g_gparam.ffmode = static_cast<uint8_t>(ffmode & 0x1);
             writeGsGParamToScratch(runtime);
+            if (runtime)
+                ps2_syscalls::configureGsCrt(runtime->memory().gs(), interlace & 1u, omode & 0xffu, ffmode & 1u);
             uint64_t pmode = makePmode(1, 0, 0, 0, 0, 0x80);
             uint64_t smode2 = (interlace & 0x1) | ((ffmode & 0x1) << 1);
             uint64_t dispfb = makeDispFb(0, 10, 0, 0, 0);
-            uint64_t display = makeDisplay(0, 0, 0, 0, 639, 447);
+            uint64_t display = makeDefaultDisplay(640u, 448u);
             uint64_t bgcolor = 0ULL;
 
             if (runtime)
@@ -891,7 +923,7 @@ namespace ps2_stubs
         const uint64_t smode2 =
             (static_cast<uint64_t>(g_gparam.interlace & 0x1u) << 0) |
             (static_cast<uint64_t>(g_gparam.ffmode & 0x1u) << 1);
-        const uint64_t display = makeDisplay(636u, 32u, 0u, 0u, w - 1u, h - 1u);
+        const uint64_t display = makeDefaultDisplay(w, h);
 
         const int32_t drawWidth = static_cast<int32_t>(w);
         const int32_t drawHeight = static_cast<int32_t>(h);
@@ -963,7 +995,7 @@ namespace ps2_stubs
             (static_cast<uint64_t>(g_gparam.interlace & 0x1u) << 0) |
             (static_cast<uint64_t>(g_gparam.ffmode & 0x1u) << 1);
         const uint64_t dispfb = makeDispFb(0u, fbw, psm, 0u, 0u);
-        const uint64_t display = makeDisplay(636u, 32u, 0u, 0u, w - 1u, h - 1u);
+        const uint64_t display = makeDefaultDisplay(w, h);
 
         const int32_t drawWidth = static_cast<int32_t>(w);
         const int32_t drawHeight = static_cast<int32_t>(h);
@@ -1013,7 +1045,7 @@ namespace ps2_stubs
 
         uint32_t fbw = (w + 63) / 64;
         uint64_t dispfb = makeDispFb(0, fbw, psm, 0, 0);
-        uint64_t display = makeDisplay(dx, dy, 0, 0, w - 1, h - 1);
+        uint64_t display = makeDefaultDisplay(w, h, static_cast<int16_t>(dx), static_cast<int16_t>(dy));
 
         writeGsDispEnv(rdram, envAddr, display, dispfb);
         setReturnS32(ctx, 0);
