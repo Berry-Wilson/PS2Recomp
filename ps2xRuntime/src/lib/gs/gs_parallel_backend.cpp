@@ -1,3 +1,4 @@
+#include <cstdlib>
 #include "runtime/gs/gs_parallel_backend.h"
 #include "runtime/gs/gs_frontend.h"
 #include "runtime/gs/ps2_gs_memory.h"
@@ -369,6 +370,16 @@ namespace
             info.dst_stage = VK_PIPELINE_STAGE_2_TRANSFER_BIT;
             info.dst_access = VK_ACCESS_2_TRANSFER_READ_BIT;
             info.crtc_offsets = true;
+            // Progressive scanout with field-blend compensation (like PCSX2's deinterlacing):
+            // interlaced games otherwise show alternating dark lines. PS2X_PGS_INTERLACED=1
+            // keeps the raw field scanout.
+            static const bool rawInterlaced = []
+            {
+                const char *env = std::getenv("PS2X_PGS_INTERLACED");
+                return env && env[0] == '1';
+            }();
+            info.force_progressive = !rawInterlaced;
+            info.anti_blur = !rawInterlaced;
             return interop.present(gs.vsync(info));
         }
 
