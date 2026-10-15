@@ -219,6 +219,13 @@ private:
     // Earliest readyCycle of any queued pipeline entry; commitReadyPipelines() runs every cycle
     // and returns immediately before this.
     uint64_t m_nextCommitCycle = ~0ull;
+    // Occupied slots of the queues above (bit i = slot i), so per-cycle commits only visit
+    // live entries. Slots are still committed in ascending index order.
+    uint32_t m_flagValidMask = 0;
+    uint32_t m_storeValidMask = 0;
+    uint32_t m_vfWriteValidMask = 0;
+    uint32_t m_viWriteValidMask = 0;
+    uint32_t m_accWriteValidMask = 0;
     XgkickPipeline m_xgkick{};
     std::array<std::array<uint64_t, 4>, 32> m_vfReady{};
     std::array<uint64_t, 16> m_viReady{};
