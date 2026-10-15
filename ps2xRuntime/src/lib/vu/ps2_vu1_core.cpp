@@ -4,8 +4,16 @@
 #include "runtime/ps2_memory.h"
 #include "ps2_vu1_detail.h"
 #include "runtime/ps2_vu1_options.h"
+#include "runtime/ps2_vu1_compiled.h"
 
 #include <algorithm>
+#include <memory>
+#include <vector>
+#include <fstream>
+#include <mutex>
+#include <set>
+#include <string>
+#include <unordered_map>
 #include <bit>
 #include <cfenv>
 #include <cmath>
@@ -75,6 +83,97 @@ namespace
 void setVu1ImmediateWriteback(bool enabled)
 {
     g_vu1ImmediateWriteback = enabled;
+}
+
+namespace
+{
+    std::unordered_map<uint64_t, Vu1CompiledFn> &compiledImages()
+    {
+        static std::unordered_map<uint64_t, Vu1CompiledFn> images;
+        return images;
+    }
+    bool g_vu1CompiledEnabled = true;
+    std::string g_vu1ImageDumpDir;
+    std::mutex g_vu1ImageDumpMutex;
+    std::set<std::pair<uint64_t, uint32_t>> g_vu1DumpedEntries;
+    std::set<uint64_t> g_vu1DumpedImages;
+
+    void dumpVu1Entry(uint64_t hash, const uint8_t *code, uint32_t size, uint32_t pc)
+    {
+        std::lock_guard<std::mutex> lock(g_vu1ImageDumpMutex);
+        if (g_vu1ImageDumpDir.empty() || !g_vu1DumpedEntries.insert({hash, pc}).second)
+            return;
+        char name[32];
+        std::snprintf(name, sizeof(name), "%016llx", static_cast<unsigned long long>(hash));
+        const std::filesystem::path base = std::filesystem::path(g_vu1ImageDumpDir) / name;
+        if (g_vu1DumpedImages.insert(hash).second)
+        {
+            std::error_code ec;
+            std::filesystem::create_directories(g_vu1ImageDumpDir, ec);
+            if (!std::filesystem::exists(base.string() + ".bin"))
+            {
+                std::ofstream out(base.string() + ".bin", std::ios::binary);
+                out.write(reinterpret_cast<const char *>(code), size);
+            }
+        }
+        std::ofstream entries(base.string() + ".entries", std::ios::app);
+        entries << std::hex << pc << "\n";
+    }
+}
+
+void registerVu1CompiledImage(uint64_t imageHash, Vu1CompiledFn fn)
+{
+    compiledImages()[imageHash] = fn;
+}
+
+void setVu1ImageDumpDir(const char *directory)
+{
+    std::lock_guard<std::mutex> lock(g_vu1ImageDumpMutex);
+    g_vu1ImageDumpDir = directory ? directory : "";
+}
+
+void setVu1CompiledImagesEnabled(bool enabled)
+{
+    g_vu1CompiledEnabled = enabled;
+}
+
+namespace
+{
+    bool g_vu1CompiledVerify = false;
+    bool g_vu1InVerifyShadow = false; // shadow interpreter run: no compiled code, no XGKICK output
+    uint32_t g_vu1VerifyMismatches = 0;
+    uint64_t g_vu1VerifiedRuns = 0;
+}
+
+void setVu1CompiledVerify(bool enabled)
+{
+    g_vu1CompiledVerify = enabled;
+}
+
+uint64_t hashVu1CodeImage(const uint8_t *code, uint32_t size)
+{
+    // FNV-1a over 64-bit words (the image size is a multiple of 8).
+    uint64_t hash = 0xCBF29CE484222325ull;
+    for (uint32_t offset = 0; offset + 8u <= size; offset += 8u)
+    {
+        uint64_t word = 0;
+        std::memcpy(&word, code + offset, sizeof(word));
+        hash ^= word;
+        hash *= 0x100000001B3ull;
+    }
+    return hash;
+}
+
+void VU1Interpreter::refreshCompiledImage(const uint8_t *vuCode, uint32_t codeSize, const PS2Memory *memory)
+{
+    const uint64_t generation = memory->getVU1CodeGeneration();
+    if (generation == m_imageGeneration)
+        return;
+    m_imageGeneration = generation;
+    m_imageHash = hashVu1CodeImage(vuCode, codeSize);
+    const auto &images = compiledImages();
+    const auto image = images.find(m_imageHash);
+    m_compiledImage = image != images.end() ? reinterpret_cast<const void *>(image->second) : nullptr;
 }
 
 VU1Interpreter::VU1Interpreter(Unit unit)
@@ -1039,6 +1138,11 @@ void VU1Interpreter::finishXgkick()
 {
     if (!m_xgkick.active)
         return;
+    if (g_vu1InVerifyShadow)
+    {
+        m_xgkick.active = false;
+        return;
+    }
 
     if (m_activeMemory)
         m_activeMemory->submitGifPacket(GifPathId::Path1, m_xgkick.packet.data(), m_xgkick.totalBytes);
@@ -1713,6 +1817,11 @@ void VU1Interpreter::execute(uint8_t *vuCode, uint32_t codeSize,
     m_state.vf[0][1] = 0.0f;
     m_state.vf[0][2] = 0.0f;
     m_state.vf[0][3] = 1.0f;
+    if (m_unit == Unit::VU1 && memory != nullptr && vuCode == memory->getVU1Code() && !g_vu1ImageDumpDir.empty())
+    {
+        refreshCompiledImage(vuCode, codeSize, memory);
+        dumpVu1Entry(m_imageHash, vuCode, codeSize, m_state.pc);
+    }
     run(vuCode, codeSize, vuData, dataSize, gs, memory, maxCycles);
 }
 
@@ -1742,7 +1851,38 @@ void VU1Interpreter::run(uint8_t *vuCode, uint32_t codeSize,
     const uint64_t budgetEnd = m_cycle + maxCycles;
     bool programEnded = false;
     const bool immediateWriteback = g_vu1ImmediateWriteback && m_unit == Unit::VU1;
-    while (m_cycle < budgetEnd && !m_stopRequested)
+    bool compiledStopped = false;
+    std::unique_ptr<VU1Interpreter> verifyShadow;
+    std::vector<uint8_t> verifyDataBefore;
+    if (immediateWriteback && g_vu1CompiledEnabled && !g_vu1InVerifyShadow && memory != nullptr && vuCode == memory->getVU1Code() &&
+        codeSize == PS2_VU1_CODE_SIZE && !compiledImages().empty())
+    {
+        refreshCompiledImage(vuCode, codeSize, memory);
+        if (m_compiledImage != nullptr && m_cycle < budgetEnd && !m_stopRequested)
+        {
+            if (g_vu1CompiledVerify)
+            {
+                verifyShadow = std::make_unique<VU1Interpreter>(*this);
+                verifyDataBefore.assign(vuData, vuData + dataSize);
+            }
+            const auto fn = reinterpret_cast<Vu1CompiledFn>(m_compiledImage);
+            switch (fn(*this, budgetEnd))
+            {
+            case Vu1CompiledResult::Ended:
+                programEnded = true;
+                break;
+            case Vu1CompiledResult::Budget:
+                compiledStopped = true;
+                break;
+            case Vu1CompiledResult::Fallback:
+                // Record PCs the translation does not cover (e.g. JR targets) as extra entries.
+                if (!g_vu1ImageDumpDir.empty())
+                    dumpVu1Entry(m_imageHash, vuCode, codeSize, m_state.pc);
+                break;
+            }
+        }
+    }
+    while (!programEnded && !compiledStopped && m_cycle < budgetEnd && !m_stopRequested)
     {
         commitReadyPipelines();
         if (m_state.pc + 8u > codeSize)
@@ -1993,6 +2133,37 @@ void VU1Interpreter::run(uint8_t *vuCode, uint32_t codeSize,
         m_pendingHaltT = false;
     }
     m_state.cycles = m_cycle;
+    if (verifyShadow)
+    {
+        // Re-run the same program on the pre-run copy with the interpreter and compare.
+        std::vector<uint8_t> dataAfter(vuData, vuData + dataSize);
+        std::memcpy(vuData, verifyDataBefore.data(), dataSize);
+        g_vu1InVerifyShadow = true;
+        verifyShadow->run(vuCode, codeSize, vuData, dataSize, gs, memory, maxCycles);
+        g_vu1InVerifyShadow = false;
+        const VU1State &a = m_state;
+        const VU1State &b = verifyShadow->m_state;
+        std::string diff;
+        auto check = [&](bool same, const char *what) { if (!same && diff.size() < 400) { diff += ' '; diff += what; } };
+        check(std::memcmp(a.vf, b.vf, sizeof(a.vf)) == 0, "vf");
+        check(std::memcmp(a.vi, b.vi, sizeof(a.vi)) == 0, "vi");
+        check(std::memcmp(a.acc, b.acc, sizeof(a.acc)) == 0, "acc");
+        check(std::memcmp(&a.q, &b.q, 4) == 0 && std::memcmp(&a.p, &b.p, 4) == 0 && std::memcmp(&a.i, &b.i, 4) == 0, "q/p/i");
+        check(a.pc == b.pc, "pc");
+        check(a.mac == b.mac && a.status == b.status && a.clip == b.clip, "flags");
+        check(a.cycles == b.cycles, "cycles");
+        check(a.ebit == b.ebit && a.branchPending == b.branchPending, "control");
+        check(std::memcmp(dataAfter.data(), vuData, dataSize) == 0, "data");
+        std::memcpy(vuData, dataAfter.data(), dataSize);
+        ++g_vu1VerifiedRuns;
+        if (!diff.empty() && g_vu1VerifyMismatches++ < 50)
+            std::fprintf(stderr, "[vu1-verify] image %016llx mismatch:%s (pc %x/%x cycles %llu/%llu)\n",
+                         static_cast<unsigned long long>(m_imageHash), diff.c_str(), a.pc, b.pc,
+                         static_cast<unsigned long long>(a.cycles), static_cast<unsigned long long>(b.cycles));
+        if ((g_vu1VerifiedRuns & 0xFFFu) == 0u)
+            std::fprintf(stderr, "[vu1-verify] %llu compiled runs checked, %u mismatches\n",
+                         static_cast<unsigned long long>(g_vu1VerifiedRuns), g_vu1VerifyMismatches);
+    }
     if (useVuRounding && previousRoundingMode != -1)
         std::fesetround(previousRoundingMode);
 }

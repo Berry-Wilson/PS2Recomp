@@ -63,6 +63,8 @@ public:
     const VU1State &state() const { return m_state; }
 
 private:
+    friend class Vu1CompiledAccess; // ahead-of-time compiled microprograms (ps2_vu1_compiled.h)
+
     enum Pipeline : uint8_t
     {
         PipelineNone = 0,
@@ -247,6 +249,10 @@ private:
     GS *m_activeGs = nullptr;
     PS2Memory *m_activeMemory = nullptr;
     bool m_stopRequested = false;
+    // Compiled-image lookup for the current VU1 code generation (see ps2_vu1_compiled.h).
+    uint64_t m_imageGeneration = ~0ull;
+    uint64_t m_imageHash = 0;
+    const void *m_compiledImage = nullptr;
     bool m_pendingHaltD = false;
     bool m_pendingHaltT = false;
 
@@ -287,6 +293,7 @@ private:
     void startXgkick(uint32_t qwordAddress);
 
     void resetScheduler();
+    void refreshCompiledImage(const uint8_t *vuCode, uint32_t codeSize, const PS2Memory *memory);
     void commitReadyPipelines();
     void commitReadyPipelinesNow();
     void advanceOneCycle();

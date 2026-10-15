@@ -97,6 +97,20 @@ if(COMMAND ps2x_stage_ffmpeg_runtime_dlls)
     ps2x_stage_ffmpeg_runtime_dlls(ps2x_tests)
 endif()
 
+# VU1 microprogram translator (links the runtime the same way the tests do).
+add_executable(ps2x_vu1recomp
+    ${CMAKE_SOURCE_DIR}/ps2xRuntime/tools/ps2_vu1recomp.cpp
+    $<TARGET_OBJECTS:ps2_test_function_table>
+)
+target_include_directories(ps2x_vu1recomp PRIVATE ${CMAKE_SOURCE_DIR}/ps2xRuntime/include)
+target_link_libraries(ps2x_vu1recomp PRIVATE ps2_runtime)
+if(MSVC)
+    target_link_options(ps2x_vu1recomp PRIVATE "/STACK:8388608")
+endif()
+if(COMMAND ps2x_stage_ffmpeg_runtime_dlls)
+    ps2x_stage_ffmpeg_runtime_dlls(ps2x_vu1recomp)
+endif()
+
 include("${CMAKE_SOURCE_DIR}/ps2xRuntime/cmake/ReleaseMode.cmake")
 
 if(CMAKE_BUILD_TYPE STREQUAL "Release" OR CMAKE_BUILD_TYPE STREQUAL "RelWithDebInfo")
