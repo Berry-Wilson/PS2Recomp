@@ -711,6 +711,53 @@ void register_ps2_gs_tests()
                      "sceGsSwapDBuffDc should honor a clear packet seeded from register-based trailing args");
         });
 
+        tc.Run("sceGsSetDefDBuff with clear makes sceGsSwapDBuff clear colour and depth", [](TestCase &t)
+        {
+            PS2Runtime runtime;
+            t.IsTrue(runtime.memory().initialize(), "runtime memory initialize should succeed");
+
+            std::vector<uint8_t> rdram(PS2_RAM_SIZE, 0u);
+            constexpr uint32_t kEnvAddr = 0x5400u;
+            constexpr uint32_t kStackAddr = 0xA00u;
+
+            // sceGsSetDefDBuff(db, psm, w, h, ztest, zpsm, clear): ztest/zpsm/clear in t0-t2.
+            R5900Context ctx{};
+            setRegU32(ctx, 4, kEnvAddr);
+            setRegU32(ctx, 5, 0u);
+            setRegU32(ctx, 6, 640u);
+            setRegU32(ctx, 7, 448u);
+            setRegU32(ctx, 8, 2u);
+            setRegU32(ctx, 9, 0u);
+            setRegU32(ctx, 10, 1u);
+            setRegU32(ctx, 29, kStackAddr);
+            ps2_stubs::sceGsSetDefDBuff(rdram.data(), &ctx, &runtime);
+
+            auto swap = [&]()
+            {
+                R5900Context swapCtx{};
+                setRegU32(swapCtx, 4, kEnvAddr);
+                setRegU32(swapCtx, 5, 0u);
+                ps2_stubs::sceGsSwapDBuff(rdram.data(), &swapCtx, &runtime);
+            };
+            swap();
+
+            GS &gs = runtime.gs();
+            const GSDebugSnapshot snap = gs.getDebugSnapshot();
+            const uint32_t fbw = snap.ctx[0].frame.fbw;
+            const uint32_t frameBlock = snap.ctx[0].frame.fbp * 32u;
+            const uint32_t depthBlock = snap.ctx[0].zbuf.zbp * 32u;
+            t.IsTrue(depthBlock != frameBlock, "the seeded draw env should place Z away from the frame buffer");
+
+            gs.WriteVram(GS_PSM_CT32, frameBlock, fbw, 100u, 100u, 0x11223344u);
+            gs.WriteVram(GS_PSM_Z32, depthBlock, fbw, 100u, 100u, 0x00FFFFFFu);
+            swap();
+
+            t.Equals(gs.ReadVram(GS_PSM_CT32, frameBlock, fbw, 100u, 100u) & 0x00FFFFFFu, 0u,
+                     "sceGsSwapDBuff should clear the colour buffer when the env was set up with clear");
+            t.Equals(gs.ReadVram(GS_PSM_Z32, depthBlock, fbw, 100u, 100u), 0u,
+                     "sceGsSwapDBuff should clear the Z buffer when the env was set up with clear");
+        });
+
         tc.Run("clearFramebufferContext clears the requested context even if another context is active", [](TestCase &t)
         {
             std::vector<uint8_t> vram(PS2_GS_VRAM_SIZE, 0u);

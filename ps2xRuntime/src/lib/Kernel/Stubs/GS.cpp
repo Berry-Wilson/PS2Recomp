@@ -975,10 +975,10 @@ namespace ps2_stubs
         uint32_t psm = getRegU32(ctx, 5);
         uint32_t w = getRegU32(ctx, 6);
         uint32_t h = getRegU32(ctx, 7);
-        const uint32_t ztest = readStackU32(rdram, ctx, 16);
-        const uint32_t zpsm = readStackU32(rdram, ctx, 20);
-        const uint32_t clear = readStackU32(rdram, ctx, 24);
-        (void)clear;
+        const GsTrailingArgs3 trailing = decodeGsTrailingArgs3(rdram, ctx);
+        const uint32_t ztest = trailing.arg0;
+        const uint32_t zpsm = trailing.arg1;
+        const uint32_t clear = trailing.arg2;
 
         if (w == 0u)
         {
@@ -1015,10 +1015,18 @@ namespace ps2_stubs
         db.disp[0].bgcolor = 0u;
         db.disp[1] = db.disp[0];
 
-        db.giftag0 = {makeGiftagAplusD(14u), 0x0E0E0E0E0E0E0E0EULL};
+        // libgraph sends the 6-register clear sprite after the draw environment (NLOOP 14
+        // instead of 8) when `clear` is set; sceGsSwapDBuff then clears colour and Z each swap.
+        const bool seedClear = clear != 0u;
+        db.giftag0 = {makeGiftagAplusD(seedClear ? 14u : 8u), 0x0E0E0E0E0E0E0E0EULL};
         seedGsDrawEnv1(db.draw0, drawWidth, drawHeight, 0u, fbw, psm, zbufAddr, zpsm, ztest, false);
         db.giftag1 = db.giftag0;
         seedGsDrawEnv1(db.draw1, drawWidth, drawHeight, 0u, fbw, psm, zbufAddr, zpsm, ztest, false);
+        if (seedClear)
+        {
+            seedGsClearPacket(db.clear0, drawWidth, drawHeight, 0u, ztest, false);
+            seedGsClearPacket(db.clear1, drawWidth, drawHeight, 0u, ztest, false);
+        }
 
         if (!writeGsDBuff(rdram, envAddr, db))
         {
@@ -1231,13 +1239,21 @@ namespace ps2_stubs
         }
 
         applyGsDispEnv(runtime, db.disp[which]);
+        // Like sceGsPutDrawEnv, send as many A+D pairs as the giftag's NLOOP says: 8 draw
+        // registers, plus the clear sprite when the buffer was set up with clear enabled.
+        const GsGiftagMem &giftag = (which == 0u) ? db.giftag0 : db.giftag1;
+        const bool sendClear = (giftag.lo & 0x7FFFull) >= 14u;
         if (which == 0u)
         {
             applyGsRegPairs(runtime, reinterpret_cast<const GsRegPairMem *>(&db.draw0), 8u);
+            if (sendClear)
+                applyGsClearPacket(runtime, db.clear0);
         }
         else
         {
             applyGsRegPairs(runtime, reinterpret_cast<const GsRegPairMem *>(&db.draw1), 8u);
+            if (sendClear)
+                applyGsClearPacket(runtime, db.clear1);
         }
 
         setReturnS32(ctx, static_cast<int32_t>(which ^ 1u));
