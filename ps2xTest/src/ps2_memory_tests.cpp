@@ -1183,6 +1183,28 @@ void register_ps2_memory_tests()
             t.IsTrue(contentOk, "scratchpad alias chain payload should match scratchpad bytes");
         });
 
+        tc.Run("VIF1 DMA chain stopped by END leaves MADR past the END tag", [](TestCase &t)
+        {
+            PS2Memory mem;
+            t.IsTrue(mem.initialize(), "PS2Memory initialize should succeed");
+
+            constexpr uint32_t kVif1Ch = 0x10009000u;
+            uint8_t *rdram = mem.getRDRAM();
+            // NEXT (no payload) -> END at 0x2000; games use the qword after the END tag as a
+            // callback record and locate the tag through MADR - 16 in their DMAC handler.
+            writeDmaTag(rdram, 0x1000u, makeDmaTag(0u, 2u, 0x2000u));
+            writeDmaTag(rdram, 0x2000u, makeDmaTag(0u, 7u, 1u));
+
+            t.IsTrue(mem.writeIORegister(kVif1Ch + 0x10u, 0u), "write MADR should succeed");
+            t.IsTrue(mem.writeIORegister(kVif1Ch + 0x30u, 0x1000u), "write TADR should succeed");
+            t.IsTrue(mem.writeIORegister(kVif1Ch + 0x00u, 0x145u), "write CHCR STR|TTE|CHAIN should succeed");
+            mem.processPendingTransfers();
+
+            t.Equals(mem.readIORegister(kVif1Ch + 0x10u), 0x2010u, "MADR should point one qword past the END tag");
+            t.Equals(mem.readIORegister(kVif1Ch + 0x20u), 0u, "QWC should be zero after the chain");
+            t.Equals((mem.readIORegister(kVif1Ch + 0x00u) >> 28) & 7u, 7u, "CHCR.TAG should hold the END tag ID");
+        });
+
         tc.Run("native GIF image upload recognizes canonical load-image chain", [](TestCase &t)
         {
             PS2Memory mem;

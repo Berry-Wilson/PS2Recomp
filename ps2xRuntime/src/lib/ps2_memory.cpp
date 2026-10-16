@@ -1409,6 +1409,9 @@ bool PS2Memory::writeIORegister(uint32_t address, uint32_t value)
 
                     int tagsProcessed = 0;
                     uint32_t lastTagUpper = (chcr >> 16) & 0xFFFFu;
+                    // MADR ends one past the last tag's payload. DMAC end handlers read it to find
+                    // the tag that stopped the chain (an END tag with a callback after it, say).
+                    uint32_t finalMadr = m_ioRegisters[channelBase + 0x10];
 
                     while (tagsProcessed < kMaxChainTags)
                     {
@@ -1520,6 +1523,7 @@ bool PS2Memory::writeIORegister(uint32_t address, uint32_t value)
 
                         if (transferTagData)
                             appendVifTagData(currentTagAddr);
+                        finalMadr = dataAddr + static_cast<uint32_t>(tagQwc) * 16u;
 
                         if (hasPayload)
                             appendData(dataAddr, tagQwc);
@@ -1530,6 +1534,8 @@ bool PS2Memory::writeIORegister(uint32_t address, uint32_t value)
                     }
 
                     m_ioRegisters[channelBase + 0x30] = tagAddr;
+                    m_ioRegisters[channelBase + 0x10] = finalMadr;
+                    m_ioRegisters[channelBase + 0x20] = 0;
                     m_ioRegisters[channelBase + 0x40] = asr0;
                     m_ioRegisters[channelBase + 0x50] = asr1;
                     chcr = (chcr & ~(0x3u << 4)) | ((asp & 0x3u) << 4);

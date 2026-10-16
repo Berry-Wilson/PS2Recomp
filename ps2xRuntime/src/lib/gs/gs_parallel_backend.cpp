@@ -212,6 +212,15 @@ namespace
             if (!gs.init(&interop.device(), ParallelGS::GSOptions{}))
                 throw std::runtime_error("parallel-gs: GS initialization failed; check Vulkan feature diagnostics above");
             gs.set_signal_interface(this);
+            // The sampler-feedback analysis pass (used for framebuffer-sourced textures) crashes the
+            // AMD driver while its compute pipeline is built; PS2X_PGS_SAMPLER_FEEDBACK=1 keeps it.
+            const char *feedbackEnv = std::getenv("PS2X_PGS_SAMPLER_FEEDBACK");
+            if (!(feedbackEnv && feedbackEnv[0] == '1'))
+            {
+                ParallelGS::DebugMode mode;
+                mode.disable_sampler_feedback = true;
+                gs.set_debug_mode(mode);
+            }
         }
 
         ~ParallelBackend() override
