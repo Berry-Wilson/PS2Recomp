@@ -44,9 +44,16 @@ void setVu1CompiledImagesEnabled(bool enabled);
 void setVu1CompiledVerify(bool enabled);
 uint64_t hashVu1CodeImage(const uint8_t *code, uint32_t size);
 
+// Generated code calls these per lane; MSVC otherwise leaves some of them out of line.
+#if defined(_MSC_VER)
+#define PS2X_VU1_FORCEINLINE __forceinline
+#else
+#define PS2X_VU1_FORCEINLINE inline __attribute__((always_inline))
+#endif
+
 // Access used by generated code and the translator (friend of VU1Interpreter).
 // Operand normalization, identical to VU1Interpreter::normalizeOperand.
-inline float vu1NormalizeOperand(float value)
+PS2X_VU1_FORCEINLINE float vu1NormalizeOperand(float value)
 {
     uint32_t bits;
     std::memcpy(&bits, &value, sizeof(bits));
@@ -64,7 +71,7 @@ inline float vu1NormalizeOperand(float value)
 // normal values below FLT_MAX are unchanged, zero/denormal results become a zero with the
 // result's sign (the exact result has the same sign and is zero or below FLT_MIN). Returns
 // false (value untouched) when the exact recomputation is needed.
-inline bool vu1NormalizeSingleRounding(float &result)
+PS2X_VU1_FORCEINLINE bool vu1NormalizeSingleRounding(float &result)
 {
     uint32_t bits;
     std::memcpy(&bits, &result, sizeof(bits));
@@ -82,7 +89,7 @@ inline bool vu1NormalizeSingleRounding(float &result)
 // interpreter recomputes is within 25% of the float result when there is no heavy
 // cancellation (|r| >= |p| * 2^-20) and both are well inside the float range, so its
 // normalization cannot change the value.
-inline bool vu1ProductSumInRange(float result, float product)
+PS2X_VU1_FORCEINLINE bool vu1ProductSumInRange(float result, float product)
 {
     uint32_t rbits, pbits;
     std::memcpy(&rbits, &result, sizeof(rbits));
@@ -94,6 +101,16 @@ inline bool vu1ProductSumInRange(float result, float product)
 }
 
 // FTOIn conversion, identical to the interpreter's (saturating, truncating).
+// True for a normal float below FLT_MAX in magnitude: the interpreter's FMAC fast path keeps
+// such a result unchanged and reports only its sign.
+PS2X_VU1_FORCEINLINE bool vu1NormalNonMax(float value)
+{
+    uint32_t bits;
+    std::memcpy(&bits, &value, sizeof(bits));
+    const uint32_t exponent = (bits >> 23) & 0xFFu;
+    return exponent != 0u && exponent != 0xFFu && (bits & 0x7FFFFFFFu) != 0x7F7FFFFFu;
+}
+
 inline int32_t vu1FloatToInt(float value, float scale)
 {
     const double scaled = static_cast<double>(value) * static_cast<double>(scale);
@@ -148,6 +165,44 @@ public:
     static void execLower(VU1Interpreter &vu, uint32_t instr, uint32_t upper)
     {
         vu.execLower(instr, vu.m_activeVuData, vu.m_activeVuDataSize, *vu.m_activeGs, vu.m_activeMemory, upper);
+    }
+
+    // Flag-observing FMAC ops inlined by the translator. Fast path: every lane is a normal
+    // in-range value, so the MAC flags are the lane sign bits (same as updateFmacFlags).
+    static void queueFmacFlags(VU1Interpreter &vu, uint32_t mac, uint32_t status, uint32_t extraSticky)
+    {
+        const uint32_t freeMask = ~vu.m_flagValidMask & ((1u << VU1Interpreter::kMaxFlagEntries) - 1u);
+        if (freeMask == 0u)
+        {
+            const uint8_t laneFlags[4] = {0u, 0u, 0u, 0u};
+            vu.updateFmacFlags(laneFlags, 0xFu, extraSticky); // full queue: let the interpreter report it
+            return;
+        }
+        uint32_t slot = 0u;
+        while ((freeMask & (1u << slot)) == 0u)
+            ++slot;
+        vu.m_flagValidMask |= 1u << slot;
+        auto &entry = vu.m_flagPipeline[slot];
+        entry = {};
+        entry.valid = true;
+        entry.issueCycle = vu.m_cycle;
+        entry.readyCycle = vu.m_cycle + VU1Interpreter::kFmacLatency;
+        if (entry.readyCycle < vu.m_nextCommitCycle)
+            vu.m_nextCommitCycle = entry.readyCycle;
+        entry.mac = mac;
+        entry.status = status;
+        entry.extraSticky = extraSticky;
+        entry.writesMac = true;
+        entry.writesStatus = true;
+    }
+    // Slow path: the interpreter's exact normalization and flags for `upper` (operands must
+    // still hold their pre-instruction values); `result` is updated in place.
+    static void fmacExact(VU1Interpreter &vu, uint32_t upper, float *result, uint8_t dest)
+    {
+        vu.m_currentUpperInstruction = upper;
+        uint8_t laneFlags[4]{};
+        vu.normalizeFmacResult(result, dest, laneFlags);
+        vu.updateFmacFlags(laneFlags, dest, vu.calculateFmacProductSticky(dest));
     }
 
     // Inline lower instructions (LQ/SQ/ILW/ISW, branches) use these.

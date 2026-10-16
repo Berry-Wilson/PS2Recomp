@@ -49,6 +49,12 @@ namespace
         return text;
     }
 
+    // Generated code is split into one function per 512-byte PC range (64 pairs): MSVC stops
+    // inlining (and allocates registers poorly) inside one huge goto function. Jumps within a
+    // chunk stay gotos; leaving a chunk returns to the image's dispatcher loop.
+    constexpr uint32_t kChunkShift = 9u;
+    uint32_t chunkOf(uint32_t pc) { return pc >> kChunkShift; }
+
     std::string label(uint32_t pc)
     {
         char text[16];
@@ -313,15 +319,81 @@ namespace
             for (const auto &n : next)
                 work.push_back(n);
         }
+        // Sticky status bits accumulate across instructions and programs, so a writer's sticky
+        // contribution is only provably unobserved when every sticky reader is "protected": no
+        // path from a program entry reaches it without passing an FSSET (which resets the
+        // sticky bits; FSSET also cancels same-cycle FMAC status writes). Then only writers
+        // between an FSSET and the next FSSET can feed a reader, and they keep their flags.
+        bool anyStickyReader = false;
         for (const auto &[pc, d] : an.pairs)
             if (readsStickyStatus(d.lower))
+                anyStickyReader = true;
+        std::set<uint32_t> stickyLiveWriters;
+        if (anyStickyReader)
+        {
+            auto statesAt = [&](uint32_t pc, std::vector<FlowState> &out)
+            {
+                for (uint64_t key : an.states)
+                    if (static_cast<uint32_t>(key >> 40) == pc)
+                        out.push_back({pc, static_cast<uint8_t>((key >> 32) & 0xFFu), static_cast<uint32_t>(key & 0xFFFFFFFFu)});
+            };
+            // Forward walk that stops at FSSET pairs; returns true if it reaches a sticky reader.
+            auto walk = [&](std::vector<FlowState> work, std::set<uint32_t> *writers)
+            {
+                bool readerReached = false;
+                std::set<uint64_t> seen;
+                while (!work.empty())
+                {
+                    const FlowState state = work.back();
+                    work.pop_back();
+                    if (!seen.insert(state.key()).second)
+                        continue;
+                    const A::Decoded &d = an.pairs.at(state.pc);
+                    if (lowerPrimaryOp(d.lower) == 0x15u) // FSSET
+                        continue;
+                    if (readsStickyStatus(d.lower))
+                        readerReached = true;
+                    if (writers && isFlagWriter(d.upper))
+                        writers->insert(state.pc);
+                    std::vector<FlowState> next;
+                    bool pathEnd = false;
+                    successors(an, state, next, pathEnd);
+                    for (const auto &n : next)
+                        work.push_back(n);
+                }
+                return readerReached;
+            };
+            std::vector<FlowState> fromEntries;
+            for (uint32_t entry : entries)
+                if (an.pairs.count(entry & kPcMask & ~7u) != 0u)
+                    fromEntries.push_back({entry & kPcMask & ~7u, PendNone, 0u});
+            if (walk(fromEntries, nullptr))
+            {
                 an.stickyObservable = true;
+            }
+            else
+            {
+                for (const auto &[pc, d] : an.pairs)
+                {
+                    if (lowerPrimaryOp(d.lower) != 0x15u)
+                        continue;
+                    std::vector<FlowState> starts, after;
+                    statesAt(pc, starts);
+                    for (const auto &s : starts)
+                    {
+                        bool pathEnd = false;
+                        successors(an, s, after, pathEnd);
+                    }
+                    walk(after, &stickyLiveWriters);
+                }
+            }
+        }
         for (const auto &[pc, d] : an.pairs)
         {
             if (!isFlagWriter(d.upper))
                 continue;
             ++an.writers;
-            if (!an.stickyObservable && !flagsLive(an, pc))
+            if (!an.stickyObservable && stickyLiveWriters.count(pc) == 0u && !flagsLive(an, pc))
                 an.deadFlagWriters.insert(pc);
         }
         return an;
@@ -329,7 +401,10 @@ namespace
 
     // Inline arithmetic for an FMAC op whose flags are unobservable. Mirrors execUpper's
     // expression for each form and its result normalization; returns false if not handled.
-    bool emitInlineFmac(std::ostream &o, uint32_t upper)
+    // withFlags: the op's MAC/status flags are observed. Emits the interpreter's fast path
+    // (every lane a normal in-range value: flags are the lane signs, a product-sum's product
+    // sticky is its sign) and calls the interpreter's exact routine otherwise.
+    bool emitInlineFmac(std::ostream &o, uint32_t upper, bool withFlags = false)
     {
         enum Kind { Add, Sub, Mul, Madd, Msub };
         enum Source { Bc, Q, I, Vt };
@@ -371,7 +446,7 @@ namespace
         const unsigned fd = (upper >> 6) & 0x1Fu;
         const bool productSum = kind == Madd || kind == Msub;
         static const char *names[] = {"ADD", "SUB", "MUL", "MADD", "MSUB"};
-        o << "    { // " << names[kind] << (accTarget ? "A" : "") << " inline (flags unobserved)\n";
+        o << "    { // " << names[kind] << (accTarget ? "A" : "") << (withFlags ? " inline (fast flags)\n" : " inline (flags unobserved)\n");
         if (source == Bc)
             o << "        const float b = vu1NormalizeOperand(st.vf[" << ft << "][" << (upper & 3u) << "]);\n";
         else if (source == Q)
@@ -381,7 +456,10 @@ namespace
         o << "        float r[4] = {0.0f, 0.0f, 0.0f, 0.0f};";
         if (productSum)
             o << " float p[4] = {0.0f, 0.0f, 0.0f, 0.0f};";
-        o << " bool inRange = true;\n";
+        o << " bool inRange = true;";
+        if (withFlags)
+            o << " uint32_t mac = 0u; uint32_t productNegative = 0u;";
+        o << "\n";
         for (uint32_t c = 0; c < 4u; ++c)
         {
             if ((dest & laneForComponent(c)) == 0u)
@@ -390,21 +468,29 @@ namespace
             const std::string t = source == Vt ? "vu1NormalizeOperand(st.vf[" + std::to_string(ft) + "][" + std::to_string(c) + "])" : "b";
             switch (kind)
             {
-            case Add: o << " r[" << c << "] = s + " << t << "; inRange = inRange && vu1NormalizeSingleRounding(r[" << c << "]);"; break;
-            case Sub: o << " r[" << c << "] = s - " << t << "; inRange = inRange && vu1NormalizeSingleRounding(r[" << c << "]);"; break;
-            case Mul: o << " r[" << c << "] = s * " << t << "; inRange = inRange && vu1NormalizeSingleRounding(r[" << c << "]);"; break;
+            case Add: o << " r[" << c << "] = s + " << t << "; inRange = inRange && " << (withFlags ? "vu1NormalNonMax" : "vu1NormalizeSingleRounding") << "(r[" << c << "]);"; break;
+            case Sub: o << " r[" << c << "] = s - " << t << "; inRange = inRange && " << (withFlags ? "vu1NormalNonMax" : "vu1NormalizeSingleRounding") << "(r[" << c << "]);"; break;
+            case Mul: o << " r[" << c << "] = s * " << t << "; inRange = inRange && " << (withFlags ? "vu1NormalNonMax" : "vu1NormalizeSingleRounding") << "(r[" << c << "]);"; break;
             case Madd:
                 o << " p[" << c << "] = s * " << t << "; r[" << c << "] = vu1NormalizeOperand(st.acc[" << c << "]) + p[" << c
-                  << "]; inRange = inRange && vu1ProductSumInRange(r[" << c << "], p[" << c << "]);";
+                  << "]; inRange = inRange && vu1ProductSumInRange(r[" << c << "], p[" << c << "])"
+                  << (withFlags ? " && vu1NormalNonMax(p[" + std::to_string(c) + "]); productNegative |= std::signbit(p[" + std::to_string(c) + "]) ? 1u : 0u;" : ";");
                 break;
             case Msub:
                 o << " p[" << c << "] = s * " << t << "; r[" << c << "] = vu1NormalizeOperand(st.acc[" << c << "]) - p[" << c
-                  << "]; inRange = inRange && vu1ProductSumInRange(r[" << c << "], p[" << c << "]);";
+                  << "]; inRange = inRange && vu1ProductSumInRange(r[" << c << "], p[" << c << "])"
+                  << (withFlags ? " && vu1NormalNonMax(p[" + std::to_string(c) + "]); productNegative |= std::signbit(p[" + std::to_string(c) + "]) ? 1u : 0u;" : ";");
                 break;
             }
+            if (withFlags)
+                o << " if (std::signbit(r[" << c << "])) mac |= " << (unsigned(laneForComponent(c)) << 4) << "u;";
             o << " }\n";
         }
-        o << "        if (!inRange) A::normalizeFmacValues(vu, " << hex32(upper) << ", r, " << dest << "u);\n";
+        if (withFlags)
+            o << "        if (!inRange) A::fmacExact(vu, " << hex32(upper) << ", r, " << dest
+              << "u); else A::queueFmacFlags(vu, mac, mac != 0u ? 2u : 0u, productNegative != 0u ? 2u : 0u);\n";
+        else
+            o << "        if (!inRange) A::normalizeFmacValues(vu, " << hex32(upper) << ", r, " << dest << "u);\n";
         o << "       ";
         for (uint32_t c = 0; c < 4u; ++c)
             if ((dest & laneForComponent(c)) != 0u)
@@ -612,6 +698,7 @@ namespace
     }
 
     uint32_t inlinedSimple = 0u;
+    uint32_t inlinedFlags = 0u;
     uint32_t inlinedLower = 0u;
 
     void emitPair(std::ostream &o, const VU1Interpreter &vu, const uint8_t *code, uint32_t pc, const std::set<uint32_t> &compiled,
@@ -683,6 +770,8 @@ namespace
         {
             if (an.deadFlagWriters.count(pc) != 0u && emitInlineFmac(o, d.upper))
                 ++inlined;
+            else if (an.deadFlagWriters.count(pc) == 0u && isFlagWriter(d.upper) && emitInlineFmac(o, d.upper, true))
+                ++inlinedFlags;
             else if (emitInlineUpperSimple(o, d.upper))
                 ++inlinedSimple;
             else
@@ -800,7 +889,7 @@ namespace
             o << "    else if (dHalt || tHalt) { st.haltAfterDelaySlot = true; A::pendingHaltD(vu) = dHalt; A::pendingHaltT(vu) = tHalt; }\n";
         o << "    A::advanceOneCycle(vu);\n";
         o << "    if (ended) return Vu1CompiledResult::Ended;\n";
-        if (compiled.count(next) != 0u)
+        if (compiled.count(next) != 0u && chunkOf(next) == chunkOf(pc))
             o << "    if (st.pc == " << next << "u) goto " << label(next) << ";\n";
         o << "    goto dispatch;\n}\n";
     }
@@ -857,21 +946,37 @@ int main(int argc, char **argv)
             o << " 0x" << std::hex << e << std::dec;
         o << ". Do not edit.\n";
         o << "#include \"runtime/ps2_vu1_compiled.h\"\n#include <algorithm>\n#include <cstring>\n\n";
-        o << "using A = Vu1CompiledAccess;\n\n";
-        o << "Vu1CompiledResult " << fnName << "(VU1Interpreter &vu, uint64_t budgetEnd)\n{\n";
-        o << "VU1State &st = A::state(vu);\nuint64_t &cyc = A::cycle(vu);\nconst uint32_t pcMask = A::microAddressMask(vu);\n";
-        o << "goto dispatch;\n";
+        o << "using A = Vu1CompiledAccess;\n";
+        o << "// Returned by a chunk when execution continues in another chunk.\n";
+        o << "static constexpr Vu1CompiledResult kContinue = static_cast<Vu1CompiledResult>(3);\n\n";
+        std::map<uint32_t, std::vector<uint32_t>> chunks;
+        for (uint32_t pc : pairs)
+            chunks[chunkOf(pc)].push_back(pc);
         uint32_t inlined = 0u;
-        for (uint32_t pc : pairs)
-            emitPair(o, vu, code.data(), pc, pairs, analysis, inlined);
-        o << "dispatch:\n    switch (st.pc)\n    {\n";
-        for (uint32_t pc : pairs)
-            o << "    case " << pc << "u: goto " << label(pc) << ";\n";
-        o << "    default: return Vu1CompiledResult::Fallback;\n    }\n}\n";
+        for (const auto &[chunk, chunkPairs] : chunks)
+        {
+            o << "static Vu1CompiledResult " << fnName << "_c" << chunk << "(VU1Interpreter &vu, uint64_t budgetEnd)\n{\n";
+            o << "VU1State &st = A::state(vu);\nuint64_t &cyc = A::cycle(vu);\nconst uint32_t pcMask = A::microAddressMask(vu);\n";
+            o << "goto dispatch;\n";
+            for (uint32_t pc : chunkPairs)
+                emitPair(o, vu, code.data(), pc, pairs, analysis, inlined);
+            o << "dispatch:\n    switch (st.pc)\n    {\n";
+            for (uint32_t pc : chunkPairs)
+                o << "    case " << pc << "u: goto " << label(pc) << ";\n";
+            o << "    default: return (st.pc >> " << kChunkShift << ") == " << chunk
+              << "u ? Vu1CompiledResult::Fallback : kContinue;\n    }\n}\n\n";
+        }
+        o << "Vu1CompiledResult " << fnName << "(VU1Interpreter &vu, uint64_t budgetEnd)\n{\n";
+        o << "    VU1State &st = A::state(vu);\n    for (;;)\n    {\n        Vu1CompiledResult result;\n";
+        o << "        switch (st.pc >> " << kChunkShift << ")\n        {\n";
+        for (const auto &[chunk, chunkPairs] : chunks)
+            o << "        case " << chunk << "u: result = " << fnName << "_c" << chunk << "(vu, budgetEnd); break;\n";
+        o << "        default: return Vu1CompiledResult::Fallback;\n        }\n";
+        o << "        if (result != kContinue)\n            return result;\n    }\n}\n";
         images.push_back(fnName);
         statusMasks.push_back(inlined != 0u ? 0x03Fu : 0xFFFu);
         std::cout << name << ": " << pairs.size() << " pairs from " << entries.size() << " entries; flag writers "
-                  << analysis.writers << ", unobserved " << analysis.deadFlagWriters.size() << ", inlined " << inlined << " (+" << inlinedSimple << " simple upper, " << inlinedLower << " lower)"
+                  << analysis.writers << ", unobserved " << analysis.deadFlagWriters.size() << ", inlined " << inlined << " (+" << inlinedFlags << " with flags, " << inlinedSimple << " simple upper, " << inlinedLower << " lower)"
                   << (analysis.stickyObservable ? " (sticky status observable: no flag elimination)" : "") << "\n";
     }
 
