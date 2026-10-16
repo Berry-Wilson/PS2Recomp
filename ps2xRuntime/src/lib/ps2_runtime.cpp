@@ -18,6 +18,7 @@
 #include "ps2_iop_host.h"
 #include "ps2x/iop/iop_subsystem.h"
 
+#include <functional>
 #include <iostream>
 #include <stdexcept>
 #include <fstream>
@@ -566,12 +567,16 @@ namespace
     void stopIopWorker(ps2x::iop::IopSubsystem *iop); // IOP worker thread, defined below
 }
 
+void setVif1WorkerNotify(std::function<void()> notify); // ps2_memory.cpp
+
 PS2Runtime::PS2Runtime()
 {
     m_iopHost = std::make_unique<PS2IopHostAdapter>(*this);
     m_iopSubsystem = std::make_unique<ps2x::iop::IopSubsystem>(*m_iopHost);
 
     m_eeScheduler = std::make_unique<EeScheduler>(*this);
+    setVif1WorkerNotify([this]()
+                        { m_eeScheduler->postEvent(EeEvent{EeEventType::Dmac, 0u, 0u}); });
 
     // Assign rather than memset: R5900Context's constructor zeroes itself and
     // then applies the COP0 reset values, which a memset here would discard.
@@ -618,6 +623,8 @@ PS2Runtime::~PS2Runtime()
     try
     {
         requestStop();
+        m_memory.drainVif1Worker();
+        setVif1WorkerNotify(nullptr); // the hook captures this runtime
         stopIopWorker(m_iopSubsystem.get());
         m_iopSubsystem.reset();
         m_iopHost.reset();

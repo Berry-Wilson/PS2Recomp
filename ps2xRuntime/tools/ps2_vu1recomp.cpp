@@ -49,10 +49,74 @@ namespace
         return text;
     }
 
-    // Generated code is split into one function per 512-byte PC range (64 pairs): MSVC stops
+const char *const kSimdPreamble = R"VU1SIMD(// SSE helpers for inlined FMAC ops: the interpreter's per-lane operand normalization and
+// fast-path range checks, four lanes at a time. Masks are movemask-style (bit c = component c).
+static inline __m128 vu1VSel(__m128 mask, __m128 a, __m128 b) { return _mm_or_ps(_mm_and_ps(mask, a), _mm_andnot_ps(mask, b)); }
+static inline __m128 vu1LaneMask(int bits)
+{
+    return _mm_castsi128_ps(_mm_set_epi32((bits & 8) ? -1 : 0, (bits & 4) ? -1 : 0, (bits & 2) ? -1 : 0, (bits & 1) ? -1 : 0));
+}
+static inline __m128i vu1VExp(__m128 v) { return _mm_and_si128(_mm_srli_epi32(_mm_castps_si128(v), 23), _mm_set1_epi32(0xFF)); }
+// vu1NormalizeOperand per lane: exponent 0 -> signed zero, exponent 255 -> signed FLT_MAX.
+static inline __m128 vu1VNorm(__m128 v)
+{
+    const __m128i bits = _mm_castps_si128(v);
+    const __m128i sign = _mm_and_si128(bits, _mm_set1_epi32(static_cast<int>(0x80000000u)));
+    const __m128i exp = vu1VExp(v);
+    const __m128i zero = _mm_cmpeq_epi32(exp, _mm_setzero_si128());
+    const __m128i inf = _mm_cmpeq_epi32(exp, _mm_set1_epi32(0xFF));
+    __m128i out = _mm_or_si128(_mm_and_si128(zero, sign), _mm_andnot_si128(zero, bits));
+    out = _mm_or_si128(_mm_and_si128(inf, _mm_or_si128(sign, _mm_set1_epi32(0x7F7FFFFF))), _mm_andnot_si128(inf, out));
+    return _mm_castsi128_ps(out);
+}
+// vu1NormalNonMax per lane.
+static inline int vu1VNormalNonMax(__m128 v)
+{
+    const __m128i exp = vu1VExp(v);
+    const __m128i bad = _mm_or_si128(_mm_or_si128(_mm_cmpeq_epi32(exp, _mm_setzero_si128()), _mm_cmpeq_epi32(exp, _mm_set1_epi32(0xFF))),
+                                     _mm_cmpeq_epi32(_mm_and_si128(_mm_castps_si128(v), _mm_set1_epi32(0x7FFFFFFF)), _mm_set1_epi32(0x7F7FFFFF)));
+    return ~_mm_movemask_ps(_mm_castsi128_ps(bad)) & 0xF;
+}
+// vu1NormalizeSingleRounding per lane: ok unless exponent 255 or |v| == FLT_MAX (zero/denormal
+// lanes are ok and become signed zeros, see vu1VZeroDenormals).
+static inline int vu1VSingleRoundingOk(__m128 v)
+{
+    const __m128i exp = vu1VExp(v);
+    const __m128i bad = _mm_or_si128(_mm_cmpeq_epi32(exp, _mm_set1_epi32(0xFF)),
+                                     _mm_cmpeq_epi32(_mm_and_si128(_mm_castps_si128(v), _mm_set1_epi32(0x7FFFFFFF)), _mm_set1_epi32(0x7F7FFFFF)));
+    return ~_mm_movemask_ps(_mm_castsi128_ps(bad)) & 0xF;
+}
+static inline __m128 vu1VZeroDenormals(__m128 v)
+{
+    const __m128i bits = _mm_castps_si128(v);
+    const __m128i zero = _mm_cmpeq_epi32(vu1VExp(v), _mm_setzero_si128());
+    return _mm_castsi128_ps(_mm_or_si128(_mm_and_si128(zero, _mm_and_si128(bits, _mm_set1_epi32(static_cast<int>(0x80000000u)))),
+                                         _mm_andnot_si128(zero, bits)));
+}
+// vu1ProductSumInRange per lane (and, for flag-observing ops, the product must be normal too).
+static inline int vu1VProductSumOk(__m128 r, __m128 p, bool productNormal)
+{
+    const __m128i rexp = vu1VExp(r);
+    const __m128i pexp = vu1VExp(p);
+    __m128i ok = _mm_and_si128(_mm_cmpgt_epi32(rexp, _mm_set1_epi32(4)), _mm_cmplt_epi32(rexp, _mm_set1_epi32(0xFD)));
+    ok = _mm_and_si128(ok, _mm_cmplt_epi32(pexp, _mm_set1_epi32(0xFD)));
+    const __m128 absMask = _mm_castsi128_ps(_mm_set1_epi32(0x7FFFFFFF));
+    ok = _mm_and_si128(ok, _mm_castps_si128(_mm_cmpge_ps(_mm_and_ps(r, absMask), _mm_mul_ps(_mm_and_ps(p, absMask), _mm_set1_ps(9.5367431640625e-7f)))));
+    int bits = _mm_movemask_ps(_mm_castsi128_ps(ok));
+    if (productNormal)
+        bits &= vu1VNormalNonMax(p);
+    return bits;
+}
+// MAC sign bits (lane c -> (8 >> c) << 4) for a movemask of the result's sign bits.
+static const uint32_t vu1MacSignBits[16] = {0x00u, 0x80u, 0x40u, 0xC0u, 0x20u, 0xA0u, 0x60u, 0xE0u,
+                                            0x10u, 0x90u, 0x50u, 0xD0u, 0x30u, 0xB0u, 0x70u, 0xF0u};
+
+)VU1SIMD";
+
+    // Generated code is split into one function per 256-byte PC range (32 pairs): MSVC stops
     // inlining (and allocates registers poorly) inside one huge goto function. Jumps within a
     // chunk stay gotos; leaving a chunk returns to the image's dispatcher loop.
-    constexpr uint32_t kChunkShift = 9u;
+    constexpr uint32_t kChunkShift = 8u;
 
     // Relaxed timing (opt-in --relaxed-timing; default is the interpreter's exact cycle model): with
     // immediate writeback, VF/VI/ACC stall cycles only change cycle counts, so they are not
@@ -469,56 +533,55 @@ namespace
         const unsigned fd = (upper >> 6) & 0x1Fu;
         const bool productSum = kind == Madd || kind == Msub;
         static const char *names[] = {"ADD", "SUB", "MUL", "MADD", "MSUB"};
-        o << "    { // " << names[kind] << (accTarget ? "A" : "") << (withFlags ? " inline (fast flags)\n" : " inline (flags unobserved)\n");
-        if (source == Bc)
-            o << "        const float b = vu1NormalizeOperand(st.vf[" << ft << "][" << (upper & 3u) << "]);\n";
-        else if (source == Q)
-            o << "        const float b = vu1NormalizeOperand(st.q);\n";
-        else if (source == I)
-            o << "        const float b = vu1NormalizeOperand(st.i);\n";
-        o << "        float r[4] = {0.0f, 0.0f, 0.0f, 0.0f};";
-        if (productSum)
-            o << " float p[4] = {0.0f, 0.0f, 0.0f, 0.0f};";
-        o << " bool inRange = true;";
-        if (withFlags)
-            o << " uint32_t mac = 0u; uint32_t productNegative = 0u;";
-        o << "\n";
-        for (uint32_t c = 0; c < 4u; ++c)
-        {
-            if ((dest & laneForComponent(c)) == 0u)
-                continue;
-            o << "        { const float s = vu1NormalizeOperand(st.vf[" << fs << "][" << c << "]);";
-            const std::string t = source == Vt ? "vu1NormalizeOperand(st.vf[" + std::to_string(ft) + "][" + std::to_string(c) + "])" : "b";
-            switch (kind)
-            {
-            case Add: o << " r[" << c << "] = s + " << t << "; inRange = inRange && " << (withFlags ? "vu1NormalNonMax" : "vu1NormalizeSingleRounding") << "(r[" << c << "]);"; break;
-            case Sub: o << " r[" << c << "] = s - " << t << "; inRange = inRange && " << (withFlags ? "vu1NormalNonMax" : "vu1NormalizeSingleRounding") << "(r[" << c << "]);"; break;
-            case Mul: o << " r[" << c << "] = s * " << t << "; inRange = inRange && " << (withFlags ? "vu1NormalNonMax" : "vu1NormalizeSingleRounding") << "(r[" << c << "]);"; break;
-            case Madd:
-                o << " p[" << c << "] = s * " << t << "; r[" << c << "] = vu1NormalizeOperand(st.acc[" << c << "]) + p[" << c
-                  << "]; inRange = inRange && vu1ProductSumInRange(r[" << c << "], p[" << c << "])"
-                  << (withFlags ? " && vu1NormalNonMax(p[" + std::to_string(c) + "]); productNegative |= std::signbit(p[" + std::to_string(c) + "]) ? 1u : 0u;" : ";");
-                break;
-            case Msub:
-                o << " p[" << c << "] = s * " << t << "; r[" << c << "] = vu1NormalizeOperand(st.acc[" << c << "]) - p[" << c
-                  << "]; inRange = inRange && vu1ProductSumInRange(r[" << c << "], p[" << c << "])"
-                  << (withFlags ? " && vu1NormalNonMax(p[" + std::to_string(c) + "]); productNegative |= std::signbit(p[" + std::to_string(c) + "]) ? 1u : 0u;" : ";");
-                break;
-            }
-            if (withFlags)
-                o << " if (std::signbit(r[" << c << "])) mac |= " << (unsigned(laneForComponent(c)) << 4) << "u;";
-            o << " }\n";
-        }
-        if (withFlags)
-            o << "        if (!inRange) A::fmacExact(vu, " << hex32(upper) << ", r, " << dest
-              << "u); else A::queueFmacFlags(vu, mac, mac != 0u ? 2u : 0u, productNegative != 0u ? 2u : 0u);\n";
+        o << "    { // " << names[kind] << (accTarget ? "A" : "") << (withFlags ? " inline SSE (fast flags)\n" : " inline SSE (flags unobserved)\n");
+        // Operands, normalized as the interpreter does, four lanes at a time. Packed SSE add/sub/mul
+        // round each lane exactly like the scalar float code (same MXCSR rounding mode).
+        o << "        const __m128 s = vu1VNorm(_mm_loadu_ps(st.vf[" << fs << "]));\n";
+        if (source == Vt)
+            o << "        const __m128 t = vu1VNorm(_mm_loadu_ps(st.vf[" << ft << "]));\n";
+        else if (source == Bc)
+            o << "        const __m128 t = _mm_set1_ps(vu1NormalizeOperand(st.vf[" << ft << "][" << (upper & 3u) << "]));\n";
         else
-            o << "        if (!inRange) A::normalizeFmacValues(vu, " << hex32(upper) << ", r, " << dest << "u);\n";
-        o << "       ";
-        for (uint32_t c = 0; c < 4u; ++c)
-            if ((dest & laneForComponent(c)) != 0u)
-                o << (accTarget ? " st.acc[" : " st.vf[") << (accTarget ? "" : std::to_string(fd) + "][") << c << "] = r[" << c << "];";
-        o << "\n    }\n";
+            o << "        const __m128 t = _mm_set1_ps(vu1NormalizeOperand(st." << (source == Q ? "q" : "i") << "));\n";
+        const char *opName = kind == Add ? "_mm_add_ps" : kind == Sub ? "_mm_sub_ps" : "_mm_mul_ps";
+        // Lane c of the vector is component c; dest bit (8 >> c) selects it.
+        const unsigned laneBits = ((dest & 8u) ? 1u : 0u) | ((dest & 4u) ? 2u : 0u) | ((dest & 2u) ? 4u : 0u) | ((dest & 1u) ? 8u : 0u);
+        o << "        const int laneBits = " << laneBits << ";\n";
+        if (productSum)
+        {
+            o << "        const __m128 p = _mm_mul_ps(s, t);\n";
+            o << "        const __m128 a = vu1VNorm(_mm_loadu_ps(st.acc));\n";
+            o << "        __m128 r = " << (kind == Madd ? "_mm_add_ps(a, p)" : "_mm_sub_ps(a, p)") << ";\n";
+            o << "        bool inRange = (vu1VProductSumOk(r, p" << (withFlags ? ", true" : ", false") << ") & laneBits) == laneBits;\n";
+        }
+        else
+        {
+            o << "        __m128 r = " << opName << "(s, t);\n";
+            if (withFlags)
+                o << "        bool inRange = (vu1VNormalNonMax(r) & laneBits) == laneBits;\n";
+            else
+                o << "        bool inRange = (vu1VSingleRoundingOk(r) & laneBits) == laneBits; r = vu1VZeroDenormals(r);\n";
+        }
+        o << "        if (!inRange) { alignas(16) float rv[4]; _mm_store_ps(rv, r); ";
+        if (withFlags)
+            o << "A::fmacExact(vu, " << hex32(upper) << ", rv, " << dest << "u); r = _mm_load_ps(rv); }\n";
+        else
+            o << "A::normalizeFmacValues(vu, " << hex32(upper) << ", rv, " << dest << "u); r = _mm_load_ps(rv); }\n";
+        if (withFlags)
+        {
+            o << "        else { const uint32_t mac = vu1MacSignBits[_mm_movemask_ps(r) & laneBits];";
+            if (productSum)
+                o << " const uint32_t productSticky = (_mm_movemask_ps(p) & laneBits) != 0 ? 2u : 0u;";
+            else
+                o << " const uint32_t productSticky = 0u;";
+            o << " A::queueFmacFlags(vu, mac, mac != 0u ? 2u : 0u, productSticky); }\n";
+        }
+        const std::string target = accTarget ? "st.acc" : "st.vf[" + std::to_string(fd) + "]";
+        if (laneBits == 0xFu)
+            o << "        _mm_storeu_ps(" << target << ", r);\n";
+        else
+            o << "        _mm_storeu_ps(" << target << ", vu1VSel(vu1LaneMask(" << laneBits << "), r, _mm_loadu_ps(" << target << ")));\n";
+        o << "    }\n";
         return true;
     }
 
@@ -526,44 +589,43 @@ namespace
     // execUpper: normalized operands, no result normalization, destination lanes only.
     bool emitInlineUpperSimple(std::ostream &o, uint32_t upper)
     {
+        // SSE versions of the interpreter's expressions: _mm_max_ps/_mm_min_ps are exactly
+        // (a > b) ? a : b and (a < b) ? a : b; int<->float conversions use the same MXCSR rounding
+        // as the scalar casts; FTOI saturates positive overflow like vuFloatToInt (the scaled
+        // operand is normalized, so it is never NaN, and scaling by a power of two is exact).
         const uint8_t op = static_cast<uint8_t>(upper & 0x3Fu);
         const unsigned dest = (upper >> 21) & 0xFu;
         const unsigned ft = (upper >> 16) & 0x1Fu;
         const unsigned fs = (upper >> 11) & 0x1Fu;
         const unsigned fd = (upper >> 6) & 0x1Fu;
-        auto lanes = [&](const std::function<std::string(uint32_t)> &value, unsigned dstReg)
+        const unsigned laneBits = ((dest & 8u) ? 1u : 0u) | ((dest & 4u) ? 2u : 0u) | ((dest & 2u) ? 4u : 0u) | ((dest & 1u) ? 8u : 0u);
+        auto store = [&](unsigned reg, const std::string &value)
         {
-            o << "    { float r[4];";
-            for (uint32_t c = 0; c < 4u; ++c)
-                if ((dest & laneForComponent(c)) != 0u)
-                    o << " r[" << c << "] = " << value(c) << ";";
-            for (uint32_t c = 0; c < 4u; ++c)
-                if ((dest & laneForComponent(c)) != 0u)
-                    o << " st.vf[" << dstReg << "][" << c << "] = r[" << c << "];";
-            o << " }\n";
+            const std::string target = "st.vf[" + std::to_string(reg) + "]";
+            if (laneBits == 0xFu)
+                o << "        _mm_storeu_ps(" << target << ", " << value << ");\n";
+            else
+                o << "        _mm_storeu_ps(" << target << ", vu1VSel(vu1LaneMask(" << laneBits << "), " << value << ", _mm_loadu_ps(" << target << ")));\n";
         };
-        auto vs = [&](uint32_t c) { return "vu1NormalizeOperand(st.vf[" + std::to_string(fs) + "][" + std::to_string(c) + "])"; };
-        auto vt = [&](uint32_t c) { return "vu1NormalizeOperand(st.vf[" + std::to_string(ft) + "][" + std::to_string(c) + "])"; };
-        auto minMax = [&](bool isMax, const std::function<std::string(uint32_t)> &other)
+        const std::string vs = "vu1VNorm(_mm_loadu_ps(st.vf[" + std::to_string(fs) + "]))";
+        const std::string vt = "vu1VNorm(_mm_loadu_ps(st.vf[" + std::to_string(ft) + "]))";
+        auto minMax = [&](bool isMax, const std::string &other)
         {
-            o << "    // " << (isMax ? "MAX" : "MINI") << " inline\n";
-            lanes([&](uint32_t c)
-                  {
-                      const std::string a = "a" + std::to_string(c), b = "b" + std::to_string(c);
-                      return "([](float " + a + ", float " + b + ") { return (" + a + (isMax ? " > " : " < ") + b + ") ? " + a +
-                             " : " + b + "; })(" + vs(c) + ", " + other(c) + ")";
-                  },
-                  fd);
+            o << "    { // " << (isMax ? "MAX" : "MINI") << " inline SSE\n";
+            store(fd, std::string(isMax ? "_mm_max_ps(" : "_mm_min_ps(") + vs + ", " + other + ")");
+            o << "    }\n";
             return true;
         };
+        const std::string bc = "_mm_set1_ps(vu1NormalizeOperand(st.vf[" + std::to_string(ft) + "][" + std::to_string(op & 3u) + "]))";
+        const std::string iReg = "_mm_set1_ps(vu1NormalizeOperand(st.i))";
         if (op >= 0x10u && op <= 0x13u)
-            return minMax(true, [&](uint32_t) { return vt(op & 3u); });
+            return minMax(true, bc);
         if (op >= 0x14u && op <= 0x17u)
-            return minMax(false, [&](uint32_t) { return vt(op & 3u); });
+            return minMax(false, bc);
         if (op == 0x1Du)
-            return minMax(true, [&](uint32_t) { return std::string("vu1NormalizeOperand(st.i)"); });
+            return minMax(true, iReg);
         if (op == 0x1Fu)
-            return minMax(false, [&](uint32_t) { return std::string("vu1NormalizeOperand(st.i)"); });
+            return minMax(false, iReg);
         if (op == 0x2Bu)
             return minMax(true, vt);
         if (op == 0x2Fu)
@@ -574,26 +636,21 @@ namespace
         static const char *const scales[] = {"1.0f", "16.0f", "4096.0f", "32768.0f"};
         if (sp >= 0x10u && sp <= 0x13u)
         {
-            o << "    // ITOF inline\n";
-            lanes([&](uint32_t c)
-                  {
-                      const std::string bits = "([&]() { int32_t v; std::memcpy(&v, &st.vf[" + std::to_string(fs) + "][" +
-                                               std::to_string(c) + "], 4); return v; })()";
-                      return sp == 0x10u ? "static_cast<float>(" + bits + ")"
-                                         : "static_cast<float>(" + bits + ") / " + scales[sp & 3u];
-                  },
-                  ft);
+            o << "    { // ITOF inline SSE\n";
+            o << "        const __m128 f = _mm_cvtepi32_ps(_mm_castps_si128(_mm_loadu_ps(st.vf[" << fs << "])));\n";
+            store(ft, sp == 0x10u ? std::string("f") : std::string("_mm_div_ps(f, _mm_set1_ps(") + scales[sp & 3u] + "))");
+            o << "    }\n";
             return true;
         }
         if (sp >= 0x14u && sp <= 0x17u)
         {
-            o << "    // FTOI inline\n";
-            lanes([&](uint32_t c)
-                  {
-                      return "([](int32_t v) { float f; std::memcpy(&f, &v, 4); return f; })(vu1FloatToInt(" + vs(c) + ", " +
-                             scales[sp & 3u] + "))";
-                  },
-                  ft);
+            o << "    { // FTOI inline SSE\n";
+            o << "        const __m128 scaled = _mm_mul_ps(" << vs << ", _mm_set1_ps(" << scales[sp & 3u] << "));\n";
+            o << "        const __m128i trunc = _mm_cvttps_epi32(scaled);\n";
+            o << "        const __m128 positiveOverflow = _mm_cmpge_ps(scaled, _mm_set1_ps(2147483648.0f));\n";
+            o << "        const __m128 ints = vu1VSel(positiveOverflow, _mm_castsi128_ps(_mm_set1_epi32(0x7FFFFFFF)), _mm_castsi128_ps(trunc));\n";
+            store(ft, "ints");
+            o << "    }\n";
             return true;
         }
         return false;
@@ -635,9 +692,9 @@ namespace
             address(vit);
             o << "        if (addr + 16u <= ds) { uint32_t words[4]; std::memcpy(words, st.vf[" << lis
               << "], sizeof(words));";
-            if (g_exactTiming)
-                o << " A::queueStore(vu, addr, words, " << dest << "u);";
-            else
+            // Written at once: a queued store commits at the start of the next cycle, before
+            // anything else (XGKICK, the next pair's loads) reads data memory, so the result is
+            // identical without the store queue.
                 for (uint32_t c = 0; c < 4u; ++c)
                     if ((dest & laneForComponent(c)) != 0u)
                         o << " std::memcpy(A::vuData(vu) + addr + " << c * 4u << "u, &words[" << c << "], 4);";
@@ -661,9 +718,6 @@ namespace
             address(vis);
             o << "        if (addr + 16u <= ds) { const uint32_t val = static_cast<uint32_t>(static_cast<uint16_t>(st.vi[" << vit
               << "] & 0xFFFF));";
-            if (g_exactTiming)
-                o << " const uint32_t words[4] = {val, val, val, val}; A::queueStore(vu, addr, words, " << dest << "u);";
-            else
                 for (uint32_t c = 0; c < 4u; ++c)
                     if ((dest & laneForComponent(c)) != 0u)
                         o << " std::memcpy(A::vuData(vu) + addr + " << c * 4u << "u, &val, 4);";
@@ -737,8 +791,8 @@ namespace
     uint32_t inlinedFlags = 0u;
     uint32_t inlinedLower = 0u;
 
-    void emitPair(std::ostream &o, const VU1Interpreter &vu, const uint8_t *code, uint32_t pc, const std::set<uint32_t> &compiled,
-                  const ImageAnalysis &an, uint32_t &inlined)
+    void emitPairBody(std::ostream &o, const VU1Interpreter &vu, const uint8_t *code, uint32_t pc, const std::set<uint32_t> &compiled,
+                      const ImageAnalysis &an, uint32_t &inlined)
     {
         const A::Decoded d = A::decode(vu, code, pc);
         o << label(pc) << ":\n{\n";
@@ -919,7 +973,20 @@ namespace
         o << "    st.vf[0][0] = 0.0f; st.vf[0][1] = 0.0f; st.vf[0][2] = 0.0f; st.vf[0][3] = 1.0f; st.vi[0] = 0;\n";
         const uint32_t next = (pc + 8u) & kPcMask;
         o << "    st.pc = " << next << "u;\n";
-        o << "    if (st.branchPending)\n    {\n        if (st.branchDelay == 0u) { st.pc = st.branchTarget & pcMask; st.branchPending = false; }\n        else --st.branchDelay;\n    }\n";
+        // Only branch pairs and delay slots can see a pending branch (entry with one pending
+        // elsewhere falls back to the interpreter, see the image function).
+        const Flow pairFlow = lowerFlow(pc, d.lower);
+        // A delay slot is always the pair right after a branch (whatever the flow analysis models).
+        bool delaySlot = false;
+        if (pc >= 8u)
+        {
+            const uint32_t prev = pc - 8u;
+            const A::Decoded pd = A::decode(vu, code, prev);
+            const Flow prevFlow = lowerFlow(prev, pd.lower);
+            delaySlot = prevFlow.staticBranch || prevFlow.jump;
+        }
+        if (pairFlow.staticBranch || pairFlow.jump || delaySlot)
+            o << "    if (st.branchPending)\n    {\n        if (st.branchDelay == 0u) { st.pc = st.branchTarget & pcMask; st.branchPending = false; }\n        else --st.branchDelay;\n    }\n";
 
         const bool dBit = d.dBit;
         const bool tBit = d.tBit;
@@ -943,6 +1010,31 @@ namespace
         if (compiled.count(next) != 0u && chunkOf(next) == chunkOf(pc))
             o << "    if (st.pc == " << next << "u) goto " << label(next) << ";\n";
         o << "    goto dispatch;\n}\n";
+    }
+}
+
+namespace
+{
+    // VF0/VI0 are constants; the per-pair reset is only needed when the pair may write register
+    // 0 (an interpreter fallback, or inline code naming st.vf[0]/st.vi[0]).
+    void emitPair(std::ostream &out, const VU1Interpreter &vu, const uint8_t *code, uint32_t pc, const std::set<uint32_t> &compiled,
+                  const ImageAnalysis &an, uint32_t &inlined)
+    {
+        std::ostringstream body;
+        emitPairBody(body, vu, code, pc, compiled, an, inlined);
+        std::string text = body.str();
+        const std::string reset = "    st.vf[0][0] = 0.0f; st.vf[0][1] = 0.0f; st.vf[0][2] = 0.0f; st.vf[0][3] = 1.0f; st.vi[0] = 0;\n";
+        const size_t at = text.find(reset);
+        if (at != std::string::npos)
+        {
+            std::string rest = text;
+            rest.erase(at, reset.size());
+            const bool mayWriteZero = rest.find("A::execUpper") != std::string::npos || rest.find("A::execLower") != std::string::npos ||
+                                      rest.find("st.vf[0]") != std::string::npos || rest.find("st.vi[0]") != std::string::npos;
+            if (!mayWriteZero)
+                text = rest;
+        }
+        out << text;
     }
 }
 
@@ -999,7 +1091,8 @@ int main(int argc, char **argv)
         for (uint32_t e : entries)
             o << " 0x" << std::hex << e << std::dec;
         o << ". Do not edit.\n";
-        o << "#include \"runtime/ps2_vu1_compiled.h\"\n#include <algorithm>\n#include <cstring>\n\n";
+        o << "#include \"runtime/ps2_vu1_compiled.h\"\n#include <algorithm>\n#include <cstring>\n#include <emmintrin.h>\n\n";
+        o << kSimdPreamble;
         o << "using A = Vu1CompiledAccess;\n";
         o << "// Returned by a chunk when execution continues in another chunk.\n";
         o << "static constexpr Vu1CompiledResult kContinue = static_cast<Vu1CompiledResult>(3);\n\n";
@@ -1021,7 +1114,9 @@ int main(int argc, char **argv)
               << "u ? Vu1CompiledResult::Fallback : kContinue;\n    }\n}\n\n";
         }
         o << "Vu1CompiledResult " << fnName << "(VU1Interpreter &vu, uint64_t budgetEnd)\n{\n";
-        o << "    VU1State &st = A::state(vu);\n    for (;;)\n    {\n        Vu1CompiledResult result;\n";
+        o << "    VU1State &st = A::state(vu);\n";
+        o << "    if (st.branchPending)\n        return Vu1CompiledResult::Fallback; // resumed mid-branch: the interpreter takes this run\n";
+        o << "    for (;;)\n    {\n        Vu1CompiledResult result;\n";
         o << "        switch (st.pc >> " << kChunkShift << ")\n        {\n";
         for (const auto &[chunk, chunkPairs] : chunks)
             o << "        case " << chunk << "u: result = " << fnName << "_c" << chunk << "(vu, budgetEnd); break;\n";

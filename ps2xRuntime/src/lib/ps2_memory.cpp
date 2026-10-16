@@ -1,3 +1,4 @@
+#include <functional>
 #include <thread>
 #include <condition_variable>
 #include <deque>
@@ -308,6 +309,18 @@ namespace
         }
         return enabled != 0;
     }
+}
+
+namespace
+{
+    // Called by the worker after each finished transfer: wakes an idle EE scheduler, which
+    // otherwise would only notice the completion at its next VBlank.
+    std::function<void()> g_vif1WorkerNotify;
+}
+
+void setVif1WorkerNotify(std::function<void()> notify)
+{
+    g_vif1WorkerNotify = std::move(notify);
 }
 
 bool ps2Vif1WorkerHasCompletions() noexcept
@@ -1837,6 +1850,8 @@ void PS2Memory::startVif1WorkerIfNeeded()
                     g_vif1Worker.pool.push_back(std::move(job));
             }
             g_vif1Worker.completed.fetch_add(1u, std::memory_order_release);
+            if (g_vif1WorkerNotify)
+                g_vif1WorkerNotify();
             {
                 std::lock_guard<std::mutex> lock(g_vif1Worker.mutex);
                 g_vif1Worker.busy = false;

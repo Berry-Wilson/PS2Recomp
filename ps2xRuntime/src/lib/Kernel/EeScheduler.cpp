@@ -2032,6 +2032,9 @@ void EeScheduler::processEvent(const EeEvent &event)
         dispatchIrq(false, 3u);
         break;
     case EeEventType::Dmac:
+        // Posted by the VIF1 worker thread when a transfer finished.
+        if (ps2Vif1WorkerHasCompletions())
+            m_runtime.drainCompletedDmacHandlers(m_rdram);
         break;
     case EeEventType::Alarm:
     {
