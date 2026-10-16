@@ -14,9 +14,7 @@
 #include "Kernel/Stubs/GS.h"
 #include "Kernel/Stubs/MPEG.h"
 #include "ps2_host_backend.h"
-#ifdef PS2X_GS_PARALLEL
 #include "rlgl.h" // after raylib.h, which defines RL_MATRIX_TYPE
-#endif
 #include "ps2_iop_host.h"
 #include "ps2x/iop/iop_subsystem.h"
 

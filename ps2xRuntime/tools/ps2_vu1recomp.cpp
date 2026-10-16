@@ -12,6 +12,7 @@
 #include "runtime/ps2_memory.h"
 #include "runtime/ps2_vu1_compiled.h"
 
+#include <functional>
 #include <algorithm>
 #include <cstdint>
 #include <cstdio>
@@ -412,6 +413,185 @@ namespace
         return true;
     }
 
+    // Inline upper ops that never touch the flag pipelines (MAX/MINI forms, ITOF/FTOI), mirroring
+    // execUpper: normalized operands, no result normalization, destination lanes only.
+    bool emitInlineUpperSimple(std::ostream &o, uint32_t upper)
+    {
+        const uint8_t op = static_cast<uint8_t>(upper & 0x3Fu);
+        const unsigned dest = (upper >> 21) & 0xFu;
+        const unsigned ft = (upper >> 16) & 0x1Fu;
+        const unsigned fs = (upper >> 11) & 0x1Fu;
+        const unsigned fd = (upper >> 6) & 0x1Fu;
+        auto lanes = [&](const std::function<std::string(uint32_t)> &value, unsigned dstReg)
+        {
+            o << "    { float r[4];";
+            for (uint32_t c = 0; c < 4u; ++c)
+                if ((dest & laneForComponent(c)) != 0u)
+                    o << " r[" << c << "] = " << value(c) << ";";
+            for (uint32_t c = 0; c < 4u; ++c)
+                if ((dest & laneForComponent(c)) != 0u)
+                    o << " st.vf[" << dstReg << "][" << c << "] = r[" << c << "];";
+            o << " }\n";
+        };
+        auto vs = [&](uint32_t c) { return "vu1NormalizeOperand(st.vf[" + std::to_string(fs) + "][" + std::to_string(c) + "])"; };
+        auto vt = [&](uint32_t c) { return "vu1NormalizeOperand(st.vf[" + std::to_string(ft) + "][" + std::to_string(c) + "])"; };
+        auto minMax = [&](bool isMax, const std::function<std::string(uint32_t)> &other)
+        {
+            o << "    // " << (isMax ? "MAX" : "MINI") << " inline\n";
+            lanes([&](uint32_t c)
+                  {
+                      const std::string a = "a" + std::to_string(c), b = "b" + std::to_string(c);
+                      return "([](float " + a + ", float " + b + ") { return (" + a + (isMax ? " > " : " < ") + b + ") ? " + a +
+                             " : " + b + "; })(" + vs(c) + ", " + other(c) + ")";
+                  },
+                  fd);
+            return true;
+        };
+        if (op >= 0x10u && op <= 0x13u)
+            return minMax(true, [&](uint32_t) { return vt(op & 3u); });
+        if (op >= 0x14u && op <= 0x17u)
+            return minMax(false, [&](uint32_t) { return vt(op & 3u); });
+        if (op == 0x1Du)
+            return minMax(true, [&](uint32_t) { return std::string("vu1NormalizeOperand(st.i)"); });
+        if (op == 0x1Fu)
+            return minMax(false, [&](uint32_t) { return std::string("vu1NormalizeOperand(st.i)"); });
+        if (op == 0x2Bu)
+            return minMax(true, vt);
+        if (op == 0x2Fu)
+            return minMax(false, vt);
+        if (op < 0x3Cu)
+            return false;
+        const uint8_t sp = static_cast<uint8_t>((upper & 3u) | ((upper >> 4) & 0x7Cu));
+        static const char *const scales[] = {"1.0f", "16.0f", "4096.0f", "32768.0f"};
+        if (sp >= 0x10u && sp <= 0x13u)
+        {
+            o << "    // ITOF inline\n";
+            lanes([&](uint32_t c)
+                  {
+                      const std::string bits = "([&]() { int32_t v; std::memcpy(&v, &st.vf[" + std::to_string(fs) + "][" +
+                                               std::to_string(c) + "], 4); return v; })()";
+                      return sp == 0x10u ? "static_cast<float>(" + bits + ")"
+                                         : "static_cast<float>(" + bits + ") / " + scales[sp & 3u];
+                  },
+                  ft);
+            return true;
+        }
+        if (sp >= 0x14u && sp <= 0x17u)
+        {
+            o << "    // FTOI inline\n";
+            lanes([&](uint32_t c)
+                  {
+                      return "([](int32_t v) { float f; std::memcpy(&f, &v, 4); return f; })(vu1FloatToInt(" + vs(c) + ", " +
+                             scales[sp & 3u] + "))";
+                  },
+                  ft);
+            return true;
+        }
+        return false;
+    }
+
+    // Inline the hot lower ops, mirroring execLower case by case (same address wrap, same
+    // store queue, same branch-VI backup reads). Returns false for anything else.
+    bool emitInlineLower(std::ostream &o, uint32_t pc, uint32_t lower)
+    {
+        const uint32_t opHi = (lower >> 25) & 0x7Fu;
+        const unsigned dest = (lower >> 21) & 0xFu;
+        const unsigned lit = (lower >> 16) & 0x1Fu, lis = (lower >> 11) & 0x1Fu;
+        const unsigned vit = (lower >> 16) & 0xFu, vis = (lower >> 11) & 0xFu, vid = (lower >> 6) & 0xFu;
+        const int imm11 = static_cast<int16_t>(static_cast<int32_t>(lower << 21) >> 21);
+        auto address = [&](unsigned baseVi)
+        {
+            o << "        const uint32_t ds = A::vuDataSize(vu);\n";
+            o << "        const uint32_t addr = (static_cast<uint32_t>(static_cast<int32_t>(st.vi[" << baseVi << "] + (" << imm11
+              << "))) * 16u) & (ds - 1u);\n";
+        };
+        auto viWrite = [&](unsigned reg, const std::string &expr)
+        {
+            if (reg != 0u)
+                o << "    st.vi[" << reg << "] = " << expr << ";\n";
+        };
+        switch (opHi)
+        {
+        case 0x00: // LQ
+            o << "    { // LQ inline\n";
+            address(vis);
+            o << "        if (addr + 16u <= ds) { float tmp[4]; std::memcpy(tmp, A::vuData(vu) + addr, 16);";
+            for (uint32_t c = 0; c < 4u; ++c)
+                if ((dest & laneForComponent(c)) != 0u)
+                    o << " st.vf[" << lit << "][" << c << "] = tmp[" << c << "];";
+            o << " }\n    }\n";
+            return true;
+        case 0x01: // SQ
+            o << "    { // SQ inline\n";
+            address(vit);
+            o << "        if (addr + 16u <= ds) { uint32_t words[4]; std::memcpy(words, st.vf[" << lis
+              << "], sizeof(words)); A::queueStore(vu, addr, words, " << dest << "u); }\n    }\n";
+            return true;
+        case 0x04: // ILW
+        {
+            const unsigned comp = (dest & 8u) ? 0u : (dest & 4u) ? 1u : (dest & 2u) ? 2u : 3u;
+            o << "    { // ILW inline\n";
+            address(vis);
+            o << "        if (addr + 16u <= ds) { uint32_t v; std::memcpy(&v, A::vuData(vu) + addr + " << comp * 4u << "u, 4);";
+            if (vit != 0u)
+                o << " st.vi[" << vit << "] = static_cast<int32_t>(static_cast<int16_t>(v & 0xFFFFu));";
+            else
+                o << " (void)v;";
+            o << " }\n    }\n";
+            return true;
+        }
+        case 0x05: // ISW
+            o << "    { // ISW inline\n";
+            address(vis);
+            o << "        if (addr + 16u <= ds) { const uint32_t val = static_cast<uint32_t>(static_cast<uint16_t>(st.vi[" << vit
+              << "] & 0xFFFF)); const uint32_t words[4] = {val, val, val, val}; A::queueStore(vu, addr, words, " << dest
+              << "u); }\n    }\n";
+            return true;
+        case 0x08: // IADDIU
+        case 0x09: // ISUBIU
+        {
+            const int imm = static_cast<int16_t>((lower & 0x7FFu) | ((lower >> 10) & 0x7800u));
+            viWrite(vit, "static_cast<int16_t>(st.vi[" + std::to_string(vis) + "] " + (opHi == 0x08u ? "+" : "-") + " (" +
+                             std::to_string(imm) + "))");
+            return true;
+        }
+        case 0x1A: // FMAND
+            viWrite(vit, "static_cast<int32_t>(st.mac & static_cast<uint32_t>(static_cast<uint16_t>(st.vi[" + std::to_string(vis) +
+                             "])))");
+            return true;
+        case 0x28: // IBEQ
+        case 0x29: // IBNE
+        {
+            const uint32_t target = (pc + 8u + static_cast<uint32_t>(imm11 * 8)) & kPcMask;
+            o << "    if (static_cast<int16_t>(A::readBranchVi(vu, " << vis << ")) " << (opHi == 0x28u ? "==" : "!=")
+              << " static_cast<int16_t>(A::readBranchVi(vu, " << vit << "))) { st.branchPending = true; st.branchTarget = "
+              << target << "u & pcMask; st.branchDelay = 1; }\n";
+            return true;
+        }
+        case 0x40:
+        {
+            const uint32_t funct = lower & 0x3Fu;
+            const std::string s = "st.vi[" + std::to_string(vis) + "]", t = "st.vi[" + std::to_string(vit) + "]";
+            switch (funct)
+            {
+            case 0x30: viWrite(vid, "static_cast<int16_t>(" + s + " + " + t + ")"); return true; // IADD
+            case 0x31: viWrite(vid, "static_cast<int16_t>(" + s + " - " + t + ")"); return true; // ISUB
+            case 0x32: // IADDI
+            {
+                const int imm5 = static_cast<int16_t>(static_cast<int32_t>(((lower >> 6) & 0x1Fu) << 27) >> 27);
+                viWrite(vit, "static_cast<int16_t>(" + s + " + (" + std::to_string(imm5) + "))");
+                return true;
+            }
+            case 0x34: viWrite(vid, s + " & " + t); return true; // IAND
+            case 0x35: viWrite(vid, s + " | " + t); return true; // IOR
+            default: return false;
+            }
+        }
+        default:
+            return false;
+        }
+    }
+
     void emitStallTerms(std::vector<std::string> &terms, const A::Usage &usage)
     {
         for (uint32_t index = 0; index < usage.vfReadCount; ++index)
@@ -430,6 +610,9 @@ namespace
             if ((usage.accRead & laneForComponent(c)) != 0u)
                 terms.push_back("A::accReady(vu, " + std::to_string(c) + ")");
     }
+
+    uint32_t inlinedSimple = 0u;
+    uint32_t inlinedLower = 0u;
 
     void emitPair(std::ostream &o, const VU1Interpreter &vu, const uint8_t *code, uint32_t pc, const std::set<uint32_t> &compiled,
                   const ImageAnalysis &an, uint32_t &inlined)
@@ -500,6 +683,8 @@ namespace
         {
             if (an.deadFlagWriters.count(pc) != 0u && emitInlineFmac(o, d.upper))
                 ++inlined;
+            else if (emitInlineUpperSimple(o, d.upper))
+                ++inlinedSimple;
             else
                 o << "    A::execUpper(vu, " << hex32(d.upper) << ");\n";
         };
@@ -526,7 +711,12 @@ namespace
             if (!upperNop)
                 emitUpper();
             if (!lowerNop)
-                o << "    A::execLower(vu, " << hex32(d.lower) << ", " << hex32(d.upper) << ");\n";
+            {
+                if (emitInlineLower(o, pc, d.lower))
+                    ++inlinedLower;
+                else
+                    o << "    A::execLower(vu, " << hex32(d.lower) << ", " << hex32(d.upper) << ");\n";
+            }
         }
         o << "    A::clearViBranchBackup(vu);\n";
 
@@ -681,7 +871,7 @@ int main(int argc, char **argv)
         images.push_back(fnName);
         statusMasks.push_back(inlined != 0u ? 0x03Fu : 0xFFFu);
         std::cout << name << ": " << pairs.size() << " pairs from " << entries.size() << " entries; flag writers "
-                  << analysis.writers << ", unobserved " << analysis.deadFlagWriters.size() << ", inlined " << inlined
+                  << analysis.writers << ", unobserved " << analysis.deadFlagWriters.size() << ", inlined " << inlined << " (+" << inlinedSimple << " simple upper, " << inlinedLower << " lower)"
                   << (analysis.stickyObservable ? " (sticky status observable: no flag elimination)" : "") << "\n";
     }
 

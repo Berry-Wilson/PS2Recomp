@@ -16,6 +16,7 @@
 #include <cmath>
 #include <cstdint>
 #include <cstring>
+#include <limits>
 
 class GS;
 class PS2Memory;
@@ -92,6 +93,17 @@ inline bool vu1ProductSumInRange(float result, float product)
            std::fabs(result) >= std::fabs(product) * 9.5367431640625e-7f;
 }
 
+// FTOIn conversion, identical to the interpreter's (saturating, truncating).
+inline int32_t vu1FloatToInt(float value, float scale)
+{
+    const double scaled = static_cast<double>(value) * static_cast<double>(scale);
+    if (scaled >= static_cast<double>(std::numeric_limits<int32_t>::max()))
+        return std::numeric_limits<int32_t>::max();
+    if (scaled <= static_cast<double>(std::numeric_limits<int32_t>::min()))
+        return std::numeric_limits<int32_t>::min();
+    return static_cast<int32_t>(scaled);
+}
+
 class Vu1CompiledAccess
 {
 public:
@@ -137,6 +149,15 @@ public:
     {
         vu.execLower(instr, vu.m_activeVuData, vu.m_activeVuDataSize, *vu.m_activeGs, vu.m_activeMemory, upper);
     }
+
+    // Inline lower instructions (LQ/SQ/ILW/ISW, branches) use these.
+    static uint8_t *vuData(VU1Interpreter &vu) { return vu.m_activeVuData; }
+    static uint32_t vuDataSize(const VU1Interpreter &vu) { return vu.m_activeVuDataSize; }
+    static void queueStore(VU1Interpreter &vu, uint32_t address, const uint32_t words[4], uint8_t laneMask)
+    {
+        vu.queueStore(address, words, laneMask);
+    }
+    static int32_t readBranchVi(const VU1Interpreter &vu, uint8_t reg) { return vu.readBranchVi(reg); }
 
     static uint64_t vfReady(const VU1Interpreter &vu, uint32_t reg, uint32_t component) { return vu.m_vfReady[reg][component]; }
     static uint64_t &vfReadyRef(VU1Interpreter &vu, uint32_t reg, uint32_t component) { return vu.m_vfReady[reg][component]; }
