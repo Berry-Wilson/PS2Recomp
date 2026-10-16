@@ -326,6 +326,8 @@ public:
     [[noreturn]] void invokeCurrentSequence(std::vector<GuestInvocation> invocations);
     [[nodiscard]] bool hasInvocation(GuestInvocationKind kind, uint64_t tag) const;
     [[nodiscard]] uint32_t invocationStackTop();
+    // Returns a deleted thread's invocation stacks to the shared free list.
+    void releaseInvocationStacks(int threadId);
 
     int addIrqHandler(bool dmac,
                       uint32_t cause,

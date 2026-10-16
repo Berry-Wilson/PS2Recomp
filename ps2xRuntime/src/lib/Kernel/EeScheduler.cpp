@@ -482,6 +482,7 @@ int EeScheduler::deleteThread(int id, uint32_t &ownedStack)
         ownedStack = it->second.stack;
     }
     m_threads.erase(it);
+    releaseInvocationStacks(id);
     publishSnapshot();
     return KE_OK;
 }
@@ -530,6 +531,7 @@ int EeScheduler::startThread(int id, uint32_t arg, const R5900Context &caller, b
     if (deleteThreadRecord && id != kMainThreadId)
     {
         m_threads.erase(id);
+        releaseInvocationStacks(id);
     }
     if (ownedStack != 0u)
     {
@@ -1182,6 +1184,31 @@ bool EeScheduler::hasInvocation(GuestInvocationKind kind, uint64_t tag) const
                        });
 }
 
+namespace
+{
+    // Invocation stacks of deleted threads, reusable by any thread. The reserved callback-stack
+    // region is small and never returns space, and games that create and delete threads over
+    // time (each with a new ID) would otherwise exhaust it. Kept per scheduler instance.
+    std::unordered_map<const EeScheduler *, std::vector<uint32_t>> g_freeInvocationStacks;
+}
+
+void EeScheduler::releaseInvocationStacks(int threadId)
+{
+    auto &freeList = g_freeInvocationStacks[this];
+    for (auto it = m_invocationStackTops.begin(); it != m_invocationStackTops.end();)
+    {
+        if (static_cast<uint32_t>(it->first >> 32u) == static_cast<uint32_t>(threadId))
+        {
+            freeList.push_back(it->second);
+            it = m_invocationStackTops.erase(it);
+        }
+        else
+        {
+            ++it;
+        }
+    }
+}
+
 uint32_t EeScheduler::invocationStackTop()
 {
     assertExecutor();
@@ -1199,7 +1226,16 @@ uint32_t EeScheduler::invocationStackTop()
         return existing->second;
     }
     constexpr uint32_t kInvocationStackSize = 0x4000u;
-    const uint32_t top = m_runtime.reserveAsyncCallbackStack(kInvocationStackSize, 16u);
+    uint32_t top = 0u;
+    if (auto &freeList = g_freeInvocationStacks[this]; !freeList.empty())
+    {
+        top = freeList.back();
+        freeList.pop_back();
+    }
+    else
+    {
+        top = m_runtime.reserveAsyncCallbackStack(kInvocationStackSize, 16u);
+    }
     if (top == 0u)
     {
         throw std::runtime_error("EE invocation stack space exhausted");

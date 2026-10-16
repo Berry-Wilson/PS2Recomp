@@ -1377,7 +1377,10 @@ bool PS2Memory::writeIORegister(uint32_t address, uint32_t value)
                     uint32_t asr1 = m_ioRegisters[channelBase + 0x50];
                     uint32_t asp = (chcr >> 4) & 0x3u;
                     const bool tieEnabled = (chcr & (1u << 7)) != 0u;
-                    const int kMaxChainTags = 4096;
+                    // Only a guard against corrupt self-looping chains: real display lists run to
+                    // tens of thousands of tags per frame (dhp1's first town), and stopping short
+                    // leaves the channel without its END tag, so the game never sees the frame end.
+                    const int kMaxChainTags = 1 << 20;
                     std::vector<uint8_t> chainBuf = takeChainBuffer();
 
                     auto appendData = [&](uint32_t srcAddr, uint32_t qwCount)
