@@ -2534,6 +2534,12 @@ void PS2Runtime::run()
             presentHeight = gpuHeight;
             presentationTexture = Texture2D{gpuFrame->AcquireTexture(), int(presentWidth), int(presentHeight), 1, PIXELFORMAT_UNCOMPRESSED_R8G8B8A8};
         }
+        else
+        {
+            // Readback frames carry the same CRTC aspect (4:3 for a full-screen mode); without it
+            // a 640x448 scanout would be shown with square pixels, ~7% too wide.
+            aspectRatio = m_gs.getLatchedPresentationAspectRatio();
+        }
 #endif
 
         BeginDrawing();

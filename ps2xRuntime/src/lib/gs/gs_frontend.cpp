@@ -1791,6 +1791,12 @@ std::shared_ptr<GSGpuFrame> GS::getLatchedGpuFrame(uint32_t &width, uint32_t &he
     return m_hostPresentationGpuFrame;
 }
 
+float GS::getLatchedPresentationAspectRatio() const
+{
+    std::lock_guard<std::mutex> lock(m_presentationMutex);
+    return m_hostPresentationAspectRatio;
+}
+
 void GS::shutdownBackend()
 {
     std::lock_guard<std::recursive_mutex> stateLock(m_stateMutex);

@@ -135,6 +135,8 @@ public:
     bool getPreferredDisplaySource(GSFrameReg &outSource, uint32_t &outDestFbp) const;
     void latchHostPresentationFrame();
     std::shared_ptr<GSGpuFrame> getLatchedGpuFrame(uint32_t &width, uint32_t &height, float &aspectRatio) const;
+    // Display aspect ratio of the latched frame (0 when the backend does not report one).
+    float getLatchedPresentationAspectRatio() const;
     bool copyLatchedHostPresentationFrame(std::vector<uint8_t> &outPixels,
                                           uint32_t &outWidth,
                                           uint32_t &outHeight,
