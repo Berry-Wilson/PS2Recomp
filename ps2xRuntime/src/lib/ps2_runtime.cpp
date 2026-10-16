@@ -2553,7 +2553,15 @@ void PS2Runtime::run()
             dstWidth,
             dstHeight};
         if (presentationTexture.id)
+        {
+            // GS framebuffer alpha is not display opacity (the CRTC ignores it), so draw the frame
+            // opaque; otherwise frames whose alpha a pass left at 0 show up black.
+            rlDrawRenderBatchActive();
+            rlDisableColorBlend();
             DrawTexturePro(presentationTexture, srcRect, dstRect, Vector2{0.0f, 0.0f}, 0.0f, WHITE);
+            rlDrawRenderBatchActive();
+            rlEnableColorBlend();
+        }
 #ifdef PS2X_GS_PARALLEL
         if (gpuFrame)
         {
