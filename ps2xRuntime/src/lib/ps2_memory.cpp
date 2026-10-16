@@ -234,6 +234,34 @@ namespace
 }
 
 // Helpers for GS VRAM addressing (PSMCT32 path).
+namespace
+{
+    // DMA chain payloads are gathered into a byte vector per transfer. Recycling the vectors
+    // keeps their capacity, so a frame's multi-megabyte VIF1 chain is not regrown (and recopied)
+    // from empty every time. Consumers copy what they keep (GifArbiter::submit), so a buffer is
+    // free once its transfer has been processed.
+    thread_local std::vector<std::vector<uint8_t>> t_chainBufferPool;
+
+    std::vector<uint8_t> takeChainBuffer()
+    {
+        if (t_chainBufferPool.empty())
+            return {};
+        std::vector<uint8_t> buffer = std::move(t_chainBufferPool.back());
+        t_chainBufferPool.pop_back();
+        buffer.clear();
+        return buffer;
+    }
+
+    template <typename Transfers>
+    void recycleChainBuffers(Transfers &transfers)
+    {
+        for (auto &transfer : transfers)
+            if (transfer.chainData.capacity() != 0u && t_chainBufferPool.size() < 8u)
+                t_chainBufferPool.push_back(std::move(transfer.chainData));
+        transfers.clear();
+    }
+}
+
 static inline uint32_t gs_vram_offset(uint32_t basePage, uint32_t x, uint32_t y, uint32_t fbw)
 {
     // basePage is in 2048-byte units; fbw is in blocks of 64 pixels.
@@ -1350,7 +1378,7 @@ bool PS2Memory::writeIORegister(uint32_t address, uint32_t value)
                     uint32_t asp = (chcr >> 4) & 0x3u;
                     const bool tieEnabled = (chcr & (1u << 7)) != 0u;
                     const int kMaxChainTags = 4096;
-                    std::vector<uint8_t> chainBuf;
+                    std::vector<uint8_t> chainBuf = takeChainBuffer();
 
                     auto appendData = [&](uint32_t srcAddr, uint32_t qwCount)
                     {
@@ -1755,7 +1783,7 @@ void PS2Memory::processPendingTransfers()
             }
         }
     }
-    m_pendingGifTransfers.clear();
+    recycleChainBuffers(m_pendingGifTransfers);
 
     const bool hadVif0 = !m_pendingVif0Transfers.empty();
     for (auto &p : m_pendingVif0Transfers)
@@ -1813,7 +1841,7 @@ void PS2Memory::processPendingTransfers()
             }
         }
     }
-    m_pendingVif0Transfers.clear();
+    recycleChainBuffers(m_pendingVif0Transfers);
 
     const bool hadVif1 = !m_pendingVif1Transfers.empty();
     for (auto &p : m_pendingVif1Transfers)
@@ -1871,7 +1899,7 @@ void PS2Memory::processPendingTransfers()
             }
         }
     }
-    m_pendingVif1Transfers.clear();
+    recycleChainBuffers(m_pendingVif1Transfers);
 
     if (m_gifArbiter)
         m_gifArbiter->drain();

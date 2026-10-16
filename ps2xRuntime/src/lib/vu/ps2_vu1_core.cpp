@@ -190,13 +190,28 @@ VU1Interpreter::VU1Interpreter(Unit unit)
 
 void VU1Interpreter::resetScheduler()
 {
-    m_flagPipeline = {};
+    // Entries outside a pipeline's valid mask already have valid == false (commit clears both),
+    // so only pipelines with live entries need clearing; this runs on every program start.
+    if (m_flagValidMask != 0u)
+        m_flagPipeline = {};
+    // Latest-write sequences are only read for the lanes a pending write set when it was
+    // queued, so without pending writes the old values are never observed.
+    if (m_vfWriteValidMask != 0u)
+        m_vfLatestWrite = {};
+    if (m_viWriteValidMask != 0u)
+        m_viLatestWrite = {};
+    if (m_accWriteValidMask != 0u)
+        m_accLatestWrite = {};
     m_fdiv = {};
     m_efu = {};
-    m_storePipeline = {};
-    m_vfWritePipeline = {};
-    m_viWritePipeline = {};
-    m_accWritePipeline = {};
+    if (m_storeValidMask != 0u)
+        m_storePipeline = {};
+    if (m_vfWriteValidMask != 0u)
+        m_vfWritePipeline = {};
+    if (m_viWriteValidMask != 0u)
+        m_viWritePipeline = {};
+    if (m_accWriteValidMask != 0u)
+        m_accWritePipeline = {};
     m_flagValidMask = 0u;
     m_storeValidMask = 0u;
     m_vfWriteValidMask = 0u;
@@ -207,9 +222,6 @@ void VU1Interpreter::resetScheduler()
     m_vfReady = {};
     m_viReady = {};
     m_accReady = {};
-    m_vfLatestWrite = {};
-    m_viLatestWrite = {};
-    m_accLatestWrite = {};
     m_nextWriteSequence = 0;
     m_efuResourceReady = 0;
     m_workingClip = m_state.clip;
