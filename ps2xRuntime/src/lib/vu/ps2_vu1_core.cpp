@@ -228,7 +228,16 @@ void VU1Interpreter::resetScheduler()
     m_viWriteValidMask = 0u;
     m_accWriteValidMask = 0u;
     m_nextCommitCycle = ~0ull;
-    m_xgkick = {};
+    // Not m_xgkick = {}: that zeroes the 64 KiB packet buffer at every program start, and its
+    // bytes are always written before they are read (up to copiedBytes / totalBytes).
+    m_xgkick.sourceAddress = 0u;
+    m_xgkick.totalBytes = 0u;
+    m_xgkick.copiedBytes = 0u;
+    m_xgkick.currentTagEnd = 0u;
+    m_xgkick.cycleCredit = 0u;
+    m_xgkick.issueCycle = 0u;
+    m_xgkick.active = false;
+    m_xgkick.currentTagEop = false;
     m_vfReady = {};
     m_viReady = {};
     m_accReady = {};

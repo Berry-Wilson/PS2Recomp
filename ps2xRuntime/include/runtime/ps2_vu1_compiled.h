@@ -144,8 +144,45 @@ public:
 
     PS2X_VU1_FORCEINLINE static void commitReadyPipelines(VU1Interpreter &vu)
     {
-        if (vu.m_cycle >= vu.m_nextCommitCycle)
+        if (vu.m_cycle < vu.m_nextCommitCycle)
+            return;
+        // Compiled code mostly has only FMAC flag writes in flight (stores are written at once,
+        // VF/VI/ACC use immediate writeback): commit those inline, exactly as
+        // commitReadyPipelinesNow does, instead of calling it every few cycles.
+        if ((vu.m_storeValidMask | vu.m_vfWriteValidMask | vu.m_viWriteValidMask | vu.m_accWriteValidMask) != 0u ||
+            vu.m_fdiv.valid || vu.m_efu[0].valid || vu.m_efu[1].valid)
+        {
             vu.commitReadyPipelinesNow();
+            return;
+        }
+        uint64_t next = ~0ull;
+        for (uint32_t mask = vu.m_flagValidMask; mask != 0u; mask &= mask - 1u)
+        {
+            uint32_t slot = 0u;
+            while (((mask >> slot) & 1u) == 0u)
+                ++slot;
+            auto &entry = vu.m_flagPipeline[slot];
+            if (entry.readyCycle > vu.m_cycle)
+            {
+                if (entry.readyCycle < next)
+                    next = entry.readyCycle;
+                continue;
+            }
+            if (entry.writesMac)
+                vu.m_state.mac = entry.mac;
+            if (entry.writesStatus)
+            {
+                const uint32_t current = entry.status & 0xFu;
+                vu.m_state.status = (vu.m_state.status & 0xFF0u) | current | ((current | entry.extraSticky) << 6);
+            }
+            if (entry.writesSticky)
+                vu.m_state.status = (vu.m_state.status & 0x03Fu) | (entry.status & 0xFC0u);
+            if (entry.writesClip)
+                vu.m_state.clip = entry.clip;
+            entry.valid = false;
+            vu.m_flagValidMask &= ~(1u << slot);
+        }
+        vu.m_nextCommitCycle = next;
     }
     PS2X_VU1_FORCEINLINE static void advanceTo(VU1Interpreter &vu, uint64_t target) { vu.advanceTo(target); }
     // Same steps as VU1Interpreter::advanceOneCycle, inlined.

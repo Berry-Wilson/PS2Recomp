@@ -611,6 +611,88 @@ void PS2Memory::processVIF1Data(const uint8_t *data, uint32_t sizeBytes)
 
             const bool zeroExtend = (imm & 0x4000u) != 0u;
 
+            // Fast path for the common case: no write mask, no row add/offset, one source vector per
+            // write (CL == WL). Every field then takes the decoded value and the writes are
+            // contiguous, so this is the general loop below without its per-field dispatch.
+            const bool v45 = vl == 3u && vn == 3u;
+            if (m_vu1Data && totalBytes > 0 && pos + totalBytes <= sizeBytes && !maskEnable && cl == wl &&
+                ((vif1_regs.mode & 3u) == 0u || v45) && (vl != 3u || v45))
+            {
+                const uint8_t *srcBase = data + pos;
+                const uint8_t *dataEnd = data + sizeBytes;
+                for (uint32_t writeIndex = 0; writeIndex < writeVectorCount; ++writeIndex)
+                {
+                    const uint32_t destOff = ((vuAddr + writeIndex) & 0x3FFu) * 16u;
+                    if (destOff + 16u > PS2_VU1_DATA_SIZE)
+                        continue;
+                    const uint8_t *v = srcBase + writeIndex * bytesPerVector;
+                    uint32_t out[4];
+                    if (v45)
+                    {
+                        uint16_t packed;
+                        std::memcpy(&packed, v, sizeof(packed));
+                        out[0] = packed & 0x1Fu;
+                        out[1] = (packed >> 5) & 0x1Fu;
+                        out[2] = (packed >> 10) & 0x1Fu;
+                        out[3] = (packed >> 15) & 0x01u;
+                    }
+                    else
+                    {
+                        const uint32_t elemBytes = static_cast<uint32_t>(bitsPerComponent) / 8u;
+                        auto element = [&](const uint8_t *e) -> uint32_t
+                        {
+                            if (vl == 0u)
+                            {
+                                uint32_t w;
+                                std::memcpy(&w, e, sizeof(w));
+                                return w;
+                            }
+                            if (vl == 1u)
+                            {
+                                uint16_t h;
+                                std::memcpy(&h, e, sizeof(h));
+                                return zeroExtend ? static_cast<uint32_t>(h)
+                                                  : static_cast<uint32_t>(static_cast<int32_t>(static_cast<int16_t>(h)));
+                            }
+                            return zeroExtend ? static_cast<uint32_t>(*e)
+                                              : static_cast<uint32_t>(static_cast<int32_t>(static_cast<int8_t>(*e)));
+                        };
+                        if (components == 1)
+                        {
+                            out[0] = out[1] = out[2] = out[3] = element(v);
+                        }
+                        else if (components == 2)
+                        {
+                            out[0] = out[2] = element(v);
+                            out[1] = out[3] = element(v + elemBytes);
+                        }
+                        else if (components == 3)
+                        {
+                            out[0] = element(v);
+                            out[1] = element(v + elemBytes);
+                            out[2] = element(v + 2u * elemBytes);
+                            const uint8_t *next = v + 3u * elemBytes;
+                            if (next + elemBytes <= dataEnd)
+                                out[3] = element(next);
+                            else
+                                std::memcpy(&out[3], m_vu1Data + destOff + 12u, sizeof(uint32_t));
+                        }
+                        else
+                        {
+                            out[0] = element(v);
+                            out[1] = element(v + elemBytes);
+                            out[2] = element(v + 2u * elemBytes);
+                            out[3] = element(v + 3u * elemBytes);
+                        }
+                    }
+                    std::memcpy(m_vu1Data + destOff, out, sizeof(out));
+                }
+                pos += totalBytes;
+                if (pos > sizeBytes)
+                    break;
+                continue;
+            }
+
             if (m_vu1Data && totalBytes > 0 && pos + totalBytes <= sizeBytes)
             {
                 const uint8_t *srcBase = data + pos;
