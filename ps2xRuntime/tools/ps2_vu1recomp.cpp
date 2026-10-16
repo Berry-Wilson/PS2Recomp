@@ -53,6 +53,29 @@ namespace
     // inlining (and allocates registers poorly) inside one huge goto function. Jumps within a
     // chunk stay gotos; leaving a chunk returns to the image's dispatcher loop.
     constexpr uint32_t kChunkShift = 9u;
+
+    // Relaxed timing (opt-in --relaxed-timing; default is the interpreter's exact cycle model): with
+    // immediate writeback, VF/VI/ACC stall cycles only change cycle counts, so they are not
+    // modelled. Stores are written at once (they became visible to the next pair anyway).
+    // Because fewer cycles pass, instructions reading Q/P wait for the FDIV/EFU unit and flag
+    // readers wait for pending flag writes, as if the stalls had covered the latency.
+    // NOT safe in general: dhp1's town renders broken geometry with it (its VU1 code depends on
+    // the stall timing somewhere), and it gave no measurable speedup there.
+    bool g_exactTiming = true;
+
+    bool upperReadsQ(uint32_t upper)
+    {
+        const uint8_t op = static_cast<uint8_t>(upper & 0x3Fu);
+        if (op < 0x3Cu)
+            return op == 0x1Cu || op == 0x20u || op == 0x21u || op == 0x24u || op == 0x25u;
+        const uint8_t sp = static_cast<uint8_t>((upper & 3u) | ((upper >> 4) & 0x7Cu));
+        return sp == 0x1Cu || sp == 0x20u || sp == 0x21u || sp == 0x24u || sp == 0x25u;
+    }
+    bool lowerReadsP(uint32_t lower)
+    {
+        return (lower & 0x80000000u) != 0u && (lower & 0x3Cu) == 0x3Cu &&
+               (((lower >> 6) & 0x1Fu) << 2 | (lower & 3u)) == 0x64u; // MFP
+    }
     uint32_t chunkOf(uint32_t pc) { return pc >> kChunkShift; }
 
     std::string label(uint32_t pc)
@@ -611,7 +634,14 @@ namespace
             o << "    { // SQ inline\n";
             address(vit);
             o << "        if (addr + 16u <= ds) { uint32_t words[4]; std::memcpy(words, st.vf[" << lis
-              << "], sizeof(words)); A::queueStore(vu, addr, words, " << dest << "u); }\n    }\n";
+              << "], sizeof(words));";
+            if (g_exactTiming)
+                o << " A::queueStore(vu, addr, words, " << dest << "u);";
+            else
+                for (uint32_t c = 0; c < 4u; ++c)
+                    if ((dest & laneForComponent(c)) != 0u)
+                        o << " std::memcpy(A::vuData(vu) + addr + " << c * 4u << "u, &words[" << c << "], 4);";
+            o << " }\n    }\n";
             return true;
         case 0x04: // ILW
         {
@@ -630,8 +660,14 @@ namespace
             o << "    { // ISW inline\n";
             address(vis);
             o << "        if (addr + 16u <= ds) { const uint32_t val = static_cast<uint32_t>(static_cast<uint16_t>(st.vi[" << vit
-              << "] & 0xFFFF)); const uint32_t words[4] = {val, val, val, val}; A::queueStore(vu, addr, words, " << dest
-              << "u); }\n    }\n";
+              << "] & 0xFFFF));";
+            if (g_exactTiming)
+                o << " const uint32_t words[4] = {val, val, val, val}; A::queueStore(vu, addr, words, " << dest << "u);";
+            else
+                for (uint32_t c = 0; c < 4u; ++c)
+                    if ((dest & laneForComponent(c)) != 0u)
+                        o << " std::memcpy(A::vuData(vu) + addr + " << c * 4u << "u, &val, 4);";
+            o << " }\n    }\n";
             return true;
         case 0x08: // IADDIU
         case 0x09: // ISUBIU
@@ -715,8 +751,22 @@ namespace
         }
 
         std::vector<std::string> terms;
-        emitStallTerms(terms, d.upperUsage);
-        emitStallTerms(terms, d.lowerUsage);
+        if (g_exactTiming)
+        {
+            emitStallTerms(terms, d.upperUsage);
+            emitStallTerms(terms, d.lowerUsage);
+        }
+        else
+        {
+            if (upperReadsQ(d.upper))
+                terms.push_back("(A::fdivValid(vu) ? A::fdivReady(vu) : 0u)");
+            if (lowerReadsP(d.lower))
+                terms.push_back("A::efuMaxPendingReady(vu)");
+            const uint32_t lowerOp = lowerPrimaryOp(d.lower);
+            const bool clipReader = lowerOp == 0x10u || lowerOp == 0x12u || lowerOp == 0x13u || lowerOp == 0x1Cu;
+            if (isFlagReader(d.lower) || clipReader)
+                terms.push_back("A::flagPipelineReady(vu)");
+        }
         std::sort(terms.begin(), terms.end());
         terms.erase(std::unique(terms.begin(), terms.end()), terms.end());
         if (d.lowerUsage.pipeline == A::kPipelineFdiv || d.lowerUsage.waitQ)
@@ -838,28 +888,29 @@ namespace
         if (writtenVi != 0u)
             o << "    st.vi[" << unsigned(writtenVi) << "] = static_cast<int16_t>(st.vi[" << unsigned(writtenVi) << "]);\n";
 
-        // markPairWrites with constants.
-        if (lowerWrite.reg != 0u && d.suppressedLowerVf != lowerWrite.reg)
+        // markPairWrites with constants (exact timing only).
+        if (g_exactTiming && lowerWrite.reg != 0u && d.suppressedLowerVf != lowerWrite.reg)
         {
             const unsigned latency = d.lowerUsage.vfLatency != 0u ? d.lowerUsage.vfLatency : d.lowerUsage.latency;
             for (uint32_t c = 0; c < 4u; ++c)
                 if ((lowerWrite.lanes & laneForComponent(c)) != 0u)
                     o << "    A::vfReadyRef(vu, " << unsigned(lowerWrite.reg) << ", " << c << ") = cyc + " << latency << "u;\n";
         }
-        if (upperWrite.reg != 0u)
+        if (g_exactTiming && upperWrite.reg != 0u)
         {
             const unsigned latency = d.upperUsage.vfLatency != 0u ? d.upperUsage.vfLatency : d.upperUsage.latency;
             for (uint32_t c = 0; c < 4u; ++c)
                 if ((upperWrite.lanes & laneForComponent(c)) != 0u)
                     o << "    A::vfReadyRef(vu, " << unsigned(upperWrite.reg) << ", " << c << ") = cyc + " << latency << "u;\n";
         }
+        if (g_exactTiming)
         {
             const unsigned latency = d.lowerUsage.viLatency != 0u ? d.lowerUsage.viLatency : d.lowerUsage.latency;
             for (uint32_t reg = 1; reg < 16u; ++reg)
                 if ((d.lowerUsage.viWrite & (1u << reg)) != 0u)
                     o << "    A::viReadyRef(vu, " << reg << ") = cyc + " << latency << "u;\n";
         }
-        for (uint32_t c = 0; c < 4u; ++c)
+        for (uint32_t c = 0; g_exactTiming && c < 4u; ++c)
             if ((d.upperUsage.accWrite & laneForComponent(c)) != 0u)
                 o << "    A::accReadyRef(vu, " << c << ") = cyc + " << A::kAccForwardLatency << "u;\n";
         if (writtenVi != 0u && d.lowerUsage.delaysNextBranchRead)
@@ -904,6 +955,9 @@ int main(int argc, char **argv)
     }
     const std::filesystem::path dumpDir = argv[1];
     const std::filesystem::path outDir = argv[2];
+    for (int i = 3; i < argc; ++i)
+        if (std::string(argv[i]) == "--relaxed-timing")
+            g_exactTiming = false;
     std::filesystem::create_directories(outDir);
 
     VU1Interpreter vu(VU1Interpreter::Unit::VU1);
@@ -988,6 +1042,8 @@ int main(int argc, char **argv)
     for (size_t i = 0; i < images.size(); ++i)
         reg << "    registerVu1CompiledImage(0x" << images[i].substr(7) << "ull, &" << images[i] << ", 0x" << std::hex
             << statusMasks[i] << std::dec << "u);\n";
+    if (!g_exactTiming)
+        reg << "    setVu1CompiledVerifyIgnoresCycles(true); // relaxed timing\n";
     reg << "}\n";
     std::cout << images.size() << " images\n";
     return 0;

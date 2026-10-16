@@ -156,6 +156,16 @@ void setVu1CompiledVerify(bool enabled)
     g_vu1CompiledVerify = enabled;
 }
 
+namespace
+{
+    bool g_vu1VerifyIgnoresCycles = false;
+}
+
+void setVu1CompiledVerifyIgnoresCycles(bool ignore)
+{
+    g_vu1VerifyIgnoresCycles = ignore;
+}
+
 uint64_t hashVu1CodeImage(const uint8_t *code, uint32_t size)
 {
     // FNV-1a over 64-bit words (the image size is a multiple of 8).
@@ -2177,7 +2187,7 @@ void VU1Interpreter::run(uint8_t *vuCode, uint32_t codeSize,
             check(a.mac == b.mac && (a.status & statusMask) == (b.status & statusMask), "flags");
         }
         check(a.clip == b.clip, "clip");
-        check(a.cycles == b.cycles, "cycles");
+        check(g_vu1VerifyIgnoresCycles || a.cycles == b.cycles, "cycles");
         check(a.ebit == b.ebit && a.branchPending == b.branchPending, "control");
         check(std::memcmp(dataAfter.data(), vuData, dataSize) == 0, "data");
         std::memcpy(vuData, dataAfter.data(), dataSize);

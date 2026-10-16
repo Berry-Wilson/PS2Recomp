@@ -398,13 +398,17 @@ bool EeScheduler::checkpointDue(uint32_t cycles) noexcept
     return false;
 }
 
+bool ps2Vif1WorkerHasCompletions() noexcept; // ps2_memory.cpp
+
 void EeScheduler::accountCycles(uint32_t cycles) noexcept
 {
     const uint64_t elapsed = std::max<uint64_t>(1u, cycles);
     m_eeCycle += elapsed;
     m_pendingEeTimerInterrupts |= m_runtime.memory().advanceEeTimers(elapsed);
     m_runtime.advanceIopEeCycles(elapsed);
-    if (m_pendingEeTimerInterrupts != 0u)
+    // Finished transfers of the VIF1 worker thread are delivered like interrupts, at the next
+    // checkpoint (the guest may be spinning on a flag its DMAC handler clears).
+    if (m_pendingEeTimerInterrupts != 0u || ps2Vif1WorkerHasCompletions())
     {
         m_checkpointPending.store(true, std::memory_order_release);
     }
@@ -1859,6 +1863,8 @@ void EeScheduler::processPendingEvents()
 {
     assertExecutor();
     processDueDeadlines();
+    if (ps2Vif1WorkerHasCompletions())
+        m_runtime.drainCompletedDmacHandlers(m_rdram);
     const uint32_t timerInterrupts = m_pendingEeTimerInterrupts;
     m_pendingEeTimerInterrupts = 0u;
     for (uint32_t timer = 0u; timer < 4u; ++timer)

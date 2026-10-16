@@ -357,6 +357,11 @@ public:
     void processVIF1Data(uint32_t srcPhysAddr, uint32_t sizeBytes);
     void processVIF1Data(const uint8_t *data, uint32_t sizeBytes);
     void processPendingTransfers();
+    // VIF1 worker thread (opt-in, see ps2_memory.cpp): waits for queued VIF1 transfers and
+    // publishes their completion; the EE side calls it before touching the GS directly.
+    void drainVif1Worker();
+    void startVif1WorkerIfNeeded();
+    void applyVif1WorkerCompletions();
     std::vector<uint32_t> consumeCompletedDmacCauses();
 
     int pollDmaRegisters();

@@ -1,3 +1,6 @@
+#include <thread>
+#include <condition_variable>
+#include <deque>
 #include "runtime/ps2_memory.h"
 
 void resetVif1DirectContinuation(); // defined in ps2_vif1_interpreter.cpp
@@ -262,6 +265,101 @@ namespace
     }
 }
 
+namespace
+{
+    // ---------------------------------------------------------------------------------------
+    // VIF1 worker thread (opt-in: setVif1WorkerEnabled / PS2X_VU1_THREAD=1). A VIF1 DMA transfer
+    // is gathered on the EE thread when it is kicked (chain walk, registers), then handed to a
+    // worker that runs the VIF1 stream: unpacks, VU1 microprograms and their PATH1/PATH2 GS
+    // output. The EE thread keeps running; it sees the transfer complete (CHCR.STR clear, D_STAT,
+    // DMAC cause) when it next reads DMA/VIF registers or drains DMAC causes, and the register
+    // map is only ever written on the EE thread. Everything else that touches VIF1/VU1/GS from
+    // the EE thread (GIF and VIF0 transfers, direct GS packets, GS stubs, sync calls) first
+    // drains the worker, so GS commands keep their order.
+    struct Vif1Worker
+    {
+        PS2Memory *memory = nullptr;
+        std::thread thread;
+        std::mutex mutex;
+        std::condition_variable wake;
+        std::condition_variable idle;
+        std::deque<std::vector<uint8_t>> jobs;
+        bool busy = false;
+        bool stop = false;
+        std::atomic<uint32_t> completed{0};
+        std::atomic<uint32_t> outstanding{0};
+        std::mutex poolMutex;
+        std::vector<std::vector<uint8_t>> pool;
+    };
+    Vif1Worker g_vif1Worker;
+    // Set when a worker completion has queued a DMAC cause the EE has not consumed yet.
+    std::atomic<bool> g_vif1CausePending{false};
+    std::atomic<int> g_vif1WorkerEnabled{-1};
+    thread_local bool t_onVif1Worker = false;
+
+    bool vif1WorkerEnabled()
+    {
+        int enabled = g_vif1WorkerEnabled.load(std::memory_order_relaxed);
+        if (enabled < 0)
+        {
+            const char *env = std::getenv("PS2X_VU1_THREAD");
+            enabled = env && env[0] == '1' ? 1 : 0;
+            g_vif1WorkerEnabled.store(enabled, std::memory_order_relaxed);
+        }
+        return enabled != 0;
+    }
+}
+
+bool ps2Vif1WorkerHasCompletions() noexcept
+{
+    return g_vif1Worker.completed.load(std::memory_order_relaxed) != 0u ||
+           g_vif1CausePending.load(std::memory_order_relaxed);
+}
+
+void setVif1WorkerEnabled(bool enabled)
+{
+    g_vif1WorkerEnabled.store(enabled ? 1 : 0, std::memory_order_relaxed);
+}
+
+// Blocks until every queued VIF1 transfer has been processed (no-op on the worker itself).
+void ps2Vif1WorkerDrain()
+{
+    if (t_onVif1Worker || !g_vif1Worker.thread.joinable())
+        return;
+    std::unique_lock<std::mutex> lock(g_vif1Worker.mutex);
+    g_vif1Worker.idle.wait(lock, []() { return g_vif1Worker.jobs.empty() && !g_vif1Worker.busy; });
+}
+
+namespace
+{
+    void stopVif1Worker()
+    {
+        if (!g_vif1Worker.thread.joinable())
+            return;
+        {
+            std::lock_guard<std::mutex> lock(g_vif1Worker.mutex);
+            g_vif1Worker.stop = true;
+        }
+        g_vif1Worker.wake.notify_all();
+        g_vif1Worker.thread.join();
+        g_vif1Worker.thread = std::thread();
+        g_vif1Worker.stop = false;
+        g_vif1Worker.jobs.clear();
+        g_vif1Worker.memory = nullptr;
+    }
+
+    std::vector<uint8_t> takeVif1JobBuffer()
+    {
+        std::lock_guard<std::mutex> lock(g_vif1Worker.poolMutex);
+        if (g_vif1Worker.pool.empty())
+            return {};
+        std::vector<uint8_t> buffer = std::move(g_vif1Worker.pool.back());
+        g_vif1Worker.pool.pop_back();
+        buffer.clear();
+        return buffer;
+    }
+}
+
 static inline uint32_t gs_vram_offset(uint32_t basePage, uint32_t x, uint32_t y, uint32_t fbw)
 {
     // basePage is in 2048-byte units; fbw is in blocks of 64 pixels.
@@ -277,6 +375,8 @@ PS2Memory::PS2Memory()
 
 PS2Memory::~PS2Memory()
 {
+    if (g_vif1Worker.memory == this)
+        stopVif1Worker();
     if (m_rdram)
     {
         delete[] m_rdram;
@@ -1382,6 +1482,8 @@ bool PS2Memory::writeIORegister(uint32_t address, uint32_t value)
                     // leaves the channel without its END tag, so the game never sees the frame end.
                     const int kMaxChainTags = 1 << 20;
                     std::vector<uint8_t> chainBuf = takeChainBuffer();
+                    if (chainBuf.capacity() == 0u && channelBase == 0x10009000u && vif1WorkerEnabled())
+                        chainBuf = takeVif1JobBuffer();
 
                     auto appendData = [&](uint32_t srcAddr, uint32_t qwCount)
                     {
@@ -1705,8 +1807,140 @@ void PS2Memory::completeDmacChannel(uint32_t channelBase, uint32_t cause)
     queueCompletedDmacCause(cause);
 }
 
+void PS2Memory::startVif1WorkerIfNeeded()
+{
+    if (g_vif1Worker.thread.joinable() && g_vif1Worker.memory == this)
+        return;
+    stopVif1Worker();
+    g_vif1Worker.memory = this;
+    g_vif1Worker.thread = std::thread([this]()
+                                      {
+        t_onVif1Worker = true;
+        for (;;)
+        {
+            std::vector<uint8_t> job;
+            {
+                std::unique_lock<std::mutex> lock(g_vif1Worker.mutex);
+                g_vif1Worker.wake.wait(lock, []() { return g_vif1Worker.stop || !g_vif1Worker.jobs.empty(); });
+                if (g_vif1Worker.stop && g_vif1Worker.jobs.empty())
+                    return;
+                job = std::move(g_vif1Worker.jobs.front());
+                g_vif1Worker.jobs.pop_front();
+                g_vif1Worker.busy = true;
+            }
+            processVIF1Data(job.data(), static_cast<uint32_t>(job.size()));
+            if (m_gifArbiter)
+                m_gifArbiter->drain();
+            {
+                std::lock_guard<std::mutex> lock(g_vif1Worker.poolMutex);
+                if (g_vif1Worker.pool.size() < 8u)
+                    g_vif1Worker.pool.push_back(std::move(job));
+            }
+            g_vif1Worker.completed.fetch_add(1u, std::memory_order_release);
+            {
+                std::lock_guard<std::mutex> lock(g_vif1Worker.mutex);
+                g_vif1Worker.busy = false;
+                if (g_vif1Worker.jobs.empty())
+                    g_vif1Worker.idle.notify_all();
+            }
+        } });
+}
+
+// EE thread: publishes finished worker transfers as DMA completions (registers + DMAC cause).
+void PS2Memory::applyVif1WorkerCompletions()
+{
+    if (t_onVif1Worker)
+        return;
+    uint32_t done = g_vif1Worker.completed.exchange(0u, std::memory_order_acq_rel);
+    if (done == 0u)
+        return;
+    static constexpr uint32_t VIF1_CHANNEL = 0x10009000u;
+    static constexpr uint32_t D_STAT = 0x1000E010u;
+    for (; done != 0u; --done)
+    {
+        g_vif1Worker.outstanding.fetch_sub(1u, std::memory_order_acq_rel);
+        uint32_t dstat = m_ioRegisters.count(D_STAT) ? m_ioRegisters[D_STAT] : 0u;
+        dstat |= 1u << 1u;
+        const uint32_t status = dstat & 0x3FFu;
+        const uint32_t mask = (dstat >> 16) & 0x3FFu;
+        if ((status & mask) != 0u)
+            dstat |= 1u << 31;
+        else
+            dstat &= ~(1u << 31);
+        m_ioRegisters[D_STAT] = dstat;
+        queueCompletedDmacCause(1u);
+        g_vif1CausePending.store(true, std::memory_order_release);
+    }
+    // A later kick may still be queued: the channel only reads idle once all of them are done.
+    if (g_vif1Worker.outstanding.load(std::memory_order_acquire) == 0u)
+    {
+        m_ioRegisters[VIF1_CHANNEL + 0x00] &= ~0x100u;
+        m_ioRegisters[VIF1_CHANNEL + 0x20] = 0;
+    }
+}
+
+void PS2Memory::drainVif1Worker()
+{
+    ps2Vif1WorkerDrain();
+    applyVif1WorkerCompletions();
+}
+
 void PS2Memory::processPendingTransfers()
 {
+    if (vif1WorkerEnabled() && !t_onVif1Worker)
+    {
+        applyVif1WorkerCompletions();
+        if (!m_pendingVif1Transfers.empty() && m_pendingGifTransfers.empty() && m_pendingVif0Transfers.empty())
+        {
+            startVif1WorkerIfNeeded();
+            for (auto &p : m_pendingVif1Transfers)
+            {
+                std::vector<uint8_t> job;
+                if (!p.chainData.empty())
+                {
+                    job = std::move(p.chainData);
+                }
+                else if (p.qwc > 0)
+                {
+                    // Normal-mode source: copy now, the game may reuse the buffer before the
+                    // worker gets to it.
+                    job = takeVif1JobBuffer();
+                    uint32_t src = 0;
+                    try
+                    {
+                        src = translateAddress(p.srcAddr);
+                    }
+                    catch (const std::exception &)
+                    {
+                        continue;
+                    }
+                    const uint8_t *base = p.fromScratchpad ? m_scratchpad : m_rdram;
+                    const uint32_t limit = p.fromScratchpad ? PS2_SCRATCHPAD_SIZE : PS2_RAM_SIZE;
+                    for (uint32_t left = p.qwc * 16u; left != 0u;)
+                    {
+                        if (src >= limit)
+                            src = 0;
+                        const uint32_t chunk = std::min(left, limit - src);
+                        job.insert(job.end(), base + src, base + src + chunk);
+                        left -= chunk;
+                        src += chunk;
+                    }
+                }
+                if (job.empty())
+                    continue;
+                g_vif1Worker.outstanding.fetch_add(1u, std::memory_order_acq_rel);
+                {
+                    std::lock_guard<std::mutex> lock(g_vif1Worker.mutex);
+                    g_vif1Worker.jobs.push_back(std::move(job));
+                }
+                g_vif1Worker.wake.notify_one();
+            }
+            m_pendingVif1Transfers.clear();
+            return;
+        }
+        drainVif1Worker();
+    }
+
     const bool hadGif = !m_pendingGifTransfers.empty();
     uint32_t observedGifQwc = 0u;
     for (const auto &transfer : m_pendingGifTransfers)
@@ -1958,6 +2192,8 @@ void PS2Memory::queueCompletedDmacCause(uint32_t cause)
 
 std::vector<uint32_t> PS2Memory::consumeCompletedDmacCauses()
 {
+    applyVif1WorkerCompletions();
+    g_vif1CausePending.store(false, std::memory_order_release);
     std::lock_guard<std::mutex> lock(m_completedDmacMutex);
     std::vector<uint32_t> causes;
     causes.swap(m_completedDmacCauses);
@@ -1992,6 +2228,8 @@ void PS2Memory::submitGifPacket(GifPathId pathId, const uint8_t *data, uint32_t 
 {
     if (!data || sizeBytes < 16)
         return;
+    if (!t_onVif1Worker && g_vif1Worker.thread.joinable())
+        drainVif1Worker();
 
     if (pathId == GifPathId::Path3)
     {
@@ -2048,6 +2286,7 @@ void PS2Memory::processGIFPacket(const uint8_t *data, uint32_t sizeBytes)
 
 bool PS2Memory::tryProcessNativeGifImageUploadChain(GS &gs, uint32_t tadr, uint32_t chcr)
 {
+    drainVif1Worker(); // the native GIF path must not overtake queued VIF1 work
     static constexpr uint32_t GIF_CHANNEL = 0x1000A000u;
     static constexpr uint32_t D_STAT = 0x1000E010u;
     static constexpr uint32_t D_CTRL = 0x1000E000u;
@@ -2240,6 +2479,7 @@ bool PS2Memory::tryProcessNativeGifImageUploadChain(GS &gs, uint32_t tadr, uint3
 
 bool PS2Memory::tryProcessNativeGifPackedChain(GS &gs, uint32_t tadr, uint32_t chcr)
 {
+    drainVif1Worker(); // the native GIF path must not overtake queued VIF1 work
     static constexpr uint32_t GIF_CHANNEL = 0x1000A000u;
     static constexpr uint32_t D_STAT = 0x1000E010u;
     static constexpr uint32_t D_CTRL = 0x1000E000u;
@@ -2325,6 +2565,8 @@ int PS2Memory::pollDmaRegisters()
 
 uint32_t PS2Memory::readIORegister(uint32_t address)
 {
+    if (g_vif1Worker.completed.load(std::memory_order_relaxed) != 0u)
+        applyVif1WorkerCompletions();
     size_t timerIndex = 0u;
     uint32_t timerOffset = 0u;
     if (decodeEeTimerRegister(address, timerIndex, timerOffset))

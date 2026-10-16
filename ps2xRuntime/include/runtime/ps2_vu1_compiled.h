@@ -42,6 +42,9 @@ void setVu1CompiledImagesEnabled(bool enabled);
 // the same starting state (XGKICK output suppressed) and report register/memory/cycle
 // mismatches on stderr.
 void setVu1CompiledVerify(bool enabled);
+// Relaxed-timing images (ps2x_vu1recomp default) do not model VF/VI/ACC stall cycles, so their
+// cycle counts legitimately differ from the interpreter's; verify then skips the cycle check.
+void setVu1CompiledVerifyIgnoresCycles(bool ignore);
 uint64_t hashVu1CodeImage(const uint8_t *code, uint32_t size);
 
 // Generated code calls these per lane; MSVC otherwise leaves some of them out of line.
@@ -126,7 +129,7 @@ class Vu1CompiledAccess
 public:
     // Value normalization of an FMAC result vector exactly as the interpreter does it (flags
     // are computed and discarded); used when a fast range check fails.
-    static void normalizeFmacValues(VU1Interpreter &vu, uint32_t upper, float *result, uint8_t dest)
+    PS2X_VU1_FORCEINLINE static void normalizeFmacValues(VU1Interpreter &vu, uint32_t upper, float *result, uint8_t dest)
     {
         vu.m_currentUpperInstruction = upper;
         uint8_t laneFlags[4];
@@ -135,18 +138,18 @@ public:
     using Decoded = VU1Interpreter::DecodedInstructionPair;
     using Usage = VU1Interpreter::InstructionUsage;
 
-    static VU1State &state(VU1Interpreter &vu) { return vu.m_state; }
-    static uint64_t &cycle(VU1Interpreter &vu) { return vu.m_cycle; }
-    static bool stopRequested(const VU1Interpreter &vu) { return vu.m_stopRequested; }
+    PS2X_VU1_FORCEINLINE static VU1State &state(VU1Interpreter &vu) { return vu.m_state; }
+    PS2X_VU1_FORCEINLINE static uint64_t &cycle(VU1Interpreter &vu) { return vu.m_cycle; }
+    PS2X_VU1_FORCEINLINE static bool stopRequested(const VU1Interpreter &vu) { return vu.m_stopRequested; }
 
-    static void commitReadyPipelines(VU1Interpreter &vu)
+    PS2X_VU1_FORCEINLINE static void commitReadyPipelines(VU1Interpreter &vu)
     {
         if (vu.m_cycle >= vu.m_nextCommitCycle)
             vu.commitReadyPipelinesNow();
     }
-    static void advanceTo(VU1Interpreter &vu, uint64_t target) { vu.advanceTo(target); }
+    PS2X_VU1_FORCEINLINE static void advanceTo(VU1Interpreter &vu, uint64_t target) { vu.advanceTo(target); }
     // Same steps as VU1Interpreter::advanceOneCycle, inlined.
-    static void advanceOneCycle(VU1Interpreter &vu)
+    PS2X_VU1_FORCEINLINE static void advanceOneCycle(VU1Interpreter &vu)
     {
         ++vu.m_cycle;
         vu.m_state.cycles = vu.m_cycle;
@@ -154,22 +157,22 @@ public:
         if (vu.m_xgkick.active)
             vu.progressXgkick();
     }
-    static uint64_t pairReadyCycle(const VU1Interpreter &vu, const Decoded &decoded) { return vu.calculatePairReadyCycle(decoded); }
-    static void markPairWrites(VU1Interpreter &vu, const Decoded &decoded) { vu.markPairWrites(decoded); }
-    static void recordViWriteForBranch(VU1Interpreter &vu, uint8_t reg, int32_t oldValue) { vu.recordViWriteForBranch(reg, oldValue); }
-    static void clearViBranchBackup(VU1Interpreter &vu) { vu.m_viBranchBackupValid = false; }
-    static uint32_t microAddressMask(const VU1Interpreter &vu) { return vu.microAddressMask(); }
-    static float normalizeOperand(const VU1Interpreter &vu, float value) { return vu.normalizeOperand(value); }
+    PS2X_VU1_FORCEINLINE static uint64_t pairReadyCycle(const VU1Interpreter &vu, const Decoded &decoded) { return vu.calculatePairReadyCycle(decoded); }
+    PS2X_VU1_FORCEINLINE static void markPairWrites(VU1Interpreter &vu, const Decoded &decoded) { vu.markPairWrites(decoded); }
+    PS2X_VU1_FORCEINLINE static void recordViWriteForBranch(VU1Interpreter &vu, uint8_t reg, int32_t oldValue) { vu.recordViWriteForBranch(reg, oldValue); }
+    PS2X_VU1_FORCEINLINE static void clearViBranchBackup(VU1Interpreter &vu) { vu.m_viBranchBackupValid = false; }
+    PS2X_VU1_FORCEINLINE static uint32_t microAddressMask(const VU1Interpreter &vu) { return vu.microAddressMask(); }
+    PS2X_VU1_FORCEINLINE static float normalizeOperand(const VU1Interpreter &vu, float value) { return vu.normalizeOperand(value); }
 
-    static void execUpper(VU1Interpreter &vu, uint32_t instr) { vu.execUpper(instr); }
-    static void execLower(VU1Interpreter &vu, uint32_t instr, uint32_t upper)
+    PS2X_VU1_FORCEINLINE static void execUpper(VU1Interpreter &vu, uint32_t instr) { vu.execUpper(instr); }
+    PS2X_VU1_FORCEINLINE static void execLower(VU1Interpreter &vu, uint32_t instr, uint32_t upper)
     {
         vu.execLower(instr, vu.m_activeVuData, vu.m_activeVuDataSize, *vu.m_activeGs, vu.m_activeMemory, upper);
     }
 
     // Flag-observing FMAC ops inlined by the translator. Fast path: every lane is a normal
     // in-range value, so the MAC flags are the lane sign bits (same as updateFmacFlags).
-    static void queueFmacFlags(VU1Interpreter &vu, uint32_t mac, uint32_t status, uint32_t extraSticky)
+    PS2X_VU1_FORCEINLINE static void queueFmacFlags(VU1Interpreter &vu, uint32_t mac, uint32_t status, uint32_t extraSticky)
     {
         const uint32_t freeMask = ~vu.m_flagValidMask & ((1u << VU1Interpreter::kMaxFlagEntries) - 1u);
         if (freeMask == 0u)
@@ -197,7 +200,7 @@ public:
     }
     // Slow path: the interpreter's exact normalization and flags for `upper` (operands must
     // still hold their pre-instruction values); `result` is updated in place.
-    static void fmacExact(VU1Interpreter &vu, uint32_t upper, float *result, uint8_t dest)
+    PS2X_VU1_FORCEINLINE static void fmacExact(VU1Interpreter &vu, uint32_t upper, float *result, uint8_t dest)
     {
         vu.m_currentUpperInstruction = upper;
         uint8_t laneFlags[4]{};
@@ -206,24 +209,24 @@ public:
     }
 
     // Inline lower instructions (LQ/SQ/ILW/ISW, branches) use these.
-    static uint8_t *vuData(VU1Interpreter &vu) { return vu.m_activeVuData; }
-    static uint32_t vuDataSize(const VU1Interpreter &vu) { return vu.m_activeVuDataSize; }
-    static void queueStore(VU1Interpreter &vu, uint32_t address, const uint32_t words[4], uint8_t laneMask)
+    PS2X_VU1_FORCEINLINE static uint8_t *vuData(VU1Interpreter &vu) { return vu.m_activeVuData; }
+    PS2X_VU1_FORCEINLINE static uint32_t vuDataSize(const VU1Interpreter &vu) { return vu.m_activeVuDataSize; }
+    PS2X_VU1_FORCEINLINE static void queueStore(VU1Interpreter &vu, uint32_t address, const uint32_t words[4], uint8_t laneMask)
     {
         vu.queueStore(address, words, laneMask);
     }
-    static int32_t readBranchVi(const VU1Interpreter &vu, uint8_t reg) { return vu.readBranchVi(reg); }
+    PS2X_VU1_FORCEINLINE static int32_t readBranchVi(const VU1Interpreter &vu, uint8_t reg) { return vu.readBranchVi(reg); }
 
-    static uint64_t vfReady(const VU1Interpreter &vu, uint32_t reg, uint32_t component) { return vu.m_vfReady[reg][component]; }
-    static uint64_t &vfReadyRef(VU1Interpreter &vu, uint32_t reg, uint32_t component) { return vu.m_vfReady[reg][component]; }
-    static uint64_t viReady(const VU1Interpreter &vu, uint32_t reg) { return vu.m_viReady[reg]; }
-    static uint64_t &viReadyRef(VU1Interpreter &vu, uint32_t reg) { return vu.m_viReady[reg]; }
-    static uint64_t accReady(const VU1Interpreter &vu, uint32_t component) { return vu.m_accReady[component]; }
-    static uint64_t &accReadyRef(VU1Interpreter &vu, uint32_t component) { return vu.m_accReady[component]; }
-    static bool fdivValid(const VU1Interpreter &vu) { return vu.m_fdiv.valid; }
-    static uint64_t fdivReady(const VU1Interpreter &vu) { return vu.m_fdiv.readyCycle; }
-    static uint64_t efuResourceReady(const VU1Interpreter &vu) { return vu.m_efuResourceReady; }
-    static uint64_t efuMaxPendingReady(const VU1Interpreter &vu)
+    PS2X_VU1_FORCEINLINE static uint64_t vfReady(const VU1Interpreter &vu, uint32_t reg, uint32_t component) { return vu.m_vfReady[reg][component]; }
+    PS2X_VU1_FORCEINLINE static uint64_t &vfReadyRef(VU1Interpreter &vu, uint32_t reg, uint32_t component) { return vu.m_vfReady[reg][component]; }
+    PS2X_VU1_FORCEINLINE static uint64_t viReady(const VU1Interpreter &vu, uint32_t reg) { return vu.m_viReady[reg]; }
+    PS2X_VU1_FORCEINLINE static uint64_t &viReadyRef(VU1Interpreter &vu, uint32_t reg) { return vu.m_viReady[reg]; }
+    PS2X_VU1_FORCEINLINE static uint64_t accReady(const VU1Interpreter &vu, uint32_t component) { return vu.m_accReady[component]; }
+    PS2X_VU1_FORCEINLINE static uint64_t &accReadyRef(VU1Interpreter &vu, uint32_t component) { return vu.m_accReady[component]; }
+    PS2X_VU1_FORCEINLINE static bool fdivValid(const VU1Interpreter &vu) { return vu.m_fdiv.valid; }
+    PS2X_VU1_FORCEINLINE static uint64_t fdivReady(const VU1Interpreter &vu) { return vu.m_fdiv.readyCycle; }
+    PS2X_VU1_FORCEINLINE static uint64_t efuResourceReady(const VU1Interpreter &vu) { return vu.m_efuResourceReady; }
+    PS2X_VU1_FORCEINLINE static uint64_t efuMaxPendingReady(const VU1Interpreter &vu)
     {
         uint64_t ready = 0u;
         for (const auto &entry : vu.m_efu)
@@ -231,12 +234,26 @@ public:
                 ready = entry.readyCycle;
         return ready;
     }
-    static bool xgkickActive(const VU1Interpreter &vu) { return vu.m_xgkick.active; }
-    static bool &pendingHaltD(VU1Interpreter &vu) { return vu.m_pendingHaltD; }
-    static bool &pendingHaltT(VU1Interpreter &vu) { return vu.m_pendingHaltT; }
+    // Cycle at which every pending flag (MAC/status/clip) write has landed (relaxed timing).
+    PS2X_VU1_FORCEINLINE static uint64_t flagPipelineReady(const VU1Interpreter &vu)
+    {
+        uint64_t ready = 0u;
+        for (uint32_t mask = vu.m_flagValidMask; mask != 0u; mask &= mask - 1u)
+        {
+            uint32_t slot = 0u;
+            while (((mask >> slot) & 1u) == 0u)
+                ++slot;
+            if (vu.m_flagPipeline[slot].readyCycle > ready)
+                ready = vu.m_flagPipeline[slot].readyCycle;
+        }
+        return ready;
+    }
+    PS2X_VU1_FORCEINLINE static bool xgkickActive(const VU1Interpreter &vu) { return vu.m_xgkick.active; }
+    PS2X_VU1_FORCEINLINE static bool &pendingHaltD(VU1Interpreter &vu) { return vu.m_pendingHaltD; }
+    PS2X_VU1_FORCEINLINE static bool &pendingHaltT(VU1Interpreter &vu) { return vu.m_pendingHaltT; }
 
     // Translator side: decode a pair exactly as the interpreter does.
-    static Decoded decode(const VU1Interpreter &vu, const uint8_t *code, uint32_t pc) { return vu.decodeInstructionPair(code, pc); }
+    PS2X_VU1_FORCEINLINE static Decoded decode(const VU1Interpreter &vu, const uint8_t *code, uint32_t pc) { return vu.decodeInstructionPair(code, pc); }
     static constexpr uint8_t kPipelineFdiv = VU1Interpreter::PipelineFdiv;
     static constexpr uint8_t kPipelineEfu = VU1Interpreter::PipelineEfu;
     static constexpr uint8_t kPipelineBranch = VU1Interpreter::PipelineBranch;
