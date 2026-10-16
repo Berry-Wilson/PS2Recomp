@@ -28,6 +28,9 @@
 #include <chrono>
 #include <atomic>
 #include <thread>
+#include <vector>
+#include <condition_variable>
+#include <mutex>
 #include <unordered_map>
 #include <sstream>
 
@@ -558,6 +561,11 @@ static void UploadFrame(Texture2D &tex, PS2Runtime *rt, uint32_t &outWidth, uint
     s_hasUploadedFrame = true;
 }
 
+namespace
+{
+    void stopIopWorker(ps2x::iop::IopSubsystem *iop); // IOP worker thread, defined below
+}
+
 PS2Runtime::PS2Runtime()
 {
     m_iopHost = std::make_unique<PS2IopHostAdapter>(*this);
@@ -610,6 +618,7 @@ PS2Runtime::~PS2Runtime()
     try
     {
         requestStop();
+        stopIopWorker(m_iopSubsystem.get());
         m_iopSubsystem.reset();
         m_iopHost.reset();
 #if defined(PLATFORM_VITA)
@@ -646,36 +655,177 @@ PS2Runtime::~PS2Runtime()
     }
 }
 
+// ---------------------------------------------------------------------------------------------
+// IOP worker thread. The EE thread hands the IOP its elapsed EE cycles as credit instead of
+// running it inline; a worker runs the credit in small chunks in parallel with the EE. Every
+// other entry into the IOP subsystem takes the same mutex. IOP -> EE SIF commands raised on the
+// worker (they run EE handlers) are queued and delivered on the EE thread at its next cycle
+// accounting, where the synchronous path delivered them. PS2X_IOP_THREAD=0 keeps it inline.
+namespace
+{
+    struct IopWorkerState
+    {
+        std::recursive_mutex iopMutex;
+        std::mutex wakeMutex;
+        std::condition_variable wake;
+        std::atomic<uint64_t> credit{0};
+        std::atomic<bool> sleeping{false};
+        std::atomic<bool> stop{false};
+        std::atomic<bool> hasSifCommands{false};
+        std::thread thread;
+        std::mutex sifMutex;
+        std::vector<std::pair<uint32_t, std::vector<uint8_t>>> sifCommands;
+    };
+    IopWorkerState g_iopWorker;
+    thread_local bool t_onIopWorker = false;
+    // EE cycles accounted on this (EE) thread but not yet handed to the worker.
+    thread_local uint64_t t_unpublishedIopCycles = 0u;
+    // Chunk size bounds how long EE-side IOP calls wait for the mutex; the lag bound keeps the
+    // IOP (and its audio) from drifting behind the EE when it is the slower side.
+    constexpr uint64_t kIopWorkerChunkCycles = 32768u;
+    constexpr uint64_t kIopWorkerMaxLagCycles = 1u << 23;
+    constexpr uint64_t kIopWorkerPublishCycles = 4096u;
+
+    bool iopThreadEnabled()
+    {
+        static const bool enabled = []
+        {
+            const char *env = std::getenv("PS2X_IOP_THREAD");
+            return !(env && env[0] == '0');
+        }();
+        return enabled;
+    }
+}
+
+bool ps2IopWorkerQueueSifCommand(uint32_t commandId, const void *packet, size_t packetSize)
+{
+    if (!t_onIopWorker)
+        return false;
+    const auto *bytes = static_cast<const uint8_t *>(packet);
+    std::lock_guard<std::mutex> lock(g_iopWorker.sifMutex);
+    g_iopWorker.sifCommands.emplace_back(commandId, std::vector<uint8_t>(bytes, bytes + packetSize));
+    g_iopWorker.hasSifCommands.store(true, std::memory_order_release);
+    return true;
+}
+
+namespace
+{
+    void runIopCreditLocked(ps2x::iop::IopSubsystem &iop) noexcept
+    {
+        const uint64_t pending = g_iopWorker.credit.exchange(0u, std::memory_order_acq_rel);
+        if (pending != 0u)
+            iop.runEeCycles(pending);
+    }
+
+    // Brings the IOP up to the EE's accounted time on the calling thread (caller holds
+    // iopMutex). Used before operations that inspect or replace IOP state.
+    void catchUpIopLocked(ps2x::iop::IopSubsystem &iop) noexcept
+    {
+        if (t_unpublishedIopCycles != 0u)
+        {
+            g_iopWorker.credit.fetch_add(t_unpublishedIopCycles, std::memory_order_acq_rel);
+            t_unpublishedIopCycles = 0u;
+        }
+        runIopCreditLocked(iop);
+    }
+
+    void startIopWorker(ps2x::iop::IopSubsystem *iop)
+{
+    if (g_iopWorker.thread.joinable() || !iopThreadEnabled())
+        return;
+    g_iopWorker.stop.store(false);
+    g_iopWorker.thread = std::thread([iop]()
+                                     {
+        t_onIopWorker = true;
+        while (!g_iopWorker.stop.load(std::memory_order_acquire))
+        {
+            uint64_t pending = g_iopWorker.credit.load(std::memory_order_acquire);
+            if (pending == 0u)
+            {
+                std::unique_lock<std::mutex> lock(g_iopWorker.wakeMutex);
+                g_iopWorker.sleeping.store(true, std::memory_order_release);
+                g_iopWorker.wake.wait_for(lock, std::chrono::milliseconds(2), []()
+                                          { return g_iopWorker.credit.load(std::memory_order_acquire) != 0u ||
+                                                   g_iopWorker.stop.load(std::memory_order_acquire); });
+                g_iopWorker.sleeping.store(false, std::memory_order_release);
+                continue;
+            }
+            const uint64_t chunk = std::min(pending, kIopWorkerChunkCycles);
+            g_iopWorker.credit.fetch_sub(chunk, std::memory_order_acq_rel);
+            std::lock_guard<std::recursive_mutex> iopLock(g_iopWorker.iopMutex);
+            iop->runEeCycles(chunk);
+        } });
+}
+
+    void stopIopWorker(ps2x::iop::IopSubsystem *iop)
+{
+    if (!g_iopWorker.thread.joinable())
+        return;
+    g_iopWorker.stop.store(true, std::memory_order_release);
+    {
+        std::lock_guard<std::mutex> lock(g_iopWorker.wakeMutex);
+        g_iopWorker.wake.notify_all();
+    }
+    g_iopWorker.thread.join();
+    std::lock_guard<std::recursive_mutex> iopLock(g_iopWorker.iopMutex);
+    if (iop)
+        runIopCreditLocked(*iop);
+}
+
+    void deliverQueuedIopSifCommands(PS2IopHostAdapter &host)
+{
+    if (!g_iopWorker.hasSifCommands.load(std::memory_order_acquire))
+        return;
+    std::vector<std::pair<uint32_t, std::vector<uint8_t>>> commands;
+    {
+        std::lock_guard<std::mutex> lock(g_iopWorker.sifMutex);
+        commands.swap(g_iopWorker.sifCommands);
+        g_iopWorker.hasSifCommands.store(false, std::memory_order_release);
+    }
+    for (const auto &[commandId, packet] : commands)
+        host.sendSifCommand(commandId, packet.data(), packet.size());
+}
+}
+
 ps2x::iop::ModuleLoadResult PS2Runtime::loadIopModule(std::string_view path, const void *arguments, uint32_t argumentSize)
 {
+    std::lock_guard<std::recursive_mutex> iopLock(g_iopWorker.iopMutex);
+    catchUpIopLocked(*m_iopSubsystem);
     auto scope = m_iopHost->enterCall(nullptr, m_memory.getRDRAM());
     return m_iopSubsystem->loadModule(path, arguments, argumentSize);
 }
 
 ps2x::iop::ModuleLoadResult PS2Runtime::loadIopModuleBuffer(uint32_t guestAddress, const void *arguments, uint32_t argumentSize)
 {
+    std::lock_guard<std::recursive_mutex> iopLock(g_iopWorker.iopMutex);
+    catchUpIopLocked(*m_iopSubsystem);
     auto scope = m_iopHost->enterCall(nullptr, m_memory.getRDRAM());
     return m_iopSubsystem->loadModuleBuffer(guestAddress, arguments, argumentSize);
 }
 
 bool PS2Runtime::stopIopModule(int32_t moduleId, int32_t *result)
 {
+    std::lock_guard<std::recursive_mutex> iopLock(g_iopWorker.iopMutex);
+    catchUpIopLocked(*m_iopSubsystem);
     auto scope = m_iopHost->enterCall(nullptr, m_memory.getRDRAM());
     return m_iopSubsystem->stopModule(moduleId, result);
 }
 
 ps2x::iop::RpcAbi PS2Runtime::selectIopRpcAbi(const ps2x::iop::RpcAbiRequest &request) const
 {
+    std::lock_guard<std::recursive_mutex> iopLock(g_iopWorker.iopMutex);
     return m_iopSubsystem->selectRpcAbi(request);
 }
 
 bool PS2Runtime::canBindIopRpc(uint32_t sid) const noexcept
 {
+    std::lock_guard<std::recursive_mutex> iopLock(g_iopWorker.iopMutex);
     return m_iopSubsystem->canBindRpc(sid);
 }
 
 ps2x::iop::RpcResult PS2Runtime::handleIopRpc(uint8_t *rdram, R5900Context *ctx, ps2x::iop::RpcRequest request)
 {
+    std::lock_guard<std::recursive_mutex> iopLock(g_iopWorker.iopMutex);
     auto scope = m_iopHost->enterCall(ctx, rdram);
     request.callToken = scope.token();
     return m_iopSubsystem->handleRpc(request);
@@ -683,52 +833,90 @@ ps2x::iop::RpcResult PS2Runtime::handleIopRpc(uint8_t *rdram, R5900Context *ctx,
 
 void PS2Runtime::notifyIopSifTransfer(uint8_t *rdram, const ps2x::iop::SifTransfer &transfer)
 {
+    std::lock_guard<std::recursive_mutex> iopLock(g_iopWorker.iopMutex);
     auto scope = m_iopHost->enterCall(nullptr, rdram);
     m_iopSubsystem->onSifTransfer(transfer);
 }
 
 void PS2Runtime::advanceIopEeCycles(uint64_t eeCycles) noexcept
 {
-    m_iopSubsystem->runEeCycles(eeCycles);
+    if (!iopThreadEnabled())
+    {
+        m_iopSubsystem->runEeCycles(eeCycles);
+        return;
+    }
+    // Publish credit in batches: this runs for every accounted EE instruction block.
+    t_unpublishedIopCycles += eeCycles;
+    if (t_unpublishedIopCycles < kIopWorkerPublishCycles)
+        return;
+    eeCycles = t_unpublishedIopCycles;
+    t_unpublishedIopCycles = 0u;
+    if (!g_iopWorker.thread.joinable())
+        startIopWorker(m_iopSubsystem.get());
+    deliverQueuedIopSifCommands(*m_iopHost);
+    const uint64_t pending = g_iopWorker.credit.fetch_add(eeCycles, std::memory_order_acq_rel) + eeCycles;
+    if (g_iopWorker.sleeping.load(std::memory_order_acquire))
+    {
+        std::lock_guard<std::mutex> lock(g_iopWorker.wakeMutex);
+        g_iopWorker.wake.notify_one();
+    }
+    if (pending > kIopWorkerMaxLagCycles)
+    {
+        // The IOP is the slower side: wait for it rather than letting it fall further behind.
+        while (g_iopWorker.credit.load(std::memory_order_acquire) > kIopWorkerMaxLagCycles / 2u &&
+               !g_iopWorker.stop.load(std::memory_order_acquire))
+            std::this_thread::yield();
+        deliverQueuedIopSifCommands(*m_iopHost);
+    }
 }
 
 void PS2Runtime::resetIop()
 {
+    std::lock_guard<std::recursive_mutex> iopLock(g_iopWorker.iopMutex);
+    g_iopWorker.credit.store(0u);
     m_iopSubsystem->reset();
 }
 
 ps2x::iop::DebugSnapshot PS2Runtime::iopDebugSnapshot() const
 {
+    std::lock_guard<std::recursive_mutex> iopLock(g_iopWorker.iopMutex);
+    catchUpIopLocked(*m_iopSubsystem);
     return m_iopSubsystem->debugSnapshot();
 }
 
 uint32_t PS2Runtime::allocateIopMemory(uint32_t size, uint32_t alignment)
 {
+    std::lock_guard<std::recursive_mutex> iopLock(g_iopWorker.iopMutex);
     return m_iopSubsystem ? m_iopSubsystem->allocateMemory(size, alignment) : 0u;
 }
 
 bool PS2Runtime::freeIopMemory(uint32_t address)
 {
+    std::lock_guard<std::recursive_mutex> iopLock(g_iopWorker.iopMutex);
     return m_iopSubsystem && m_iopSubsystem->freeMemory(address);
 }
 
 bool PS2Runtime::readIopMemory(uint32_t address, void *destination, size_t size) const
 {
+    std::lock_guard<std::recursive_mutex> iopLock(g_iopWorker.iopMutex);
     return m_iopSubsystem && m_iopSubsystem->readMemory(address, destination, size);
 }
 
 bool PS2Runtime::writeIopMemory(uint32_t address, const void *source, size_t size)
 {
+    std::lock_guard<std::recursive_mutex> iopLock(g_iopWorker.iopMutex);
     return m_iopSubsystem && m_iopSubsystem->writeMemory(address, source, size);
 }
 
 bool PS2Runtime::zeroIopMemory(uint32_t address, size_t size)
 {
+    std::lock_guard<std::recursive_mutex> iopLock(g_iopWorker.iopMutex);
     return m_iopSubsystem && m_iopSubsystem->zeroMemory(address, size);
 }
 
 bool PS2Runtime::isIopMemoryRange(uint32_t address, size_t size) const
 {
+    std::lock_guard<std::recursive_mutex> iopLock(g_iopWorker.iopMutex);
     return m_iopSubsystem && m_iopSubsystem->isMemoryRange(address, size);
 }
 
@@ -1085,7 +1273,11 @@ bool PS2Runtime::loadELF(const std::string &elfPath)
         return false;
     }
 
-    m_iopSubsystem->reset();
+    {
+        std::lock_guard<std::recursive_mutex> iopLock(g_iopWorker.iopMutex);
+        g_iopWorker.credit.store(0u);
+        m_iopSubsystem->reset();
+    }
 
     ps2_game_overrides::applyMatching(*this,
                                       elfPath,

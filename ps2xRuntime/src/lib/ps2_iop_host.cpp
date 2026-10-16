@@ -503,10 +503,15 @@ bool PS2IopHostAdapter::invokeGuestFunction(uint64_t callToken,
     return false;
 }
 
+bool ps2IopWorkerQueueSifCommand(uint32_t commandId, const void *packet, size_t packetSize);
+
 bool PS2IopHostAdapter::sendSifCommand(uint32_t commandId,
                                        const void *packet,
                                        size_t packetSize)
 {
+    // On the IOP worker thread the packet is queued for the EE thread (its handler is EE code).
+    if (ps2IopWorkerQueueSifCommand(commandId, packet, packetSize))
+        return true;
     uint8_t *const rdram = m_activeRdram
                                ? m_activeRdram
                                : m_runtime.memory().getRDRAM();
