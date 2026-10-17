@@ -174,17 +174,16 @@ namespace ps2recomp
 
     std::string CodeGenerator::translateVU_VCALLMSR(const Instruction &inst)
     {
-        // VCALLMSR calls a VU0 microprogram at address stored in integer register
-        uint8_t vis_reg_idx = inst.rd; // Source integer register (vis)
-
-        return fmt::format(
-            "{{ "
-            "    uint16_t instr_index = ctx->vi[{}] & 0x1FF; "             // Get instruction index from VI[IS], mask to 9 bits
-            "    uint32_t target_byte_addr = (uint32_t)instr_index << 3; " // Convert to byte address
-            "    ctx->vu0_pc = target_byte_addr; "
-            "    runtime->vu0StartMicroProgram(rdram, ctx, target_byte_addr); "
-            "}}",
-            vis_reg_idx);
+        // VCALLMSR starts the VU0 microprogram at CMSAR0 (control register 27, written by CTC2). The
+        // encoded register field is always 27; CMSAR0 is not one of the 16 VI registers, so it must not
+        // be read through ctx->vi. Like VCALLMS's immediate, CMSAR0 is an instruction (8-byte) index.
+        (void)inst;
+        return "{ "
+               "    uint16_t instr_index = static_cast<uint16_t>(ctx->vu0_cmsar0 & 0x1FFu); "
+               "    uint32_t target_byte_addr = (uint32_t)instr_index << 3; "
+               "    ctx->vu0_pc = target_byte_addr; "
+               "    runtime->vu0StartMicroProgram(rdram, ctx, target_byte_addr); "
+               "}";
     }
 
     std::string CodeGenerator::translateVU_VRNEXT(const Instruction &inst)

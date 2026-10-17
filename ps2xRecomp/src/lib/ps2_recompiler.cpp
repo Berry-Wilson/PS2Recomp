@@ -846,6 +846,20 @@ namespace ps2recomp
             m_config = m_configManager.loadConfig();
             m_skipFunctions.clear();
             m_skipFunctionStarts.clear();
+            m_recompileFunctions.clear();
+            m_recompileFunctionStarts.clear();
+            for (const auto &name : m_config.recompileFunctions)
+            {
+                const FunctionSelector selector = parseFunctionSelector(name);
+                if (!selector.name.empty())
+                {
+                    m_recompileFunctions.insert(selector.name);
+                }
+                if (selector.start.has_value())
+                {
+                    m_recompileFunctionStarts.insert(*selector.start);
+                }
+            }
             m_stubFunctions.clear();
             m_stubFunctionStarts.clear();
             m_stubHandlerBindingsByStart.clear();
@@ -2221,6 +2235,11 @@ namespace ps2recomp
 
     bool PS2Recompiler::isStubFunction(const Function &function) const
     {
+        if (m_recompileFunctionStarts.contains(function.start) || m_recompileFunctions.contains(function.name))
+        {
+            return false;
+        }
+
         if (m_stubFunctionStarts.contains(function.start))
         {
             return true;

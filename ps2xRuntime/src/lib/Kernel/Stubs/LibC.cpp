@@ -916,16 +916,31 @@ namespace ps2_stubs
         setReturnS32(ctx, ret);
     }
 
+    // The EE has no double-precision FPU: the libm double functions (sin, atan2, fabs, ...) take
+    // their arguments as 64-bit IEEE doubles in $a0/$a1 and return the result in $v0.
+    static double doubleArg(R5900Context *ctx, int reg)
+    {
+        const uint64_t bits = GPR_U64(ctx, reg);
+        double value;
+        std::memcpy(&value, &bits, sizeof(value));
+        return value;
+    }
+
+    static void setDoubleReturn(R5900Context *ctx, double value)
+    {
+        uint64_t bits;
+        std::memcpy(&bits, &value, sizeof(bits));
+        setReturnU64(ctx, bits);
+    }
+
     void sqrt(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
     {
-        float arg = ctx->f[12];
-        ctx->f[0] = ::sqrtf(arg);
+        setDoubleReturn(ctx, std::sqrt(doubleArg(ctx, 4)));
     }
 
     void sin(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
     {
-        float arg = ctx->f[12];
-        ctx->f[0] = ::sinf(arg);
+        setDoubleReturn(ctx, std::sin(doubleArg(ctx, 4)));
     }
 
     void __kernel_sinf(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
@@ -938,8 +953,7 @@ namespace ps2_stubs
 
     void cos(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
     {
-        float arg = ctx->f[12];
-        ctx->f[0] = ::cosf(arg);
+        setDoubleReturn(ctx, std::cos(doubleArg(ctx, 4)));
     }
 
     void __kernel_cosf(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
@@ -974,58 +988,47 @@ namespace ps2_stubs
 
     void tan(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
     {
-        float arg = ctx->f[12];
-        ctx->f[0] = ::tanf(arg);
+        setDoubleReturn(ctx, std::tan(doubleArg(ctx, 4)));
     }
 
     void atan2(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
     {
-        float y = ctx->f[12];
-        float x = ctx->f[14];
-        ctx->f[0] = ::atan2f(y, x);
+        setDoubleReturn(ctx, std::atan2(doubleArg(ctx, 4), doubleArg(ctx, 5)));
     }
 
     void pow(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
     {
-        float base = ctx->f[12];
-        float exp = ctx->f[14];
-        ctx->f[0] = ::powf(base, exp);
+        setDoubleReturn(ctx, std::pow(doubleArg(ctx, 4), doubleArg(ctx, 5)));
     }
 
     void exp(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
     {
-        float arg = ctx->f[12];
-        ctx->f[0] = ::expf(arg);
+        setDoubleReturn(ctx, std::exp(doubleArg(ctx, 4)));
     }
 
     void log(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
     {
-        float arg = ctx->f[12];
-        ctx->f[0] = ::logf(arg);
+        setDoubleReturn(ctx, std::log(doubleArg(ctx, 4)));
     }
 
     void log10(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
     {
-        float arg = ctx->f[12];
-        ctx->f[0] = ::log10f(arg);
+        setDoubleReturn(ctx, std::log10(doubleArg(ctx, 4)));
     }
 
     void ceil(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
     {
-        float arg = ctx->f[12];
-        ctx->f[0] = ::ceilf(arg);
+        setDoubleReturn(ctx, std::ceil(doubleArg(ctx, 4)));
     }
 
     void floor(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
     {
-        float arg = ctx->f[12];
-        ctx->f[0] = ::floorf(arg);
+        setDoubleReturn(ctx, std::floor(doubleArg(ctx, 4)));
     }
 
     void fabs(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
     {
-        float arg = ctx->f[12];
-        ctx->f[0] = ::fabsf(arg);
+        setDoubleReturn(ctx, std::fabs(doubleArg(ctx, 4)));
     }
     void abs(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
     {
@@ -1040,21 +1043,7 @@ namespace ps2_stubs
 
     void atan(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
     {
-        float in = ctx ? ctx->f[12] : 0.0f;
-        if (in == 0.0f)
-        {
-            uint32_t raw = getRegU32(ctx, 4);
-            std::memcpy(&in, &raw, sizeof(in));
-        }
-        const float out = std::atan(in);
-        if (ctx)
-        {
-            ctx->f[0] = out;
-        }
-
-        uint32_t outRaw = 0u;
-        std::memcpy(&outRaw, &out, sizeof(outRaw));
-        setReturnU32(ctx, outRaw);
+        setDoubleReturn(ctx, std::atan(doubleArg(ctx, 4)));
     }
 
     void memchr(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)

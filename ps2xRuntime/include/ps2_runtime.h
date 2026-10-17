@@ -150,6 +150,9 @@ struct alignas(16) R5900Context
 
         // Initialize VU0 registers
         vu0_q = 1.0f; // Q register usually initialized to 1.0
+        // VF0 is hardwired to (0, 0, 0, 1); libvu0 and inline VU0 code divide by vf0w. Every
+        // context (thread, interrupt, callback) needs it, not just the boot context.
+        vu0_vf[0] = _mm_set_ps(1.0f, 0.0f, 0.0f, 0.0f);
 
         // Reset COP0 registers
         cop0_random = 47; // Start at maximum value

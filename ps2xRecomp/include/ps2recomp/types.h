@@ -185,6 +185,8 @@ namespace ps2recomp
         bool patchCop0 = true;
         bool patchCache = true;
         std::vector<std::string> skipFunctions;
+        // Functions to recompile from the ELF even when the runtime has a stub of the same name.
+        std::vector<std::string> recompileFunctions;
         std::unordered_map<uint32_t, std::string> patches;
         std::vector<std::string> stubImplementations;
         std::vector<std::string> entryPointHints;
