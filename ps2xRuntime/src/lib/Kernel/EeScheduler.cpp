@@ -3,6 +3,7 @@
 #include "ps2_log.h"
 #include "ps2_runtime_macros.h"
 
+#include <unordered_map>
 #include <algorithm>
 #include <cassert>
 #include <cstring>
@@ -1302,6 +1303,15 @@ int EeScheduler::setIrqHandlerEnabled(bool dmac, int id, bool enabled)
     return KE_OK;
 }
 
+namespace
+{
+    // DMAC causes raised while masked (D_STAT.CIS set, CIM clear). On hardware the status bit
+    // stays set and the interrupt is taken once the cause is enabled again; dropping it loses
+    // e.g. a VIF1 transfer end that completes asynchronously while the game has the channel
+    // masked, and the game then waits forever for its handler. Per scheduler instance.
+    std::unordered_map<const EeScheduler *, uint32_t> g_pendingMaskedDmac;
+}
+
 int EeScheduler::setIrqCauseEnabled(bool dmac, uint32_t cause, bool enabled)
 {
     assertExecutor();
@@ -1311,6 +1321,15 @@ int EeScheduler::setIrqCauseEnabled(bool dmac, uint32_t cause, bool enabled)
         if (enabled)
         {
             mask |= 1u << cause;
+            if (dmac)
+            {
+                uint32_t &pending = g_pendingMaskedDmac[this];
+                if ((pending & (1u << cause)) != 0u)
+                {
+                    pending &= ~(1u << cause);
+                    dispatchIrq(true, cause);
+                }
+            }
         }
         else
         {
@@ -1326,6 +1345,8 @@ void EeScheduler::dispatchIrq(bool dmac, uint32_t cause)
     const uint32_t mask = dmac ? m_enabledDmacMask : m_enabledIntcMask;
     if (cause < 32u && (mask & (1u << cause)) == 0u)
     {
+        if (dmac)
+            g_pendingMaskedDmac[this] |= 1u << cause;
         return;
     }
     const auto &handlers = dmac ? m_dmacHandlers : m_intcHandlers;
