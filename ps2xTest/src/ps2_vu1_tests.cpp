@@ -700,6 +700,39 @@ void register_ps2_vu1_tests()
             t.Equals(vu1.state().q, 5.0f, "WAITQ should expose SQRT after its seven-cycle latency");
         });
 
+        tc.Run("EFU special opcodes decode as ERSQRT 0x79, ESIN 0x7C, ERCPR 0x7A", [](TestCase &t)
+        {
+            Vu1Fixture fx;
+            t.IsTrue(fx.initialize(), "VU1 fixture should initialize");
+
+            constexpr uint32_t kUpperNopEnd = kVuUpperNop | 0x40000000u; // NOP with the E bit
+            constexpr uint32_t kVuLowerNop = 0x8000033Cu;
+            // 0x8000e7bd is "ERSQRT P, vf28x" exactly as .hack//Infection's skinning microcode encodes it.
+            writeVuInstructionPair(fx.code, 0u, 0x8000E7BDu, kVuUpperNop);
+            writeVuInstructionPair(fx.code, 8u, makeVuLowerSpecial(0x7Bu, 0u), kUpperNopEnd); // WAITP
+            writeVuInstructionPair(fx.code, 16u, kVuLowerNop, kVuUpperNop);
+            writeVuInstructionPair(fx.code, 24u, makeVuLowerSpecial(0x7Cu, 1u), kVuUpperNop); // ESIN P, vf1x
+            writeVuInstructionPair(fx.code, 32u, makeVuLowerSpecial(0x7Bu, 0u), kUpperNopEnd);
+            writeVuInstructionPair(fx.code, 40u, kVuLowerNop, kVuUpperNop);
+            writeVuInstructionPair(fx.code, 48u, makeVuLowerSpecial(0x7Au, 2u), kVuUpperNop); // ERCPR P, vf2x
+            writeVuInstructionPair(fx.code, 56u, makeVuLowerSpecial(0x7Bu, 0u), kUpperNopEnd);
+            writeVuInstructionPair(fx.code, 64u, kVuLowerNop, kVuUpperNop);
+
+            VU1Interpreter vu1;
+            vu1.state().vf[28][0] = 4096.0f;
+            vu1.state().vf[1][0] = 0.0f;
+            vu1.state().vf[2][0] = 8.0f;
+
+            vu1.execute(fx.code, PS2_VU1_CODE_SIZE, fx.data, PS2_VU1_DATA_SIZE, fx.gs, &fx.mem, 0u, 0u, 0u, 1000u);
+            t.Equals(vu1.state().p, 1.0f / 64.0f, "ERSQRT (special 0x79) should leave 1/sqrt(vf28.x) in P");
+
+            vu1.execute(fx.code, PS2_VU1_CODE_SIZE, fx.data, PS2_VU1_DATA_SIZE, fx.gs, &fx.mem, 24u, 0u, 0u, 1000u);
+            t.Equals(vu1.state().p, 0.0f, "ESIN (special 0x7C) of 0 should be 0");
+
+            vu1.execute(fx.code, PS2_VU1_CODE_SIZE, fx.data, PS2_VU1_DATA_SIZE, fx.gs, &fx.mem, 48u, 0u, 0u, 1000u);
+            t.Equals(vu1.state().p, 0.125f, "ERCPR (special 0x7A) should leave 1/vf2.x in P");
+        });
+
         tc.Run("FDIV resource serializes back-to-back scalar operations", [](TestCase &t)
         {
             Vu1Fixture fx;
@@ -851,9 +884,10 @@ void register_ps2_vu1_tests()
             };
             constexpr EfuCase cases[] = {
                 {0x70u, 11u}, {0x71u, 18u}, {0x72u, 18u}, {0x73u, 24u},
-                {0x74u, 54u}, {0x75u, 54u}, {0x76u, 12u}, {0x77u, 18u},
-                {0x78u, 12u}, {0x79u, 29u}, {0x7Au, 12u}, {0x7Cu, 54u},
-                {0x7Du, 44u}};
+                // ESQRT 0x78, ERSQRT 0x79, ERCPR 0x7A, ESIN 0x7C, EATAN 0x7D, EEXP 0x7E (0x77 is unassigned).
+                {0x74u, 54u}, {0x75u, 54u}, {0x76u, 12u}, {0x78u, 12u},
+                {0x79u, 18u}, {0x7Au, 12u}, {0x7Cu, 29u}, {0x7Du, 54u},
+                {0x7Eu, 44u}};
 
             for (const EfuCase &efu : cases)
             {
