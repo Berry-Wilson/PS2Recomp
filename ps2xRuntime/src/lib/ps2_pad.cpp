@@ -117,6 +117,16 @@ bool PSPadBackend::readState(int /*port*/, int /*slot*/, uint8_t *data, size_t s
             clearBit(PAD_START);
         if (IsKeyDown(KEY_TAB))
             clearBit(PAD_SELECT);
+
+        // Right analog stick: IJKL (I/K = up/down, J/L = left/right).
+        if (IsKeyDown(KEY_J))
+            data[4] = 0x00;
+        else if (IsKeyDown(KEY_L))
+            data[4] = 0xFF;
+        if (IsKeyDown(KEY_I))
+            data[5] = 0x00;
+        else if (IsKeyDown(KEY_K))
+            data[5] = 0xFF;
     }
 
     data[2] = static_cast<uint8_t>(btns & 0xFF);
