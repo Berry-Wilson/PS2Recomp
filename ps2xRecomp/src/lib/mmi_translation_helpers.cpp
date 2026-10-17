@@ -8,6 +8,78 @@
 
 namespace ps2recomp
 {
+    // The EE's HI and LO are 128-bit. This runtime keeps their low halves in ctx->hi / ctx->lo and
+    // their high halves in ctx->hi1 / ctx->lo1 (the MULT1/DIV1 pipeline), so MMI code sees them as
+    // four 32-bit words each: L_[0..3] and H_[0..3]. Semantics follow PCSX2's MMI interpreter.
+    namespace
+    {
+        constexpr const char *kMmiHiLoLoad =
+            "uint32_t L_[4] = {(uint32_t)ctx->lo, (uint32_t)(ctx->lo >> 32), (uint32_t)ctx->lo1, (uint32_t)(ctx->lo1 >> 32)}; \n"
+            "   uint32_t H_[4] = {(uint32_t)ctx->hi, (uint32_t)(ctx->hi >> 32), (uint32_t)ctx->hi1, (uint32_t)(ctx->hi1 >> 32)}; \n";
+        constexpr const char *kMmiHiLoStore =
+            "   ctx->lo = (uint64_t)L_[0] | ((uint64_t)L_[1] << 32); ctx->lo1 = (uint64_t)L_[2] | ((uint64_t)L_[3] << 32); \n"
+            "   ctx->hi = (uint64_t)H_[0] | ((uint64_t)H_[1] << 32); ctx->hi1 = (uint64_t)H_[2] | ((uint64_t)H_[3] << 32); \n";
+
+        std::string mmiLoad(const char *type, const char *name, uint8_t reg)
+        {
+            return fmt::format("   alignas(16) {} {}[16 / sizeof({})]; _mm_store_si128((__m128i *){}, GPR_VEC(ctx, {})); \n",
+                               type, name, type, name, reg);
+        }
+
+        // PMULTH / PMADDH / PMSUBH: eight independent 16x16 products. Lanes 0,1 -> LO w0,w1;
+        // 2,3 -> HI w0,w1; 4,5 -> LO w2,w3; 6,7 -> HI w2,w3. rd = {LO w0, HI w0, LO w2, HI w2}.
+        std::string mmiHalfwordMulAcc(const Instruction &inst, const char *combine)
+        {
+            return fmt::format("{{ {}{}{}"
+                               "   uint32_t *slot_[8] = {{&L_[0], &L_[1], &H_[0], &H_[1], &L_[2], &L_[3], &H_[2], &H_[3]}}; \n"
+                               "   for (int i_ = 0; i_ < 8; ++i_) {{ const uint32_t p_ = (uint32_t)((int32_t)S_[i_] * (int32_t)T_[i_]); *slot_[i_] = {}; }} \n"
+                               "{}"
+                               "   SET_GPR_VEC(ctx, {}, _mm_set_epi32((int)H_[2], (int)L_[2], (int)H_[0], (int)L_[0])); }}",
+                               kMmiHiLoLoad, mmiLoad("int16_t", "S_", inst.rs), mmiLoad("int16_t", "T_", inst.rt),
+                               combine, kMmiHiLoStore, inst.rd);
+        }
+
+        // PHMADH / PHMSBH: pairwise sums (or differences) of adjacent 16x16 products.
+        std::string mmiHorizontalHalfword(const Instruction &inst, bool subtract)
+        {
+            return fmt::format("{{ {}{}{}"
+                               "   uint32_t *dst_[4] = {{&L_[0], &H_[0], &L_[2], &H_[2]}}; \n"
+                               "   for (int i_ = 0; i_ < 4; ++i_) {{ \n"
+                               "       const int32_t odd_ = (int32_t)S_[2 * i_ + 1] * (int32_t)T_[2 * i_ + 1]; \n"
+                               "       const int32_t even_ = (int32_t)S_[2 * i_] * (int32_t)T_[2 * i_]; \n"
+                               "       dst_[i_][0] = (uint32_t)({}); dst_[i_][1] = (uint32_t)({}); }} \n"
+                               "{}"
+                               "   SET_GPR_VEC(ctx, {}, _mm_set_epi32((int)H_[2], (int)L_[2], (int)H_[0], (int)L_[0])); }}",
+                               kMmiHiLoLoad, mmiLoad("int16_t", "S_", inst.rs), mmiLoad("int16_t", "T_", inst.rt),
+                               subtract ? "odd_ - even_" : "odd_ + even_", subtract ? "~odd_" : "odd_",
+                               kMmiHiLoStore, inst.rd);
+        }
+
+        // PMULTW / PMADDW / PMSUBW and the unsigned forms: words 0 and 2 produce 64-bit results in
+        // LO/HI doublewords 0 and 1 (each half sign-extended from 32 bits) and in rd.
+        std::string mmiWordMulAcc(const Instruction &inst, bool isUnsigned, int accumulate)
+        {
+            const char *type = isUnsigned ? "uint32_t" : "int32_t";
+            const char *wide = isUnsigned ? "uint64_t" : "int64_t";
+            std::string acc;
+            if (accumulate == 0)
+                acc = fmt::format("const uint64_t r_ = (uint64_t)(({})S_[w_] * ({})T_[w_]);", wide, wide);
+            else
+                acc = fmt::format("const uint64_t r_ = (((uint64_t)H_[w_] << 32) | L_[w_]) {} (uint64_t)(({})S_[w_] * ({})T_[w_]);",
+                                  accumulate > 0 ? "+" : "-", wide, wide);
+            return fmt::format("{{ {}{}{}"
+                               "   uint64_t rd_[2]; \n"
+                               "   for (int k_ = 0; k_ < 2; ++k_) {{ const int w_ = 2 * k_; {} \n"
+                               "       const uint32_t lo_ = (uint32_t)r_, hi_ = (uint32_t)(r_ >> 32); \n"
+                               "       L_[w_] = lo_; L_[w_ + 1] = (lo_ & 0x80000000u) ? 0xFFFFFFFFu : 0u; \n"
+                               "       H_[w_] = hi_; H_[w_ + 1] = (hi_ & 0x80000000u) ? 0xFFFFFFFFu : 0u; rd_[k_] = r_; }} \n"
+                               "{}"
+                               "   SET_GPR_VEC(ctx, {}, _mm_set_epi64x((long long)rd_[1], (long long)rd_[0])); }}",
+                               kMmiHiLoLoad, mmiLoad(type, "S_", inst.rs), mmiLoad(type, "T_", inst.rt), acc,
+                               kMmiHiLoStore, inst.rd);
+        }
+    }
+
     std::string CodeGenerator::translateMMI0Instruction(const Instruction &inst)
     {
         uint8_t subfunc = inst.sa;
@@ -141,9 +213,9 @@ namespace ps2recomp
         case MMI2_PMSUBW:
             return translatePMSUBW(inst);
         case MMI2_PMFHI:
-            return fmt::format("SET_GPR_U64(ctx, {}, ctx->hi);", rd);
+            return fmt::format("SET_GPR_VEC(ctx, {}, _mm_set_epi64x((long long)ctx->hi1, (long long)ctx->hi));", rd);
         case MMI2_PMFLO:
-            return fmt::format("SET_GPR_U64(ctx, {}, ctx->lo);", rd);
+            return fmt::format("SET_GPR_VEC(ctx, {}, _mm_set_epi64x((long long)ctx->lo1, (long long)ctx->lo));", rd);
         case MMI2_PINTH:
             return fmt::format("SET_GPR_VEC(ctx, {}, PS2_PINTH(GPR_VEC(ctx, {}), GPR_VEC(ctx, {})));", rd, rs, rt);
         case MMI2_PMULTW:
@@ -225,21 +297,34 @@ namespace ps2recomp
     std::string CodeGenerator::translatePMFHLInstruction(const Instruction &inst)
     {
         uint8_t subfunc = inst.sa;
+        const char *pick = nullptr;
         switch (subfunc)
         {
-        case PMFHL_LW:
-            return fmt::format("SET_GPR_VEC(ctx, {}, PS2_PMFHL_LW(ctx->hi, ctx->lo));", inst.rd);
-        case PMFHL_UW:
-            return fmt::format("SET_GPR_VEC(ctx, {}, PS2_PMFHL_UW(ctx->hi, ctx->lo));", inst.rd);
-        case PMFHL_SLW:
-            return fmt::format("SET_GPR_VEC(ctx, {}, PS2_PMFHL_SLW(ctx->hi, ctx->lo));", inst.rd);
-        case PMFHL_LH:
-            return fmt::format("SET_GPR_VEC(ctx, {}, PS2_PMFHL_LH(ctx->hi, ctx->lo));", inst.rd);
-        case PMFHL_SH:
-            return fmt::format("SET_GPR_VEC(ctx, {}, PS2_PMFHL_SH(ctx->hi, ctx->lo));", inst.rd);
+        case PMFHL_LW: // {LO w0, HI w0, LO w2, HI w2}
+            pick = "   SET_GPR_VEC(ctx, {}, _mm_set_epi32((int)H_[2], (int)L_[2], (int)H_[0], (int)L_[0])); ";
+            break;
+        case PMFHL_UW: // {LO w1, HI w1, LO w3, HI w3}
+            pick = "   SET_GPR_VEC(ctx, {}, _mm_set_epi32((int)H_[3], (int)L_[3], (int)H_[1], (int)L_[1])); ";
+            break;
+        case PMFHL_SLW: // HI:LO words 0 and 2 saturated to signed 32 bits, sign-extended to 64
+            pick = "   auto sat_ = [](uint32_t h, uint32_t l) -> long long {{ const int64_t v = (int64_t)(((uint64_t)h << 32) | l); "
+                   "return v > INT32_MAX ? INT32_MAX : (v < INT32_MIN ? INT32_MIN : v); }}; \n"
+                   "   SET_GPR_VEC(ctx, {}, _mm_set_epi64x(sat_(H_[2], L_[2]), sat_(H_[0], L_[0]))); ";
+            break;
+        case PMFHL_LH: // low halfword of each LO/HI word
+            pick = "   SET_GPR_VEC(ctx, {}, _mm_set_epi16((short)H_[3], (short)H_[2], (short)L_[3], (short)L_[2], "
+                   "(short)H_[1], (short)H_[0], (short)L_[1], (short)L_[0])); ";
+            break;
+        case PMFHL_SH: // each LO/HI word saturated to a signed halfword
+            pick = "   auto sat_ = [](uint32_t w) -> short {{ const int32_t v = (int32_t)w; "
+                   "return (short)(v > 32767 ? 32767 : (v < -32768 ? -32768 : v)); }}; \n"
+                   "   SET_GPR_VEC(ctx, {}, _mm_set_epi16(sat_(H_[3]), sat_(H_[2]), sat_(L_[3]), sat_(L_[2]), "
+                   "sat_(H_[1]), sat_(H_[0]), sat_(L_[1]), sat_(L_[0]))); ";
+            break;
         default:
             return emitUnhandledInstruction(inst, fmt::format("Unhandled PMFHL instruction: function 0x{:X}", subfunc));
         }
+        return std::string("{ ") + kMmiHiLoLoad + fmt::format(fmt::runtime(pick), inst.rd) + "}";
     }
 
 
@@ -248,8 +333,9 @@ namespace ps2recomp
         uint8_t subfunc = inst.sa;
         switch (subfunc)
         {
-        case PMFHL_LW:
-            return fmt::format("{{ __m128i val = GPR_VEC(ctx, {}); ctx->lo = _mm_extract_epi32(val, 0); ctx->hi = _mm_extract_epi32(val, 1); }}", inst.rs);
+        case PMFHL_LW: // PMTHL.LW: rs words 0..3 -> LO w0, HI w0, LO w2, HI w2
+            return fmt::format("{{ {}{}   L_[0] = (uint32_t)S_[0]; H_[0] = (uint32_t)S_[1]; L_[2] = (uint32_t)S_[2]; H_[2] = (uint32_t)S_[3]; \n{}}}",
+                               kMmiHiLoLoad, mmiLoad("int32_t", "S_", inst.rs), kMmiHiLoStore);
         default:
             return emitUnhandledInstruction(inst, fmt::format("Unhandled PMTHL instruction: function 0x{:X}", subfunc));
         }
@@ -303,74 +389,40 @@ namespace ps2recomp
 
     std::string CodeGenerator::translatePMADDW(const Instruction &inst)
     {
-        return fmt::format("{{ __m128i p01 = _mm_mul_epu32(GPR_VEC(ctx, {}), GPR_VEC(ctx, {})); \n"
-                           "   __m128i p23 = _mm_mul_epu32(_mm_srli_si128(GPR_VEC(ctx, {}), 8), _mm_srli_si128(GPR_VEC(ctx, {}), 8)); \n"
-                           "   uint64_t acc = Ps2HiLoToU64(ctx->hi, ctx->lo); \n"
-                           "   acc += _mm_cvtsi128_si64(p01); \n"
-                           "   acc += _mm_cvtsi128_si64(_mm_srli_si128(p01, 8)); \n"
-                           "   acc += _mm_cvtsi128_si64(p23); \n"
-                           "   acc += _mm_cvtsi128_si64(_mm_srli_si128(p23, 8)); \n"
-                           "   ctx->lo = (uint32_t)acc; ctx->hi = (uint32_t)(acc >> 32); \n"
-                           "   SET_GPR_U64(ctx, {}, acc); }}",
-                           inst.rs, inst.rt, inst.rs, inst.rt, inst.rd);
+        return mmiWordMulAcc(inst, false, 1);
     }
 
 
     std::string CodeGenerator::translatePMSUBW(const Instruction &inst)
     {
-        return fmt::format("{{ __m128i p01 = _mm_mul_epu32(GPR_VEC(ctx, {}), GPR_VEC(ctx, {})); \n"
-                           "   __m128i p23 = _mm_mul_epu32(_mm_srli_si128(GPR_VEC(ctx, {}), 8), _mm_srli_si128(GPR_VEC(ctx, {}), 8)); \n"
-                           "   uint64_t acc = Ps2HiLoToU64(ctx->hi, ctx->lo); \n"
-                           "   acc -= _mm_cvtsi128_si64(p01); \n"
-                           "   acc -= _mm_cvtsi128_si64(_mm_srli_si128(p01, 8)); \n"
-                           "   acc -= _mm_cvtsi128_si64(p23); \n"
-                           "   acc -= _mm_cvtsi128_si64(_mm_srli_si128(p23, 8)); \n"
-                           "   ctx->lo = (uint32_t)acc; ctx->hi = (uint32_t)(acc >> 32); \n"
-                           "   SET_GPR_U64(ctx, {}, acc); }}",
-                           inst.rs, inst.rt, inst.rs, inst.rt, inst.rd);
+        return mmiWordMulAcc(inst, false, -1);
     }
 
 
     std::string CodeGenerator::translatePMULTW(const Instruction &inst)
     {
-        return fmt::format("{{ __m128i p01 = _mm_mul_epu32(GPR_VEC(ctx, {}), GPR_VEC(ctx, {})); \n"
-                           "   __m128i p23 = _mm_mul_epu32(_mm_srli_si128(GPR_VEC(ctx, {}), 8), _mm_srli_si128(GPR_VEC(ctx, {}), 8)); \n"
-                           "   uint64_t acc = 0; \n"
-                           "   acc += _mm_cvtsi128_si64(p01); \n"
-                           "   acc += _mm_cvtsi128_si64(_mm_srli_si128(p01, 8)); \n"
-                           "   acc += _mm_cvtsi128_si64(p23); \n"
-                           "   acc += _mm_cvtsi128_si64(_mm_srli_si128(p23, 8)); \n"
-                           "   ctx->lo = (uint32_t)acc; ctx->hi = (uint32_t)(acc >> 32); \n"
-                           "   SET_GPR_U64(ctx, {}, acc); }}",
-                           inst.rs, inst.rt, inst.rs, inst.rt, inst.rd);
+        return mmiWordMulAcc(inst, false, 0);
     }
 
 
     std::string CodeGenerator::translatePMADDUW(const Instruction &inst)
     {
-        return fmt::format("{{ __m128i p01 = _mm_mul_epu32(GPR_VEC(ctx, {}), GPR_VEC(ctx, {})); \n"
-                           "   __m128i p23 = _mm_mul_epu32(_mm_srli_si128(GPR_VEC(ctx, {}), 8), _mm_srli_si128(GPR_VEC(ctx, {}), 8)); \n"
-                           "   uint64_t acc = Ps2HiLoToU64(ctx->hi, ctx->lo); \n"
-                           "   acc += _mm_cvtsi128_si64(p01); \n"
-                           "   acc += _mm_cvtsi128_si64(_mm_srli_si128(p01, 8)); \n"
-                           "   acc += _mm_cvtsi128_si64(p23); \n"
-                           "   acc += _mm_cvtsi128_si64(_mm_srli_si128(p23, 8)); \n"
-                           "   ctx->lo = (uint32_t)acc; ctx->hi = (uint32_t)(acc >> 32); \n"
-                           "   SET_GPR_U64(ctx, {}, acc); }}",
-                           inst.rs, inst.rt, inst.rs, inst.rt, inst.rd);
+        return mmiWordMulAcc(inst, true, 1);
     }
 
 
     std::string CodeGenerator::translatePDIVW(const Instruction &inst)
     {
-        // Only divides the first word element rs[0] / rt[0]
-        return fmt::format("{{ int32_t rs0 = GPR_S32(ctx, {}); int32_t rt0 = GPR_S32(ctx, {}); \n"
-                           "   if (rt0 != 0) {{ \n"
-                           "       if (rt0 == -1 && rs0 == INT32_MIN) {{ ctx->lo = (uint32_t)INT32_MIN; ctx->hi = 0; }} \n"
-                           "       else {{ ctx->lo = (uint32_t)(rs0 / rt0); ctx->hi = (uint32_t)(rs0 % rt0); }} \n"
-                           "   }} else {{ ctx->lo = (rs0 < 0) ? 1 : -1; ctx->hi = (uint32_t)rs0; }} \n"
-                           "   SET_GPR_U32(ctx, {}, ctx->lo); }}",
-                           inst.rs, inst.rt, inst.rd);
+        // Words 0 and 2; quotient to LO doubleword, remainder to HI doubleword (sign-extended). No rd.
+        return fmt::format("{{ {}{}{}"
+                           "   for (int k_ = 0; k_ < 2; ++k_) {{ const int32_t n_ = S_[2 * k_], d_ = T_[2 * k_]; int32_t q_, r_; \n"
+                           "       if (n_ == INT32_MIN && d_ == -1) {{ q_ = INT32_MIN; r_ = 0; }} \n"
+                           "       else if (d_ != 0) {{ q_ = n_ / d_; r_ = n_ % d_; }} \n"
+                           "       else {{ q_ = (n_ < 0) ? 1 : -1; r_ = n_; }} \n"
+                           "       L_[2 * k_] = (uint32_t)q_; L_[2 * k_ + 1] = q_ < 0 ? 0xFFFFFFFFu : 0u; \n"
+                           "       H_[2 * k_] = (uint32_t)r_; H_[2 * k_ + 1] = r_ < 0 ? 0xFFFFFFFFu : 0u; }} \n"
+                           "{}}}",
+                           kMmiHiLoLoad, mmiLoad("int32_t", "S_", inst.rs), mmiLoad("int32_t", "T_", inst.rt), kMmiHiLoStore);
     }
 
 
@@ -384,71 +436,25 @@ namespace ps2recomp
 
     std::string CodeGenerator::translatePMADDH(const Instruction &inst)
     {
-        // Parallel multiply add halfword -> results to HI/LO and rd
-        return fmt::format("{{ __m128i prod = _mm_madd_epi16(GPR_VEC(ctx, {}), GPR_VEC(ctx, {})); \n" // Packed multiply and add adjacent pairs
-                           "   int32_t p0 = _mm_cvtsi128_si32(prod); \n"
-                           "   int32_t p1 = _mm_cvtsi128_si32(_mm_srli_si128(prod, 4)); \n"
-                           "   int32_t p2 = _mm_cvtsi128_si32(_mm_srli_si128(prod, 8)); \n"
-                           "   int32_t p3 = _mm_cvtsi128_si32(_mm_srli_si128(prod, 12)); \n"
-                           "   int64_t acc = Ps2HiLoToU64(ctx->hi, ctx->lo); \n"
-                           "   acc += (int64_t)p0 + (int64_t)p1 + (int64_t)p2 + (int64_t)p3; \n"
-                           "   ctx->lo = (uint32_t)acc; ctx->hi = (uint32_t)(acc >> 32); \n"
-                           "   SET_GPR_U64(ctx, {}, acc); }}",
-                           inst.rs, inst.rt, inst.rd);
+        return mmiHalfwordMulAcc(inst, "*slot_[i_] + p_");
     }
 
 
     std::string CodeGenerator::translatePHMADH(const Instruction &inst)
     {
-        // Parallel Horizontal Multiply Add Halfword -> results to HI/LO and rd
-        return fmt::format("{{ __m128i evens = _mm_shuffle_epi32(GPR_VEC(ctx, {}), _MM_SHUFFLE(2,0,2,0)); \n" // Select even halfwords
-                           "   __m128i odds  = _mm_shuffle_epi32(GPR_VEC(ctx, {}), _MM_SHUFFLE(3,1,3,1)); \n" // Select odd halfwords
-                           "   __m128i prod_ev = _mm_mullo_epi16(evens, _mm_shuffle_epi32(GPR_VEC(ctx, {}), _MM_SHUFFLE(2,0,2,0))); \n"
-                           "   __m128i prod_od = _mm_mullo_epi16(odds,  _mm_shuffle_epi32(GPR_VEC(ctx, {}), _MM_SHUFFLE(3,1,3,1))); \n"
-                           "   __m128i sum_pairs = _mm_add_epi16(prod_ev, prod_od); \n"                            // Add rs[0]*rt[0] + rs[1]*rt[1], etc.
-                           "   int32_t h0 = _mm_extract_epi16(sum_pairs, 0) + _mm_extract_epi16(sum_pairs, 1); \n" // Horizontal add within low 32b
-                           "   int32_t h1 = _mm_extract_epi16(sum_pairs, 2) + _mm_extract_epi16(sum_pairs, 3); \n" // Horizontal add within next 32b
-                           "   int32_t h2 = _mm_extract_epi16(sum_pairs, 4) + _mm_extract_epi16(sum_pairs, 5); \n"
-                           "   int32_t h3 = _mm_extract_epi16(sum_pairs, 6) + _mm_extract_epi16(sum_pairs, 7); \n"
-                           "   int64_t acc = Ps2HiLoToU64(ctx->hi, ctx->lo); \n"
-                           "   acc += (int64_t)h0 + (int64_t)h1 + (int64_t)h2 + (int64_t)h3; \n"
-                           "   ctx->lo = (uint32_t)acc; ctx->hi = (uint32_t)(acc >> 32); \n"
-                           "   SET_GPR_U64(ctx, {}, acc); }}",
-                           inst.rs, inst.rt, inst.rs, inst.rt, inst.rd);
+        return mmiHorizontalHalfword(inst, false);
     }
 
 
     std::string CodeGenerator::translatePMSUBH(const Instruction &inst)
     {
-        return fmt::format("{{ __m128i prod = _mm_madd_epi16(GPR_VEC(ctx, {}), GPR_VEC(ctx, {})); \n"
-                           "   int32_t p0 = _mm_cvtsi128_si32(prod); \n"
-                           "   int32_t p1 = _mm_cvtsi128_si32(_mm_srli_si128(prod, 4)); \n"
-                           "   int32_t p2 = _mm_cvtsi128_si32(_mm_srli_si128(prod, 8)); \n"
-                           "   int32_t p3 = _mm_cvtsi128_si32(_mm_srli_si128(prod, 12)); \n"
-                           "   int64_t acc = Ps2HiLoToU64(ctx->hi, ctx->lo); \n"
-                           "   acc -= (int64_t)p0 + (int64_t)p1 + (int64_t)p2 + (int64_t)p3; \n"
-                           "   ctx->lo = (uint32_t)acc; ctx->hi = (uint32_t)(acc >> 32); \n"
-                           "   SET_GPR_U64(ctx, {}, acc); }}",
-                           inst.rs, inst.rt, inst.rd);
+        return mmiHalfwordMulAcc(inst, "*slot_[i_] - p_");
     }
 
 
     std::string CodeGenerator::translatePHMSBH(const Instruction &inst)
     {
-        return fmt::format("{{ __m128i evens = _mm_shuffle_epi32(GPR_VEC(ctx, {}), _MM_SHUFFLE(2,0,2,0)); \n"
-                           "   __m128i odds  = _mm_shuffle_epi32(GPR_VEC(ctx, {}), _MM_SHUFFLE(3,1,3,1)); \n"
-                           "   __m128i prod_ev = _mm_mullo_epi16(evens, _mm_shuffle_epi32(GPR_VEC(ctx, {}), _MM_SHUFFLE(2,0,2,0))); \n"
-                           "   __m128i prod_od = _mm_mullo_epi16(odds,  _mm_shuffle_epi32(GPR_VEC(ctx, {}), _MM_SHUFFLE(3,1,3,1))); \n"
-                           "   __m128i sub_pairs = _mm_sub_epi16(prod_od, prod_ev); \n"
-                           "   int32_t h0 = _mm_extract_epi16(sub_pairs, 0) + _mm_extract_epi16(sub_pairs, 1); \n"
-                           "   int32_t h1 = _mm_extract_epi16(sub_pairs, 2) + _mm_extract_epi16(sub_pairs, 3); \n"
-                           "   int32_t h2 = _mm_extract_epi16(sub_pairs, 4) + _mm_extract_epi16(sub_pairs, 5); \n"
-                           "   int32_t h3 = _mm_extract_epi16(sub_pairs, 6) + _mm_extract_epi16(sub_pairs, 7); \n"
-                           "   int64_t acc = Ps2HiLoToU64(ctx->hi, ctx->lo); \n"
-                           "   acc += (int64_t)h0 + (int64_t)h1 + (int64_t)h2 + (int64_t)h3; \n"
-                           "   ctx->lo = (uint32_t)acc; ctx->hi = (uint32_t)(acc >> 32); \n"
-                           "   SET_GPR_U64(ctx, {}, acc); }}",
-                           inst.rs, inst.rt, inst.rs, inst.rt, inst.rd);
+        return mmiHorizontalHalfword(inst, true);
     }
 
 
@@ -471,43 +477,21 @@ namespace ps2recomp
 
     std::string CodeGenerator::translatePMULTH(const Instruction &inst)
     {
-        // Parallel multiply halfword, results sum to HI/LO and rd
-        return fmt::format("{{ __m128i prod = _mm_madd_epi16(GPR_VEC(ctx, {}), GPR_VEC(ctx, {})); \n"
-                           "   int32_t p0 = _mm_cvtsi128_si32(prod); \n"
-                           "   int32_t p1 = _mm_cvtsi128_si32(_mm_srli_si128(prod, 4)); \n"
-                           "   int32_t p2 = _mm_cvtsi128_si32(_mm_srli_si128(prod, 8)); \n"
-                           "   int32_t p3 = _mm_cvtsi128_si32(_mm_srli_si128(prod, 12)); \n"
-                           "   int64_t result = (int64_t)p0 + (int64_t)p1 + (int64_t)p2 + (int64_t)p3; \n"
-                           "   ctx->lo = (uint32_t)result; ctx->hi = (uint32_t)(result >> 32); \n"
-                           "   SET_GPR_U64(ctx, {}, result); }}",
-                           inst.rs, inst.rt, inst.rd);
+        return mmiHalfwordMulAcc(inst, "p_");
     }
 
 
     std::string CodeGenerator::translatePDIVBW(const Instruction &inst)
     {
-        return fmt::format(
-            "{{\n"
-            "    __m128i rsVec = GPR_VEC(ctx, {});\n"
-            "    __m128i rtVec = GPR_VEC(ctx, {});\n"
-            "    alignas(16) int32_t rsWords[4];\n"
-            "    alignas(16) int32_t rtWords[4];\n"
-            "    _mm_store_si128((__m128i*)rsWords, rsVec);\n"
-            "    _mm_store_si128((__m128i*)rtWords, rtVec);\n"
-            "    int32_t div = rtWords[0];\n"
-            "    int32_t q0 = 0, q1 = 0, q2 = 0, q3 = 0;\n"
-            "    if (div != 0) {{\n"
-            "        q0 = rsWords[0] / div; ctx->lo = (uint32_t)q0; ctx->hi = (uint32_t)(rsWords[0] % div);\n"
-            "        q1 = rsWords[1] / div;\n"
-            "        q2 = rsWords[2] / div;\n"
-            "        q3 = rsWords[3] / div;\n"
-            "    }} else {{\n"
-            "        ctx->lo = (rsWords[0] < 0) ? 1 : -1;\n"
-            "        ctx->hi = (uint32_t)rsWords[0];\n"
-            "    }}\n"
-            "    SET_GPR_VEC(ctx, {}, _mm_set_epi32(q3, q2, q1, q0));\n"
-            "}}",
-            inst.rs, inst.rt, inst.rd);
+        // Four words of rs divided by the halfword rt[0]; quotients to LO words, remainders to HI words.
+        return fmt::format("{{ {}{}"
+                           "   const int16_t d_ = (int16_t)GPR_U32(ctx, {}); \n"
+                           "   for (int i_ = 0; i_ < 4; ++i_) {{ const int32_t n_ = S_[i_]; \n"
+                           "       if (n_ == INT32_MIN && d_ == -1) {{ L_[i_] = 0x80000000u; H_[i_] = 0u; }} \n"
+                           "       else if (d_ != 0) {{ L_[i_] = (uint32_t)(n_ / d_); H_[i_] = (uint32_t)(int32_t)(int16_t)(n_ % d_); }} \n"
+                           "       else {{ L_[i_] = (n_ < 0) ? 1u : 0xFFFFFFFFu; H_[i_] = (uint32_t)n_; }} }} \n"
+                           "{}}}",
+                           kMmiHiLoLoad, mmiLoad("int32_t", "S_", inst.rs), inst.rt, kMmiHiLoStore);
     }
 
 
@@ -528,25 +512,19 @@ namespace ps2recomp
 
     std::string CodeGenerator::translatePMULTUW(const Instruction &inst)
     {
-        // Parallel multiply unsigned word -> results to HI/LO and rd (lower 32 bits)
-        return fmt::format("{{ __m128i p01 = _mm_mul_epu32(GPR_VEC(ctx, {}), GPR_VEC(ctx, {})); \n"
-                           "   __m128i p23 = _mm_mul_epu32(_mm_srli_si128(GPR_VEC(ctx, {}), 8), _mm_srli_si128(GPR_VEC(ctx, {}), 8)); \n"
-                           "   uint64_t res0 = _mm_cvtsi128_si64(p01); uint64_t res1 = _mm_cvtsi128_si64(_mm_srli_si128(p01, 8)); \n"
-                           "   uint64_t res2 = _mm_cvtsi128_si64(p23); uint64_t res3 = _mm_cvtsi128_si64(_mm_srli_si128(p23, 8)); \n"
-                           "   ctx->lo = (uint32_t)res0; ctx->hi = (uint32_t)(res0 >> 32); \n" // HI/LO from first product only
-                           "   SET_GPR_VEC(ctx, {}, _mm_set_epi32((uint32_t)res3, (uint32_t)res2, (uint32_t)res1, (uint32_t)res0)); }}",
-                           inst.rs, inst.rt, inst.rs, inst.rt, inst.rd);
+        return mmiWordMulAcc(inst, true, 0);
     }
 
 
     std::string CodeGenerator::translatePDIVUW(const Instruction &inst)
     {
-        // Parallel divide unsigned word (only first element) -> results to HI/LO and rd (quotient)
-        return fmt::format("{{ uint32_t rs0 = GPR_U32(ctx, {}); uint32_t rt0 = GPR_U32(ctx, {}); \n"
-                           "   if (rt0 != 0) {{ ctx->lo = rs0 / rt0; ctx->hi = rs0 % rt0; }} \n"
-                           "   else {{ ctx->lo = 0xFFFFFFFF; ctx->hi = rs0; }} \n" // Div by zero behavior
-                           "   SET_GPR_U32(ctx, {}, ctx->lo); }}",
-                           inst.rs, inst.rt, inst.rd);
+        return fmt::format("{{ {}{}{}"
+                           "   for (int k_ = 0; k_ < 2; ++k_) {{ const uint32_t n_ = S_[2 * k_], d_ = T_[2 * k_]; uint32_t q_, r_; \n"
+                           "       if (d_ != 0) {{ q_ = n_ / d_; r_ = n_ % d_; }} else {{ q_ = 0xFFFFFFFFu; r_ = n_; }} \n"
+                           "       L_[2 * k_] = q_; L_[2 * k_ + 1] = (q_ & 0x80000000u) ? 0xFFFFFFFFu : 0u; \n"
+                           "       H_[2 * k_] = r_; H_[2 * k_ + 1] = (r_ & 0x80000000u) ? 0xFFFFFFFFu : 0u; }} \n"
+                           "{}}}",
+                           kMmiHiLoLoad, mmiLoad("uint32_t", "S_", inst.rs), mmiLoad("uint32_t", "T_", inst.rt), kMmiHiLoStore);
     }
 
 
@@ -585,13 +563,13 @@ namespace ps2recomp
 
     std::string CodeGenerator::translatePMTHI(const Instruction &inst)
     {
-        return fmt::format("ctx->hi = GPR_U32(ctx, {});", inst.rs); // PMTHI uses standard HI/LO
+        return fmt::format("{{ const __m128i v_ = GPR_VEC(ctx, {}); ctx->hi = (uint64_t)_mm_cvtsi128_si64(v_); ctx->hi1 = (uint64_t)_mm_cvtsi128_si64(_mm_unpackhi_epi64(v_, v_)); }}", inst.rs);
     }
 
 
     std::string CodeGenerator::translatePMTLO(const Instruction &inst)
     {
-        return fmt::format("ctx->lo = GPR_U32(ctx, {});", inst.rs); // PMTLO uses standard HI/LO
+        return fmt::format("{{ const __m128i v_ = GPR_VEC(ctx, {}); ctx->lo = (uint64_t)_mm_cvtsi128_si64(v_); ctx->lo1 = (uint64_t)_mm_cvtsi128_si64(_mm_unpackhi_epi64(v_, v_)); }}", inst.rs);
     }
 
 

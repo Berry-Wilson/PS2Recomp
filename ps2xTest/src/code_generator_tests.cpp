@@ -1227,6 +1227,40 @@ void register_code_generator_tests()
                      "PCPYLD should use PS2_PCPYLD helper");
         });
 
+        tc.Run("MMI multiply-accumulate keeps per-lane 128-bit HI/LO", [](TestCase &t) {
+            CodeGenerator gen({}, {});
+            auto mmi = [](uint8_t function, uint8_t sa, uint8_t rd, uint8_t rs, uint8_t rt)
+            {
+                Instruction inst{};
+                inst.isMMI = true;
+                inst.opcode = OPCODE_MMI;
+                inst.function = function;
+                inst.sa = sa;
+                inst.rd = rd;
+                inst.rs = rs;
+                inst.rt = rt;
+                return inst;
+            };
+
+            // ccMorpher::Modify (.hack//Infection face morphs) clears HI/LO with PMTHI/PMTLO $zero,
+            // accumulates per-target deltas with PMADDH and reads lanes 0/2/4/6 back from rd.
+            const std::string pmaddh = gen.translateInstruction(mmi(MMI_MMI2, MMI2_PMADDH, 13, 13, 11));
+            t.IsTrue(pmaddh.find("&L_[0], &L_[1], &H_[0], &H_[1], &L_[2], &L_[3], &H_[2], &H_[3]") != std::string::npos,
+                     "PMADDH should route halfword lanes 0-7 to LO w0,w1 / HI w0,w1 / LO w2,w3 / HI w2,w3");
+            t.IsTrue(pmaddh.find("*slot_[i_] + p_") != std::string::npos, "PMADDH should accumulate each lane independently");
+            t.IsTrue(pmaddh.find("ctx->lo1 =") != std::string::npos && pmaddh.find("ctx->hi1 =") != std::string::npos,
+                     "PMADDH should write the upper 64 bits of LO and HI");
+            t.IsTrue(pmaddh.find("_mm_set_epi32((int)H_[2], (int)L_[2], (int)H_[0], (int)L_[0])") != std::string::npos,
+                     "PMADDH rd should be {LO w0, HI w0, LO w2, HI w2}");
+
+            const std::string pmthi = gen.translateInstruction(mmi(MMI_MMI3, MMI3_PMTHI, 0, 0, 0));
+            t.IsTrue(pmthi.find("ctx->hi1 =") != std::string::npos, "PMTHI should set all 128 bits of HI");
+            const std::string pmtlo = gen.translateInstruction(mmi(MMI_MMI3, MMI3_PMTLO, 0, 0, 0));
+            t.IsTrue(pmtlo.find("ctx->lo1 =") != std::string::npos, "PMTLO should set all 128 bits of LO");
+            const std::string pmfhi = gen.translateInstruction(mmi(MMI_MMI2, MMI2_PMFHI, 5, 0, 0));
+            t.IsTrue(pmfhi.find("ctx->hi1") != std::string::npos, "PMFHI should read the upper 64 bits of HI");
+        });
+
         tc.Run("Unary MMI permutations read their source from rt", [](TestCase &t) {
             CodeGenerator gen({}, {});
 
