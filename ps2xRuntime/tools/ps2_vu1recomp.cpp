@@ -127,6 +127,35 @@ static const uint32_t vu1MacSignBits[16] = {0x00u, 0x80u, 0x40u, 0xC0u, 0x20u, 0
     // the stall timing somewhere), and it gave no measurable speedup there.
     bool g_exactTiming = true;
 
+    // Static stall elimination. A "block" is a straight-line run of pairs entered only at its
+    // first pair (an MSCAL entry, a branch target, a link return, a chunk's first pair, or a pair
+    // not reached by fallthrough). Compiled code is only ever entered at block starts (the
+    // dispatcher lists nothing else and Budget is only returned there), so within a block every
+    // pair advances the cycle by at least one. A VF/VI/ACC write with latency L at block pair w is
+    // therefore ready by pair w + L, and any write from before the block is ready once the pair
+    // index reaches the image's maximum write latency. Reads proven ready skip the runtime check.
+    std::set<uint32_t> g_blockStarts;
+    uint32_t g_maxVfLatency = 0u, g_maxViLatency = 0u, g_maxAccLatency = 0u;
+    struct BlockTracker
+    {
+        uint32_t index = 0u;
+        uint32_t vf[32][4]{};
+        uint32_t vi[16]{};
+        uint32_t acc[4]{};
+        void start()
+        {
+            index = 0u;
+            for (auto &reg : vf)
+                for (uint32_t &lane : reg)
+                    lane = g_maxVfLatency;
+            for (uint32_t &reg : vi)
+                reg = g_maxViLatency;
+            for (uint32_t &lane : acc)
+                lane = g_maxAccLatency;
+        }
+    } g_block;
+    uint32_t g_stallChecksRemoved = 0u, g_stallChecksKept = 0u;
+
     bool upperReadsQ(uint32_t upper)
     {
         const uint8_t op = static_cast<uint8_t>(upper & 0x3Fu);
@@ -770,6 +799,17 @@ static const uint32_t vu1MacSignBits[16] = {0x00u, 0x80u, 0x40u, 0xC0u, 0x20u, 0
 
     void emitStallTerms(std::vector<std::string> &terms, const A::Usage &usage)
     {
+        const uint32_t j = g_block.index;
+        auto keep = [&](uint32_t readyIndex, std::string term)
+        {
+            if (readyIndex <= j)
+            {
+                ++g_stallChecksRemoved;
+                return;
+            }
+            ++g_stallChecksKept;
+            terms.push_back(std::move(term));
+        };
         for (uint32_t index = 0; index < usage.vfReadCount; ++index)
         {
             const auto &access = usage.vfRead[index];
@@ -777,14 +817,14 @@ static const uint32_t vu1MacSignBits[16] = {0x00u, 0x80u, 0x40u, 0xC0u, 0x20u, 0
                 continue;
             for (uint32_t c = 0; c < 4u; ++c)
                 if ((access.lanes & laneForComponent(c)) != 0u)
-                    terms.push_back("A::vfReady(vu, " + std::to_string(access.reg) + ", " + std::to_string(c) + ")");
+                    keep(g_block.vf[access.reg & 31u][c], "A::vfReady(vu, " + std::to_string(access.reg) + ", " + std::to_string(c) + ")");
         }
         for (uint32_t reg = 1; reg < 16u; ++reg)
             if ((usage.viRead & (1u << reg)) != 0u)
-                terms.push_back("A::viReady(vu, " + std::to_string(reg) + ")");
+                keep(g_block.vi[reg], "A::viReady(vu, " + std::to_string(reg) + ")");
         for (uint32_t c = 0; c < 4u; ++c)
             if ((usage.accRead & laneForComponent(c)) != 0u)
-                terms.push_back("A::accReady(vu, " + std::to_string(c) + ")");
+                keep(g_block.acc[c], "A::accReady(vu, " + std::to_string(c) + ")");
     }
 
     uint32_t inlinedSimple = 0u;
@@ -795,8 +835,12 @@ static const uint32_t vu1MacSignBits[16] = {0x00u, 0x80u, 0x40u, 0xC0u, 0x20u, 0
                       const ImageAnalysis &an, uint32_t &inlined)
     {
         const A::Decoded d = A::decode(vu, code, pc);
+        const bool blockStart = g_blockStarts.count(pc) != 0u;
+        if (blockStart)
+            g_block.start();
         o << label(pc) << ":\n{\n";
-        o << "    if (cyc >= budgetEnd || A::stopRequested(vu)) { st.pc = " << pc << "u; return Vu1CompiledResult::Budget; }\n";
+        if (blockStart)
+            o << "    if (cyc >= budgetEnd || A::stopRequested(vu)) { st.pc = " << pc << "u; return Vu1CompiledResult::Budget; }\n";
         o << "    A::commitReadyPipelines(vu);\n";
         if (d.upperUsage.reserved || d.lowerUsage.reserved)
         {
@@ -839,9 +883,12 @@ static const uint32_t vu1MacSignBits[16] = {0x00u, 0x80u, 0x40u, 0xC0u, 0x20u, 0
             o << " return r; };\n";
             o << "        uint64_t readyCycle = ready();\n";
             o << "        while (readyCycle > cyc)\n        {\n";
-            o << "            if (readyCycle >= budgetEnd) { A::advanceTo(vu, budgetEnd); break; }\n";
+            if (blockStart)
+                o << "            if (readyCycle >= budgetEnd) { A::advanceTo(vu, budgetEnd); break; }\n";
             o << "            A::advanceTo(vu, readyCycle);\n            readyCycle = ready();\n        }\n";
-            o << "        if (cyc >= budgetEnd) { st.pc = " << pc << "u; return Vu1CompiledResult::Budget; }\n    }\n";
+            if (blockStart)
+                o << "        if (cyc >= budgetEnd) { st.pc = " << pc << "u; return Vu1CompiledResult::Budget; }\n";
+            o << "    }\n";
         }
 
         uint8_t writtenVi = 0u;
@@ -969,6 +1016,31 @@ static const uint32_t vu1MacSignBits[16] = {0x00u, 0x80u, 0x40u, 0xC0u, 0x20u, 0
                 o << "    A::accReadyRef(vu, " << c << ") = cyc + " << A::kAccForwardLatency << "u;\n";
         if (writtenVi != 0u && d.lowerUsage.delaysNextBranchRead)
             o << "    A::recordViWriteForBranch(vu, " << unsigned(writtenVi) << ", oldVi);\n";
+        {
+            const uint32_t w = g_block.index;
+            if (lowerWrite.reg != 0u && d.suppressedLowerVf != lowerWrite.reg)
+            {
+                const unsigned latency = d.lowerUsage.vfLatency != 0u ? d.lowerUsage.vfLatency : d.lowerUsage.latency;
+                for (uint32_t c = 0; c < 4u; ++c)
+                    if ((lowerWrite.lanes & laneForComponent(c)) != 0u)
+                        g_block.vf[lowerWrite.reg & 31u][c] = w + latency;
+            }
+            if (upperWrite.reg != 0u)
+            {
+                const unsigned latency = d.upperUsage.vfLatency != 0u ? d.upperUsage.vfLatency : d.upperUsage.latency;
+                for (uint32_t c = 0; c < 4u; ++c)
+                    if ((upperWrite.lanes & laneForComponent(c)) != 0u)
+                        g_block.vf[upperWrite.reg & 31u][c] = w + latency;
+            }
+            const unsigned viLatency = d.lowerUsage.viLatency != 0u ? d.lowerUsage.viLatency : d.lowerUsage.latency;
+            for (uint32_t reg = 1; reg < 16u; ++reg)
+                if ((d.lowerUsage.viWrite & (1u << reg)) != 0u)
+                    g_block.vi[reg] = w + viLatency;
+            for (uint32_t c = 0; c < 4u; ++c)
+                if ((d.upperUsage.accWrite & laneForComponent(c)) != 0u)
+                    g_block.acc[c] = w + A::kAccForwardLatency;
+            ++g_block.index;
+        }
 
         o << "    st.vf[0][0] = 0.0f; st.vf[0][1] = 0.0f; st.vf[0][2] = 0.0f; st.vf[0][3] = 1.0f; st.vi[0] = 0;\n";
         const uint32_t next = (pc + 8u) & kPcMask;
@@ -1084,6 +1156,41 @@ int main(int argc, char **argv)
 
         const std::set<uint32_t> pairs = reachablePairs(vu, code.data(), entries);
         const ImageAnalysis analysis = analyse(vu, code.data(), pairs, entries);
+        {
+            g_blockStarts.clear();
+            g_maxVfLatency = g_maxViLatency = 0u;
+            g_maxAccLatency = A::kAccForwardLatency;
+            std::set<uint32_t> noFallthrough; // pairs not reached by sequential flow
+            for (uint32_t pc : pairs)
+            {
+                const A::Decoded d = A::decode(vu, code.data(), pc);
+                // Only pairs that actually write a register count (EFU ops report a long latency but
+                // write P, not VF/VI).
+                if (d.lowerUsage.vfWrite.reg != 0u && d.suppressedLowerVf != d.lowerUsage.vfWrite.reg)
+                    g_maxVfLatency = std::max<uint32_t>(g_maxVfLatency, d.lowerUsage.vfLatency != 0u ? d.lowerUsage.vfLatency : d.lowerUsage.latency);
+                if (d.upperUsage.vfWrite.reg != 0u)
+                    g_maxVfLatency = std::max<uint32_t>(g_maxVfLatency, d.upperUsage.vfLatency != 0u ? d.upperUsage.vfLatency : d.upperUsage.latency);
+                if ((d.lowerUsage.viWrite & 0xFFFEu) != 0u)
+                    g_maxViLatency = std::max<uint32_t>(g_maxViLatency, d.lowerUsage.viLatency != 0u ? d.lowerUsage.viLatency : d.lowerUsage.latency);
+                const Flow flow = lowerFlow(pc, d.lower);
+                const uint32_t afterSlot = (pc + 16u) & kPcMask;
+                if (flow.staticBranch)
+                    g_blockStarts.insert(flow.target & kPcMask & ~7u);
+                if (flow.link)
+                    g_blockStarts.insert(afterSlot);
+                if (d.eBit || ((flow.staticBranch || flow.jump) && !flow.conditional))
+                    noFallthrough.insert(afterSlot);
+            }
+            for (uint32_t entry : entries)
+                g_blockStarts.insert(entry & kPcMask & ~7u);
+            for (uint32_t pc : pairs)
+            {
+                const uint32_t previous = (pc - 8u) & kPcMask;
+                if (pairs.count(previous) == 0u || chunkOf(previous) != chunkOf(pc) || noFallthrough.count(pc) != 0u)
+                    g_blockStarts.insert(pc);
+            }
+            g_stallChecksRemoved = g_stallChecksKept = 0u;
+        }
         char fnName[64];
         std::snprintf(fnName, sizeof(fnName), "vu1img_%016llx", static_cast<unsigned long long>(hash));
         std::ofstream o(outDir / (std::string("vu1_") + (fnName + 7) + ".cpp"));
@@ -1109,7 +1216,8 @@ int main(int argc, char **argv)
                 emitPair(o, vu, code.data(), pc, pairs, analysis, inlined);
             o << "dispatch:\n    switch (st.pc)\n    {\n";
             for (uint32_t pc : chunkPairs)
-                o << "    case " << pc << "u: goto " << label(pc) << ";\n";
+                if (g_blockStarts.count(pc) != 0u)
+                    o << "    case " << pc << "u: goto " << label(pc) << ";\n";
             o << "    default: return (st.pc >> " << kChunkShift << ") == " << chunk
               << "u ? Vu1CompiledResult::Fallback : kContinue;\n    }\n}\n\n";
         }
@@ -1124,6 +1232,8 @@ int main(int argc, char **argv)
         o << "        if (result != kContinue)\n            return result;\n    }\n}\n";
         images.push_back(fnName);
         statusMasks.push_back(inlined != 0u ? 0x03Fu : 0xFFFu);
+        std::cout << name << ": " << g_blockStarts.size() << " block starts, stall checks removed " << g_stallChecksRemoved
+                  << " kept " << g_stallChecksKept << " (max latency vf " << g_maxVfLatency << " vi " << g_maxViLatency << ")\n";
         std::cout << name << ": " << pairs.size() << " pairs from " << entries.size() << " entries; flag writers "
                   << analysis.writers << ", unobserved " << analysis.deadFlagWriters.size() << ", inlined " << inlined << " (+" << inlinedFlags << " with flags, " << inlinedSimple << " simple upper, " << inlinedLower << " lower)"
                   << (analysis.stickyObservable ? " (sticky status observable: no flag elimination)" : "") << "\n";
