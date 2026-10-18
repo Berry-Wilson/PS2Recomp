@@ -9,7 +9,11 @@
 #include "thread_id.hpp"
 #include <algorithm>
 #include <cstring>
+#include <condition_variable>
+#include <deque>
 #include <mutex>
+#include <thread>
+#include <vector>
 #include <stdexcept>
 #include <iostream>
 
@@ -94,6 +98,72 @@ namespace
             std::lock_guard<std::recursive_mutex> guard;
             explicit Lock(std::recursive_mutex &m) : guard(m) { Util::register_thread_index(0); }
         };
+
+        // GIF packets are decoded on a dedicated GS thread so the VU1/VIF1 worker (PATH1/2) and the
+        // EE (PATH3) only copy them into a queue. Any other entry point drains the queue first.
+        // PS2X_PGS_THREAD=0 decodes synchronously instead.
+        struct GifPacket
+        {
+            uint32_t path = 0;
+            std::vector<uint8_t> data;
+        };
+        mutable std::mutex queueMutex;
+        mutable std::condition_variable queueCv;
+        mutable std::condition_variable idleCv;
+        std::deque<GifPacket> queue;
+        std::vector<std::vector<uint8_t>> freeBuffers;
+        bool gsBusy = false;
+        bool gsStopping = false;
+        bool gsThreaded = true;
+        std::thread gsThread;
+
+        void drain() const
+        {
+            if (!gsThreaded)
+                return;
+            std::unique_lock<std::mutex> lock(queueMutex);
+            idleCv.wait(lock, [&] { return queue.empty() && !gsBusy; });
+        }
+
+        struct SyncLock
+        {
+            explicit SyncLock(const ParallelBackend &backend) : drained((backend.drain(), 0)), inner(backend.mutex) {}
+            int drained;
+            Lock inner;
+        };
+
+        void decodeGIF(uint32_t path, const uint8_t *data, uint32_t size)
+        {
+            Lock lock(mutex);
+            observeGIF(path, data, size);
+            gs.gif_transfer(path, data, size);
+        }
+
+        void gsThreadMain()
+        {
+            std::deque<GifPacket> batch;
+            for (;;)
+            {
+                {
+                    std::unique_lock<std::mutex> lock(queueMutex);
+                    queueCv.wait(lock, [&] { return gsStopping || !queue.empty(); });
+                    if (queue.empty())
+                        return; // stopping
+                    batch.swap(queue);
+                    gsBusy = true;
+                }
+                for (GifPacket &packet : batch)
+                    decodeGIF(packet.path, packet.data.data(), static_cast<uint32_t>(packet.data.size()));
+                std::lock_guard<std::mutex> lock(queueMutex);
+                for (GifPacket &packet : batch)
+                    if (freeBuffers.size() < 64u)
+                        freeBuffers.push_back(std::move(packet.data));
+                batch.clear();
+                gsBusy = false;
+                if (queue.empty())
+                    idleCv.notify_all();
+            }
+        }
         uint64_t bitblt = 0, trxreg = 0;
         GSTransferSnapshot transfer;
         size_t transferBytes = 0, uploadedBytes = 0;
@@ -221,10 +291,23 @@ namespace
                 mode.disable_sampler_feedback = true;
                 gs.set_debug_mode(mode);
             }
+            const char *threadEnv = std::getenv("PS2X_PGS_THREAD");
+            gsThreaded = !(threadEnv && threadEnv[0] == '0');
+            if (gsThreaded)
+                gsThread = std::thread([this] { gsThreadMain(); });
         }
 
         ~ParallelBackend() override
         {
+            if (gsThread.joinable())
+            {
+                {
+                    std::lock_guard<std::mutex> lock(queueMutex);
+                    gsStopping = true;
+                }
+                queueCv.notify_all();
+                gsThread.join();
+            }
             Lock lock(mutex);
             gs.flush();
             interop.device().wait_idle();
@@ -237,13 +320,13 @@ namespace
 
         uint64_t GetReadbackCount() const override
         {
-            Lock lock(mutex);
+            SyncLock lock(*this);
             return readbacks;
         }
 
         void Initialize(uint8_t *vram, uint32_t size) override
         {
-            Lock lock(mutex);
+            SyncLock lock(*this);
             if (!vram || size < VramSize)
                 throw std::invalid_argument("parallel-gs requires 4 MiB initial VRAM");
             std::memcpy(gs.map_vram_write(0, VramSize), vram, VramSize);
@@ -252,7 +335,7 @@ namespace
 
         void Reset() override
         {
-            Lock lock(mutex);
+            SyncLock lock(*this);
             gs.flush();
             interop.device().wait_idle();
             gs.reset_context_state();
@@ -263,18 +346,31 @@ namespace
 
         void ProcessGIF(uint32_t path, const uint8_t *data, uint32_t size) override
         {
-            Lock lock(mutex);
             if (path < 1 || path > 3 || size % 16)
                 throw std::invalid_argument("parallel-gs: invalid GIF path or size");
             if (!data || !size)
                 return;
-            observeGIF(path, data, size);
-            gs.gif_transfer(path, data, size);
+            if (!gsThreaded)
+            {
+                decodeGIF(path, data, size);
+                return;
+            }
+            std::lock_guard<std::mutex> lock(queueMutex);
+            GifPacket packet;
+            packet.path = path;
+            if (!freeBuffers.empty())
+            {
+                packet.data = std::move(freeBuffers.back());
+                freeBuffers.pop_back();
+            }
+            packet.data.assign(data, data + size);
+            queue.push_back(std::move(packet));
+            queueCv.notify_one();
         }
 
         void WriteRegisterRaw(uint8_t addr, uint64_t value) override
         {
-            Lock lock(mutex);
+            SyncLock lock(*this);
             if (addr >= 128)
                 return; // Reserved addresses never index upstream's 128-entry table.
             observeRegister(addr, value);
@@ -316,7 +412,7 @@ namespace
 
         void UploadImage(const uint8_t *data, uint32_t size) override
         {
-            Lock lock(mutex);
+            SyncLock lock(*this);
             if (!data || transfer.direction != 0)
                 return;
             size = uint32_t(std::min<size_t>(size, transferBytes - uploadedBytes));
@@ -339,7 +435,7 @@ namespace
 
         void Flush() override
         {
-            Lock lock(mutex);
+            SyncLock lock(*this);
             gs.flush();
         }
 
@@ -350,7 +446,7 @@ namespace
 
         void Sync(GSSyncReason reason) override
         {
-            Lock lock(mutex);
+            SyncLock lock(*this);
             if (reason == GSSyncReason::Finish || reason == GSSyncReason::Reset)
             {
                 gs.flush();
@@ -361,7 +457,7 @@ namespace
 
         PresentationFrame Present(const GSPresentationRequest &request) override
         {
-            Lock lock(mutex);
+            SyncLock lock(*this);
             gs.flush();
             auto &p = gs.get_priv_register_state();
             p.qwords_lo[0] = request.pmode;
@@ -394,7 +490,7 @@ namespace
 
         uint32_t ReadVram(uint32_t psm, uint32_t base, uint32_t bw, uint32_t x, uint32_t y) const override
         {
-            Lock lock(mutex);
+            SyncLock lock(*this);
             auto *mapped = const_cast<uint8_t *>(static_cast<const uint8_t *>(gs.map_vram_read(0, VramSize)));
             ++readbacks;
             return pixelAccess(psm).read(mapped, base, bw, x, y);
@@ -402,7 +498,7 @@ namespace
 
         void WriteVram(uint32_t psm, uint32_t base, uint32_t bw, uint32_t x, uint32_t y, uint32_t value) override
         {
-            Lock lock(mutex);
+            SyncLock lock(*this);
             gs.map_vram_read(0, VramSize); // Preserve untouched pixels and packed-format lanes.
             auto *mapped = static_cast<uint8_t *>(gs.map_vram_write(0, VramSize));
             ++readbacks;
@@ -412,7 +508,7 @@ namespace
 
         void SnapshotVram(std::vector<uint8_t> &out) const override
         {
-            Lock lock(mutex);
+            SyncLock lock(*this);
             auto *mapped = static_cast<const uint8_t *>(gs.map_vram_read(0, VramSize));
             ++readbacks;
             out.assign(mapped, mapped + VramSize);
@@ -420,7 +516,7 @@ namespace
 
         bool ClearFramebuffer(const GSContext &ctx, uint32_t rgba) override
         {
-            Lock lock(mutex);
+            SyncLock lock(*this);
             if (!ctx.frame.fbw || (ctx.frame.psm != GS_PSM_CT32 && ctx.frame.psm != GS_PSM_CT24 &&
                                    ctx.frame.psm != GS_PSM_CT16 && ctx.frame.psm != GS_PSM_CT16S))
                 return false;
@@ -448,7 +544,7 @@ namespace
 
         uint32_t ConsumeLocalToHostBytes(uint8_t *dst, uint32_t maxBytes) override
         {
-            Lock lock(mutex);
+            SyncLock lock(*this);
             if (!dst)
                 return 0;
             auto count = uint32_t(std::min<size_t>(maxBytes, transfer.localToHostPendingBytes));
@@ -467,13 +563,13 @@ namespace
 
         GSTransferSnapshot GetTransferSnapshot() const override
         {
-            Lock lock(mutex);
+            SyncLock lock(*this);
             return transfer;
         }
 
         void ReadRegisterState(GSDebugSnapshot &s) const override
         {
-            Lock lock(mutex);
+            SyncLock lock(*this);
             const auto &r = gs.get_register_state();
             for (unsigned i = 0; i < 2; ++i)
             {

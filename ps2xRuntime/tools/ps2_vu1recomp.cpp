@@ -840,8 +840,10 @@ static const uint32_t vu1MacSignBits[16] = {0x00u, 0x80u, 0x40u, 0xC0u, 0x20u, 0
             g_block.start();
         o << label(pc) << ":\n{\n";
         if (blockStart)
+        {
             o << "    if (cyc >= budgetEnd || A::stopRequested(vu)) { st.pc = " << pc << "u; return Vu1CompiledResult::Budget; }\n";
-        o << "    A::commitReadyPipelines(vu);\n";
+            o << "    A::commitReadyPipelines(vu);\n";
+        }
         if (d.upperUsage.reserved || d.lowerUsage.reserved)
         {
             o << "    st.pc = " << pc << "u;\n    return Vu1CompiledResult::Fallback; // reserved instruction: interpreter reports it\n}\n";
@@ -1077,7 +1079,7 @@ static const uint32_t vu1MacSignBits[16] = {0x00u, 0x80u, 0x40u, 0xC0u, 0x20u, 0
             o << "    else st.ebit = true;\n";
         else if (haltBranchPossible)
             o << "    else if (dHalt || tHalt) { st.haltAfterDelaySlot = true; A::pendingHaltD(vu) = dHalt; A::pendingHaltT(vu) = tHalt; }\n";
-        o << "    A::advanceOneCycle(vu);\n";
+        o << "    if (A::xgkickActive(vu)) A::advanceOneCycle(vu); else { ++cyc; A::commitReadyPipelines(vu); }\n";
         o << "    if (ended) return Vu1CompiledResult::Ended;\n";
         if (compiled.count(next) != 0u && chunkOf(next) == chunkOf(pc))
             o << "    if (st.pc == " << next << "u) goto " << label(next) << ";\n";
