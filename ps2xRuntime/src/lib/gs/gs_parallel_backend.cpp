@@ -10,6 +10,7 @@
 #include <algorithm>
 #include <cstring>
 #include <condition_variable>
+#include <chrono>
 #include <deque>
 #include <mutex>
 #include <thread>
@@ -113,7 +114,8 @@ namespace
         std::deque<GifPacket> queue;
         std::vector<std::vector<uint8_t>> freeBuffers;
         bool gsBusy = false;
-        bool gsSleeping = false; // the GS thread is blocked on queueCv: producers must wake it
+        bool gsSleeping = false; // the GS thread is blocked on queueCv
+        size_t queuedBytes = 0;
         bool gsStopping = false;
         bool gsThreaded = true;
         std::thread gsThread;
@@ -123,6 +125,10 @@ namespace
             if (!gsThreaded)
                 return;
             std::unique_lock<std::mutex> lock(queueMutex);
+            if (queue.empty() && !gsBusy)
+                return;
+            if (gsSleeping)
+                queueCv.notify_one();
             idleCv.wait(lock, [&] { return queue.empty() && !gsBusy; });
         }
 
@@ -147,12 +153,16 @@ namespace
             {
                 {
                     std::unique_lock<std::mutex> lock(queueMutex);
-                    gsSleeping = true;
-                    queueCv.wait(lock, [&] { return gsStopping || !queue.empty(); });
-                    gsSleeping = false;
+                    while (!gsStopping && queue.empty())
+                    {
+                        gsSleeping = true;
+                        queueCv.wait_for(lock, std::chrono::milliseconds(1));
+                        gsSleeping = false;
+                    }
                     if (queue.empty())
                         return; // stopping
                     batch.swap(queue);
+                    queuedBytes = 0;
                     gsBusy = true;
                 }
                 for (GifPacket &packet : batch)
@@ -367,9 +377,11 @@ namespace
                 freeBuffers.pop_back();
             }
             packet.data.assign(data, data + size);
+            queuedBytes += size;
             queue.push_back(std::move(packet));
-            // Waking a thread costs a kernel call; a busy GS thread picks the packet up on its own.
-            if (gsSleeping)
+            // Waking a thread costs a kernel call per packet. A sleeping GS thread polls every
+            // millisecond anyway and drain() wakes it at once, so only wake it for a large batch.
+            if (gsSleeping && (queue.size() >= 32u || queuedBytes >= 128u * 1024u))
                 queueCv.notify_one();
         }
 
