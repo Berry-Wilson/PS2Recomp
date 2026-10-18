@@ -1,3 +1,5 @@
+#include <cstdlib>
+#include <cstdio>
 // Based on Blackline Interactive implementation
 #include "runtime/ps2_memory.h"
 #include <cstring>
@@ -336,6 +338,144 @@ void PS2Memory::processVIF0Data(const uint8_t *data, uint32_t sizeBytes)
     }
 }
 
+
+namespace
+{
+    // Templated VIF UNPACK for CL >= WL (every write consumes one source vector), any mode, any
+    // write mask. Same semantics as the general loop in processVIF1Data: V2 writes x,y,x,y; V3's W
+    // takes the next source element (or keeps the lane at the end of the data); masks select data
+    // (plus ROW in offset/difference mode), ROW, COL[min(cycle,3)] or keep the lane.
+    template <uint32_t VN, uint32_t VL>
+    inline uint32_t vifElement(const uint8_t *e, bool zeroExtend)
+    {
+        if constexpr (VL == 0u)
+        {
+            uint32_t w;
+            std::memcpy(&w, e, sizeof(w));
+            return w;
+        }
+        else if constexpr (VL == 1u)
+        {
+            uint16_t h;
+            std::memcpy(&h, e, sizeof(h));
+            return zeroExtend ? static_cast<uint32_t>(h) : static_cast<uint32_t>(static_cast<int32_t>(static_cast<int16_t>(h)));
+        }
+        else
+        {
+            return zeroExtend ? static_cast<uint32_t>(*e) : static_cast<uint32_t>(static_cast<int32_t>(static_cast<int8_t>(*e)));
+        }
+    }
+
+    template <uint32_t VN, uint32_t VL>
+    void vifUnpackFast(uint8_t *vuData, const uint8_t *src, const uint8_t *dataEnd, uint32_t writeCount, uint32_t vuAddr,
+                       uint32_t cl, uint32_t wl, uint32_t mode, bool maskEnable, uint32_t mask, uint32_t (&row)[4],
+                       const uint32_t (&col)[4], bool zeroExtend)
+    {
+        constexpr uint32_t elemBytes = 4u >> VL;
+        constexpr uint32_t bytesPerVector = (VN + 1u) * elemBytes;
+        // spec[cycle][field]: 0 data, 1 row, 2 col, 3 keep.
+        uint8_t spec[4][4]{};
+        bool anyKeep = false;
+        if (maskEnable)
+            for (uint32_t c = 0; c < 4u; ++c)
+                for (uint32_t f = 0; f < 4u; ++f)
+                {
+                    spec[c][f] = static_cast<uint8_t>((mask >> ((c * 4u + f) * 2u)) & 3u);
+                    anyKeep |= spec[c][f] == 3u;
+                }
+        const bool plain = !maskEnable && mode == 0u;
+        uint32_t cyclePos = 0u;
+        uint32_t blockBase = vuAddr;
+        for (uint32_t w = 0; w < writeCount; ++w)
+        {
+            const uint32_t destOff = ((blockBase + cyclePos) & 0x3FFu) * 16u;
+            const uint8_t *v = src + w * bytesPerVector;
+            uint32_t out[4];
+            if constexpr (VN == 0u)
+            {
+                out[0] = out[1] = out[2] = out[3] = vifElement<VN, VL>(v, zeroExtend);
+            }
+            else if constexpr (VN == 1u)
+            {
+                out[0] = out[2] = vifElement<VN, VL>(v, zeroExtend);
+                out[1] = out[3] = vifElement<VN, VL>(v + elemBytes, zeroExtend);
+            }
+            else if constexpr (VN == 2u)
+            {
+                out[0] = vifElement<VN, VL>(v, zeroExtend);
+                out[1] = vifElement<VN, VL>(v + elemBytes, zeroExtend);
+                out[2] = vifElement<VN, VL>(v + 2u * elemBytes, zeroExtend);
+                const uint8_t *next = v + 3u * elemBytes;
+                if (next + elemBytes <= dataEnd)
+                    out[3] = vifElement<VN, VL>(next, zeroExtend);
+                else
+                    std::memcpy(&out[3], vuData + destOff + 12u, sizeof(uint32_t));
+            }
+            else
+            {
+                out[0] = vifElement<VN, VL>(v, zeroExtend);
+                out[1] = vifElement<VN, VL>(v + elemBytes, zeroExtend);
+                out[2] = vifElement<VN, VL>(v + 2u * elemBytes, zeroExtend);
+                out[3] = vifElement<VN, VL>(v + 3u * elemBytes, zeroExtend);
+            }
+
+            if (plain)
+            {
+                std::memcpy(vuData + destOff, out, sizeof(out));
+            }
+            else
+            {
+                uint32_t lanes[4];
+                const uint32_t c = cyclePos > 3u ? 3u : cyclePos;
+                if (anyKeep)
+                    std::memcpy(lanes, vuData + destOff, sizeof(lanes));
+                for (uint32_t f = 0; f < 4u; ++f)
+                {
+                    switch (spec[c][f])
+                    {
+                    case 0u:
+                    {
+                        uint32_t value = out[f];
+                        if (mode == 1u || mode == 2u)
+                        {
+                            value += row[f];
+                            if (mode == 2u)
+                                row[f] = value;
+                        }
+                        lanes[f] = value;
+                        break;
+                    }
+                    case 1u:
+                        lanes[f] = row[f];
+                        break;
+                    case 2u:
+                        lanes[f] = col[c];
+                        break;
+                    default:
+                        break; // keep
+                    }
+                }
+                std::memcpy(vuData + destOff, lanes, sizeof(lanes));
+            }
+
+            if (++cyclePos == wl)
+            {
+                cyclePos = 0u;
+                blockBase += cl;
+            }
+        }
+    }
+
+    using VifUnpackFn = void (*)(uint8_t *, const uint8_t *, const uint8_t *, uint32_t, uint32_t, uint32_t, uint32_t,
+                                 uint32_t, bool, uint32_t, uint32_t (&)[4], const uint32_t (&)[4], bool);
+    constexpr VifUnpackFn kVifUnpackFast[4][3] = {
+        {vifUnpackFast<0, 0>, vifUnpackFast<0, 1>, vifUnpackFast<0, 2>},
+        {vifUnpackFast<1, 0>, vifUnpackFast<1, 1>, vifUnpackFast<1, 2>},
+        {vifUnpackFast<2, 0>, vifUnpackFast<2, 1>, vifUnpackFast<2, 2>},
+        {vifUnpackFast<3, 0>, vifUnpackFast<3, 1>, vifUnpackFast<3, 2>},
+    };
+}
+
 void PS2Memory::processVIF1Data(uint32_t srcPhys, uint32_t sizeBytes)
 {
     if (sizeBytes == 0u || srcPhys >= PS2_RAM_SIZE)
@@ -610,6 +750,16 @@ void PS2Memory::processVIF1Data(const uint8_t *data, uint32_t sizeBytes)
                 vuAddr = (vuAddr + (vif1_regs.tops & 0x3FFu)) & 0x3FFu;
 
             const bool zeroExtend = (imm & 0x4000u) != 0u;
+            // Templated path for CL >= WL with any mode/mask (dhp1's interleaved vertex unpacks).
+            if (m_vu1Data && totalBytes > 0 && pos + totalBytes <= sizeBytes && cl >= wl && vl != 3u)
+            {
+                kVifUnpackFast[vn][vl](m_vu1Data, data + pos, data + sizeBytes, writeVectorCount, vuAddr, cl, wl,
+                                       vif1_regs.mode & 3u, maskEnable, vif1_regs.mask, vif1_regs.row, vif1_regs.col, zeroExtend);
+                pos += totalBytes;
+                if (pos > sizeBytes)
+                    break;
+                continue;
+            }
 
             // Fast path for the common case: no write mask, no row add/offset, one source vector per
             // write (CL == WL). Every field then takes the decoded value and the writes are

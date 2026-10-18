@@ -113,6 +113,7 @@ namespace
         std::deque<GifPacket> queue;
         std::vector<std::vector<uint8_t>> freeBuffers;
         bool gsBusy = false;
+        bool gsSleeping = false; // the GS thread is blocked on queueCv: producers must wake it
         bool gsStopping = false;
         bool gsThreaded = true;
         std::thread gsThread;
@@ -146,7 +147,9 @@ namespace
             {
                 {
                     std::unique_lock<std::mutex> lock(queueMutex);
+                    gsSleeping = true;
                     queueCv.wait(lock, [&] { return gsStopping || !queue.empty(); });
+                    gsSleeping = false;
                     if (queue.empty())
                         return; // stopping
                     batch.swap(queue);
@@ -365,7 +368,9 @@ namespace
             }
             packet.data.assign(data, data + size);
             queue.push_back(std::move(packet));
-            queueCv.notify_one();
+            // Waking a thread costs a kernel call; a busy GS thread picks the packet up on its own.
+            if (gsSleeping)
+                queueCv.notify_one();
         }
 
         void WriteRegisterRaw(uint8_t addr, uint64_t value) override
