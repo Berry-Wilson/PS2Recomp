@@ -1,5 +1,7 @@
 #pragma once
 
+#include "iop_spu2.h"
+
 #include <cstddef>
 #include <cstdint>
 #include <cstring>
@@ -85,6 +87,7 @@ namespace ps2x::iop::detail
         // Ends an SPU2 DMA transfer when its completion interrupt (0x24/0x28) is delivered:
         // clears CHCR.start and sets the core's STATX DMA-ready bit (0x80).
         void completeSpuDma(int irq);
+        [[nodiscard]] IopSpu2 &spu2() noexcept { return m_spu2; }
         [[nodiscard]] std::span<const uint8_t> ram() const noexcept { return m_ram; }
         // Raw main RAM without ownership tracking (compiled-module verify snapshots).
         [[nodiscard]] uint8_t *ramData() noexcept { return m_ram.data(); }
@@ -95,7 +98,7 @@ namespace ps2x::iop::detail
         [[nodiscard]] uint32_t readHardware32(uint32_t address) const;
         void writeHardware32(uint32_t address, uint32_t value);
         void markOwned(uint32_t address, size_t size);
-        void setSpuDmaReady(bool secondCore, bool ready);
+        [[nodiscard]] static bool isSpu2Address(uint32_t phys) noexcept { return phys >= Spu2Base && phys < Spu2End; }
 
         std::vector<uint8_t> m_ram;
         std::vector<uint8_t> m_owned;
@@ -107,5 +110,7 @@ namespace ps2x::iop::detail
         uint32_t m_interruptMask = 0;
         uint32_t m_interruptControl = 1;
         std::optional<DmaStart> m_dmaStart;
+        // mutable: SPU2 register reads have side effects (IRQINFO clears on read).
+        mutable IopSpu2 m_spu2;
     };
 }

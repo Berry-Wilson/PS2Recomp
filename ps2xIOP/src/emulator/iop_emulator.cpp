@@ -251,6 +251,19 @@ namespace ps2x::iop::detail
             }
         }
 
+        // Mixes SPU2 output up to the current IOP time and raises its interrupt (IRQ 9) when a
+        // voice, DMA or input-buffer access hit a core's IRQA.
+        void advanceSpu2()
+        {
+            IopSpu2 &spu2 = memory.spu2();
+            spu2.advanceTo(totalCycles);
+            if (spu2.takeIrq())
+            {
+                pendingDmaInterrupts[IopSpu2::Irq] = totalCycles;
+                refreshNextDmaDue();
+            }
+        }
+
         void refreshNextDmaDue()
         {
             nextDmaDue = ~0ull;
@@ -777,6 +790,7 @@ namespace ps2x::iop::detail
                     if (next->state == IopThreadState::Ready && !next->cpu.yielded)
                         cacheScheduleDecision(next);
                 }
+                advanceSpu2();
             }
             catch (...)
             {

@@ -99,6 +99,45 @@ namespace ps2_stubs
         }
     }
 
+    namespace
+    {
+        // Forwards an EE sceSdRemote call to the IOP's real LIBSD remote server (SDRDRV, sid
+        // 0x80000701) with the libsdr packet layout: function = command, the variadic arguments
+        // from word 1, the result in word 0 of the 16-byte reply. Returns false if nothing on the
+        // IOP handled it.
+        bool forwardSdRemoteToIop(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime, uint32_t command,
+                                  const uint32_t (&arguments)[6], uint32_t &result)
+        {
+            if (!runtime || !rdram || kRpcPacketPoolCount == 0u)
+                return false;
+            const auto allocPacket = [rdram]()
+            {
+                const uint32_t slot = g_rpc_packet_index++ % kRpcPacketPoolCount;
+                const uint32_t addr = kRpcPacketPoolBase + slot * kRpcPacketSize;
+                std::memset(getMemPtr(rdram, addr), 0, kRpcPacketSize);
+                return addr;
+            };
+            const uint32_t sendAddr = allocPacket();
+            const uint32_t receiveAddr = allocPacket();
+            uint32_t words[7] = {0u};
+            for (int i = 0; i < 6; ++i)
+                words[i + 1] = arguments[i];
+            std::memcpy(getMemPtr(rdram, sendAddr), words, sizeof(words));
+
+            ps2x::iop::RpcRequest request{};
+            request.sid = kSdrRpcSid;
+            request.function = command;
+            request.mode = 0u;
+            request.send = {sendAddr, kRpcPacketSize};
+            request.receive = {receiveAddr, 16u};
+            const ps2x::iop::RpcResult rpc = PS2IopTransport::handleRpc(runtime, rdram, ctx, request);
+            if (!rpc.handled)
+                return false;
+            std::memcpy(&result, getMemPtr(rdram, receiveAddr), sizeof(result));
+            return true;
+        }
+    }
+
     void resetAudioStubState()
     {
         std::lock_guard<std::mutex> lock(g_audio_stub_mutex);
@@ -126,6 +165,18 @@ namespace ps2_stubs
         const uint32_t arg5 = (arg5Reg != 0u) ? arg5Reg : arg5Stk;
         const uint32_t arg6 = (arg6Reg != 0u) ? arg6Reg : arg6Stk;
 
+        // The game's sound runs on the IOP's real LIBSD (SDRDRV services these remote calls), so
+        // every command goes there; the HLE state below is only a fallback when nothing on the IOP
+        // handles the RPC. (Previously only init was forwarded, so e.g. master volume was never set.)
+        {
+            const uint32_t arguments[6] = {cmdArg0, cmdArg1, arg4Reg, arg5Reg, arg6Reg, getRegU32(ctx, 11)};
+            uint32_t iopResult = 0u;
+            if (forwardSdRemoteToIop(rdram, ctx, runtime, cmd, arguments, iopResult))
+            {
+                setReturnU32(ctx, iopResult);
+                return;
+            }
+        }
         if (cmd == kLibSdCmdInit)
         {
             forwardSdInitToIop(rdram, ctx, runtime, cmdArg0);

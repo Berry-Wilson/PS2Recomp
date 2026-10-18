@@ -17,6 +17,7 @@
 #include "rlgl.h" // after raylib.h, which defines RL_MATRIX_TYPE
 #include "ps2_iop_host.h"
 #include "ps2x/iop/iop_subsystem.h"
+#include "ps2x/iop/spu2_output.h"
 
 #include <functional>
 #include <iostream>
@@ -34,6 +35,43 @@
 #include <mutex>
 #include <unordered_map>
 #include <sstream>
+
+namespace
+{
+#if !defined(PLATFORM_VITA)
+    // Host stream for the emulated SPU2's 48 kHz stereo mix (filled from the IOP's output ring).
+    AudioStream g_spu2Stream{};
+    bool g_spu2StreamActive = false;
+
+    void spu2AudioCallback(void *buffer, unsigned int frames)
+    {
+        int16_t *out = static_cast<int16_t *>(buffer);
+        const size_t got = ps2x::iop::readSpu2Frames(out, frames);
+        if (got < frames)
+            std::memset(out + got * 2u, 0, (frames - got) * 2u * sizeof(int16_t));
+    }
+
+    void startSpu2Stream()
+    {
+        if (g_spu2StreamActive || !IsAudioDeviceReady())
+            return;
+        SetAudioStreamBufferSizeDefault(1024);
+        g_spu2Stream = LoadAudioStream(ps2x::iop::kSpu2SampleRate, 16, 2);
+        SetAudioStreamCallback(g_spu2Stream, spu2AudioCallback);
+        PlayAudioStream(g_spu2Stream);
+        g_spu2StreamActive = true;
+    }
+
+    void stopSpu2Stream()
+    {
+        if (!g_spu2StreamActive)
+            return;
+        StopAudioStream(g_spu2Stream);
+        UnloadAudioStream(g_spu2Stream);
+        g_spu2StreamActive = false;
+    }
+#endif
+}
 
 namespace ps2_stubs
 {
@@ -634,6 +672,7 @@ PS2Runtime::~PS2Runtime()
 #else
         if (IsAudioDeviceReady())
         {
+            stopSpu2Stream();
             CloseAudioDevice();
             m_audioBackend.setAudioReady(false);
         }
@@ -1012,6 +1051,7 @@ bool PS2Runtime::initialize(const char *title)
         InitWindow(HOST_WINDOW_WIDTH, HOST_WINDOW_HEIGHT, title);
         InitAudioDevice();
         m_audioBackend.setAudioReady(IsAudioDeviceReady());
+        startSpu2Stream();
 #endif
 #ifdef PS2X_GS_PARALLEL
         // Needs the window's current OpenGL context to share the Vulkan scanout image.
