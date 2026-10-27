@@ -2833,8 +2833,8 @@ void PS2Runtime::run()
             gpuFrame->ReleaseTexture();
         }
 #endif
-        // FPS overlay: PS2X_SHOW_FPS=1 shows it from the start, F3 toggles it. "Game" is guest
-        // VSync ticks per second (60 = full speed on NTSC), "Window" is the host redraw rate.
+        // FPS overlay: PS2X_SHOW_FPS=1 shows it from the start, F3 toggles it. Shows guest VSync
+        // ticks per second (60 = full speed on NTSC).
         {
             static bool s_showFps = []
             {
@@ -2843,26 +2843,22 @@ void PS2Runtime::run()
             }();
             static double s_windowStart = GetTime();
             static uint64_t s_tickStart = m_eeScheduler->currentVSyncTick();
-            static uint32_t s_windowFrames = 0u;
-            static float s_gameRate = 0.0f, s_hostRate = 0.0f;
+            static float s_gameRate = 0.0f;
             if (IsKeyPressed(KEY_F3))
                 s_showFps = !s_showFps;
-            ++s_windowFrames;
             const double now = GetTime();
             if (now - s_windowStart >= 0.5)
             {
                 const uint64_t tick = m_eeScheduler->currentVSyncTick();
                 s_gameRate = static_cast<float>((tick - s_tickStart) / (now - s_windowStart));
-                s_hostRate = static_cast<float>(s_windowFrames / (now - s_windowStart));
                 s_windowStart = now;
                 s_tickStart = tick;
-                s_windowFrames = 0u;
             }
             if (s_showFps)
             {
                 const int fontSize = std::max(16, GetScreenHeight() / 36);
-                const char *text = TextFormat("Game %.1f / 60  (%d%%)   Window %.0f fps", s_gameRate,
-                                              static_cast<int>(s_gameRate / 60.0f * 100.0f + 0.5f), s_hostRate);
+                const char *text = TextFormat("%.1f / 60  (%d%%)", s_gameRate,
+                                              static_cast<int>(s_gameRate / 60.0f * 100.0f + 0.5f));
                 const int pad = fontSize / 3;
                 DrawRectangle(0, 0, MeasureText(text, fontSize) + pad * 2, fontSize + pad * 2, Color{0, 0, 0, 160});
                 DrawText(text, pad, pad, fontSize, s_gameRate >= 57.0f ? LIME : (s_gameRate >= 45.0f ? YELLOW : RED));
