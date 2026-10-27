@@ -646,18 +646,13 @@ namespace ps2_stubs
         const uint32_t imageQwc = (totalImageBytes + 15u) / 16u;
         const uint32_t totalQwc = headerQwc + imageQwc;
 
-        uint32_t pktAddr = runtime->guestMalloc(totalQwc * 16u, 16u);
-        if (pktAddr == 0)
-        {
-            setReturnS32(ctx, -1);
-            return;
-        }
-
-        uint8_t *pkt = getMemPtr(rdram, pktAddr);
+        // Build the packet host-side: the guest heap can be too small for a large image (dhp1's
+        // 256x256 4-bit font failed here, leaving the number glyphs out of VRAM).
+        std::vector<uint8_t> packet(static_cast<size_t>(totalQwc) * 16u, 0u);
+        uint8_t *pkt = packet.data();
         const uint8_t *src = getConstMemPtr(rdram, srcAddr);
-        if (!pkt || !src)
+        if (!src)
         {
-            runtime->guestFree(pktAddr);
             setReturnS32(ctx, -1);
             return;
         }
@@ -686,14 +681,7 @@ namespace ps2_stubs
 
         std::memcpy(pkt + headerQwc * 16u, src, totalImageBytes);
 
-        constexpr uint32_t GIF_CHANNEL = 0x1000A000;
-        constexpr uint32_t CHCR_STR_MODE0 = 0x101u;
-        auto &mem = runtime->memory();
-        mem.writeIORegister(GIF_CHANNEL + 0x10u, pktAddr);
-        mem.writeIORegister(GIF_CHANNEL + 0x20u, totalQwc & 0xFFFFu);
-        mem.writeIORegister(GIF_CHANNEL + 0x00u, CHCR_STR_MODE0);
-        mem.processPendingTransfers();
-        runtime->guestFree(pktAddr);
+        runtime->memory().submitGifPacket(GifPathId::Path3, pkt, totalQwc * 16u, true);
 
         setReturnS32(ctx, 0);
     }
