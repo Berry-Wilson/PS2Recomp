@@ -296,8 +296,9 @@ namespace
         {
             // Internal resolution: PS2X_PGS_SSAA=1/2/4/8/16 super-samples every draw. From 4x on the
             // scanout is also built at double resolution (PS2X_PGS_HIRES=0 keeps native size).
-            // PS2X_PGS_SS_TEXTURES=0 drops the super samples when a render target is sampled as a
-            // texture; PS2X_PGS_NO_MIPMAPS=1 always samples LOD0 for sharper upscaled textures.
+            // PS2X_PGS_SS_TEXTURES=1 keeps the super samples when a render target is sampled as a
+            // texture (off by default: it corrupts dhp1's sky); PS2X_PGS_NO_MIPMAPS=1 always
+            // samples LOD0 for sharper upscaled textures.
             ParallelGS::GSOptions options{};
             {
                 const char *ssaaEnv = std::getenv("PS2X_PGS_SSAA");
@@ -308,7 +309,7 @@ namespace
                                          : ssaa >= 2 ? ParallelGS::SuperSampling::X2
                                                      : ParallelGS::SuperSampling::X1;
                 const char *texEnv = std::getenv("PS2X_PGS_SS_TEXTURES");
-                options.super_sampled_textures = ssaa >= 2 && !(texEnv && texEnv[0] == '0');
+                options.super_sampled_textures = ssaa >= 2 && texEnv && texEnv[0] == '1';
                 options.ordered_super_sampling = true;
                 const char *hiresEnv = std::getenv("PS2X_PGS_HIRES");
                 highResScanout = ssaa >= 4 && !(hiresEnv && hiresEnv[0] == '0');
