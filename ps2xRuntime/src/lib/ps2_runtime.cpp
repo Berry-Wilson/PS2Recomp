@@ -573,6 +573,27 @@ static void UploadFrame(Texture2D &tex, PS2Runtime *rt, uint32_t &outWidth, uint
     s_lastWidth = width;
     s_lastHeight = height;
 
+    // Super-sampled scanout (e.g. 1280x896) is larger than the default 640x512 texture: size the
+    // texture to the frame and upload it directly; go back to the default size for native frames.
+    const bool largeFrame = width > static_cast<uint32_t>(FB_WIDTH) || height > static_cast<uint32_t>(FB_HEIGHT);
+    const int wantWidth = largeFrame ? static_cast<int>(width) : FB_WIDTH;
+    const int wantHeight = largeFrame ? static_cast<int>(height) : FB_HEIGHT;
+    if (tex.width != wantWidth || tex.height != wantHeight)
+    {
+        UnloadTexture(tex);
+        Image blank = GenImageColor(wantWidth, wantHeight, BLANK);
+        tex = LoadTextureFromImage(blank);
+        UnloadImage(blank);
+    }
+    if (largeFrame && s_scratch.size() >= static_cast<size_t>(width) * height * 4u)
+    {
+        UpdateTexture(tex, s_scratch.data());
+        outWidth = width;
+        outHeight = height;
+        s_hasUploadedFrame = true;
+        return;
+    }
+
     std::fill(s_uploadBuffer.begin(), s_uploadBuffer.end(), 0u);
     if (!s_scratch.empty() && width != 0u && height != 0u)
     {

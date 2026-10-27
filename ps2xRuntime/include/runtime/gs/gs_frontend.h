@@ -236,6 +236,7 @@ private:
     uint32_t m_pathImageRemainingQw[4] = {};
     uint32_t m_hostPresentationWidth = 0;
     uint32_t m_hostPresentationHeight = 0;
+    uint32_t m_hostPresentationStride = 0;
     uint32_t m_hostPresentationDisplayFbp = 0;
     uint32_t m_hostPresentationSourceFbp = 0;
     bool m_hostPresentationUsedPreferred = false;

@@ -429,6 +429,7 @@ public:
         d.unmap_host_buffer(*readbackBuffer, Vulkan::MEMORY_ACCESS_READ_BIT);
         frame.width = width;
         frame.height = height;
+        frame.stride = width;
         return frame;
     }
 };
