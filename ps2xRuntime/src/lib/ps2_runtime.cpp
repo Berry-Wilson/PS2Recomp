@@ -2572,6 +2572,23 @@ void PS2Runtime::run()
             dstWidth,
             dstHeight};
         DrawTexturePro(frameTex, srcRect, dstRect, Vector2{0.0f, 0.0f}, 0.0f, WHITE);
+        {
+            // Guest VSyncs per second (60 = full speed NTSC), averaged over half-second windows.
+            static double s_rateStart = GetTime();
+            static uint64_t s_rateStartTick = m_memory.gs().vsyncTick.load(std::memory_order_acquire);
+            static double s_vsyncsPerSecond = 0.0;
+            const double now = GetTime();
+            const uint64_t tickNow = m_memory.gs().vsyncTick.load(std::memory_order_acquire);
+            if (now - s_rateStart >= 0.5)
+            {
+                s_vsyncsPerSecond = static_cast<double>(tickNow - s_rateStartTick) / (now - s_rateStart);
+                s_rateStart = now;
+                s_rateStartTick = tickNow;
+            }
+            const char *text = TextFormat("VSync/s: %.1f", s_vsyncsPerSecond);
+            DrawText(text, 9, 9, 20, BLACK);
+            DrawText(text, 8, 8, 20, s_vsyncsPerSecond >= 59.0 ? GREEN : YELLOW);
+        }
         if (m_debugUiInitialized && m_debugUiDrawCallback)
         {
             m_debugUiDrawCallback(*this, m_debugUiUserData);
