@@ -413,13 +413,27 @@ namespace
         }
 
         std::memset(dst, 0, byteCount);
-        std::ifstream file(path, std::ios::binary);
+        // Streamed reads (movies, audio) hit the same large file thousands of times; keep the
+        // last file open instead of reopening it for every few sectors.
+        static std::mutex s_fileMutex;
+        static std::filesystem::path s_filePath;
+        static std::ifstream s_file;
+        std::lock_guard<std::mutex> fileLock(s_fileMutex);
+        if (!s_file.is_open() || s_filePath != path)
+        {
+            s_file.close();
+            s_file.clear();
+            s_file.open(path, std::ios::binary);
+            s_filePath = path;
+        }
+        std::ifstream &file = s_file;
         if (!file.is_open())
         {
             g_lastCdError = -1;
             return false;
         }
 
+        file.clear();
         file.seekg(static_cast<std::streamoff>(offsetBytes), std::ios::beg);
         if (!file.good())
         {
@@ -1433,6 +1447,7 @@ namespace
         {
             ps2_syscalls::dispatchDmacHandlersForCause(rdram, runtime, completedCause);
         }
+        runtime->raisePendingGsInterrupts();
 
         return 0;
     }

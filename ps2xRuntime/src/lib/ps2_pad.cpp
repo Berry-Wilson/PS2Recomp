@@ -1,6 +1,10 @@
 #include "runtime/ps2_pad.h"
 #include "ps2_host_backend.h"
 #include <cstring>
+#include <cstdio>
+#include <cstdlib>
+#include <string>
+#include <vector>
 
 namespace
 {
@@ -23,6 +27,62 @@ namespace
     constexpr uint16_t PAD_L1 = 0x0400u;
     constexpr uint16_t PAD_R2 = 0x0200u;
     constexpr uint16_t PAD_L2 = 0x0100u;
+
+    // Scripted input for headless testing.
+    // PS2X_AUTOPAD="startSec:durSec:hexMask[;startSec:durSec:hexMask...]"
+    // Times are seconds since the first pad read; mask uses the PAD_* bit values above
+    // (e.g. 4000 = CROSS, 0008 = START). Example: PS2X_AUTOPAD="8:0.2:4000;12:0.2:0008"
+    struct AutoPadEvent
+    {
+        double start;
+        double duration;
+        uint16_t mask;
+    };
+
+    const std::vector<AutoPadEvent> &autoPadEvents()
+    {
+        static const std::vector<AutoPadEvent> events = []()
+        {
+            std::vector<AutoPadEvent> out;
+            const char *env = std::getenv("PS2X_AUTOPAD");
+            if (!env)
+                return out;
+            std::string spec(env);
+            size_t pos = 0;
+            while (pos < spec.size())
+            {
+                size_t end = spec.find(';', pos);
+                if (end == std::string::npos)
+                    end = spec.size();
+                const std::string item = spec.substr(pos, end - pos);
+                double s = 0.0, d = 0.0;
+                unsigned int m = 0;
+                if (std::sscanf(item.c_str(), "%lf:%lf:%x", &s, &d, &m) == 3)
+                {
+                    out.push_back({s, d, static_cast<uint16_t>(m)});
+                }
+                pos = end + 1;
+            }
+            return out;
+        }();
+        return events;
+    }
+
+    uint16_t autoPadPressedMask()
+    {
+        const auto &events = autoPadEvents();
+        if (events.empty())
+            return 0u;
+        static const double s_t0 = GetTime();
+        const double t = GetTime() - s_t0;
+        uint16_t mask = 0u;
+        for (const auto &e : events)
+        {
+            if (t >= e.start && t < e.start + e.duration)
+                mask |= e.mask;
+        }
+        return mask;
+    }
 }
 
 bool PSPadBackend::readState(int /*port*/, int /*slot*/, uint8_t *data, size_t size)
@@ -118,6 +178,8 @@ bool PSPadBackend::readState(int /*port*/, int /*slot*/, uint8_t *data, size_t s
         if (IsKeyDown(KEY_TAB))
             clearBit(PAD_SELECT);
     }
+
+    btns &= static_cast<uint16_t>(~autoPadPressedMask());
 
     data[2] = static_cast<uint8_t>(btns & 0xFF);
     data[3] = static_cast<uint8_t>(btns >> 8);

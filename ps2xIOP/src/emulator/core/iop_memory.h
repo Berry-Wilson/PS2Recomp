@@ -13,7 +13,7 @@ namespace ps2x::iop::detail
     class IopMemory
     {
     public:
-        static constexpr uint32_t RamSize = 2u * 1024u * 1024u;
+        static constexpr uint32_t RamSize = 8u * 1024u * 1024u;
         static constexpr uint32_t ScratchBase = 0x1F800000u;
         static constexpr uint32_t ScratchSize = 0x400u;
         static constexpr uint32_t HardwareBase = 0x1F801000u;
@@ -23,7 +23,7 @@ namespace ps2x::iop::detail
         static constexpr uint32_t SifBase = 0x1D000000u;
         static constexpr uint32_t SifEnd = 0x1D001000u;
         static constexpr uint32_t HeapBase = 0x00120000u;
-        static constexpr uint32_t HeapLimit = 0x001F0000u;
+        static constexpr uint32_t HeapLimit = 0x007F0000u;
 
         struct Allocation
         {

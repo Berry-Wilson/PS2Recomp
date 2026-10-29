@@ -386,6 +386,7 @@ public:
     uint32_t reserveAsyncCallbackStack(uint32_t size, uint32_t alignment = 16u);
 
     void drainCompletedDmacHandlers(uint8_t *rdram);
+    void raisePendingGsInterrupts();
 
     void requestStop();
     bool isStopRequested() const;
@@ -513,6 +514,9 @@ private:
     uint32_t m_guestHeapLimit = PS2_RAM_SIZE;
     uint32_t m_guestHeapSuggestedBase = 0x00100000u;
     bool m_guestHeapConfigured = false;
+    // Set once INTC_GS has been raised for the current CSR.FINISH event; cleared when the
+    // guest acknowledges FINISH (write-one-to-clear) so the next FINISH raises again.
+    bool m_gsFinishIrqRaised = false;
     uint32_t m_asyncCallbackStackFloor = 0x01F00000u;
     uint32_t m_asyncCallbackStackTop = PS2_RAM_SIZE;
 

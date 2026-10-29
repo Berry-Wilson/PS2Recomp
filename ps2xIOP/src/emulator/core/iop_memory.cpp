@@ -299,21 +299,17 @@ namespace ps2x::iop::detail
             return address;
         }
 
-        uint32_t candidate = alignUp(m_heapCursor, alignment);
-        for (;;)
+        uint32_t candidate = alignUp(HeapBase, alignment);
+        std::vector<Allocation> sorted = m_allocations;
+        std::sort(sorted.begin(), sorted.end(), [](const Allocation &a, const Allocation &b) {
+            return a.address < b.address;
+        });
+        for (const auto &block : sorted)
         {
-            bool overlap = false;
-            for (const auto &block : m_allocations)
-            {
-                if (candidate < block.address + block.size && block.address < candidate + size)
-                {
-                    candidate = alignUp(block.address + block.size, alignment);
-                    overlap = true;
-                    break;
-                }
-            }
-            if (!overlap)
+            if (candidate + size <= block.address)
                 break;
+            if (candidate < block.address + block.size)
+                candidate = alignUp(block.address + block.size, alignment);
         }
         if (candidate > HeapLimit || size > HeapLimit - candidate)
             return 0u;
@@ -339,7 +335,21 @@ namespace ps2x::iop::detail
 
     uint32_t IopMemory::maxFreeMemory() const
     {
-        return m_heapCursor < HeapLimit ? HeapLimit - m_heapCursor : 0u;
+        uint32_t maxGap = 0u;
+        uint32_t cursor = HeapBase;
+        std::vector<Allocation> sorted = m_allocations;
+        std::sort(sorted.begin(), sorted.end(), [](const Allocation &a, const Allocation &b) {
+            return a.address < b.address;
+        });
+        for (const auto &block : sorted)
+        {
+            if (block.address > cursor)
+                maxGap = std::max(maxGap, block.address - cursor);
+            cursor = std::max(cursor, block.address + block.size);
+        }
+        if (cursor < HeapLimit)
+            maxGap = std::max(maxGap, HeapLimit - cursor);
+        return maxGap;
     }
 
     std::optional<IopMemory::Allocation> IopMemory::allocationContaining(uint32_t address) const

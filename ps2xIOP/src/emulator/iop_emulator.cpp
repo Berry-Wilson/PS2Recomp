@@ -794,8 +794,8 @@ namespace ps2x::iop::detail
     bool IopEmulator::isMemoryRange(uint32_t address, size_t size) const
     {
         const bool physicalSegment = address < IopMemory::RamSize;
-        const bool cachedSegment = address >= 0x80000000u && address < 0x80200000u;
-        const bool uncachedSegment = address >= 0xA0000000u && address < 0xA0200000u;
+        const bool cachedSegment = address >= 0x80000000u && address < 0x80000000u + IopMemory::RamSize;
+        const bool uncachedSegment = address >= 0xA0000000u && address < 0xA0000000u + IopMemory::RamSize;
         if (!physicalSegment && !cachedSegment && !uncachedSegment)
             return false;
         const uint32_t physical = IopMemory::physicalAddress(address);

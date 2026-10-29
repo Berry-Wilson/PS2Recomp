@@ -31,4 +31,8 @@ public:
     virtual void WriteVram(uint32_t psm, uint32_t base, uint32_t bw, uint32_t x, uint32_t y, uint32_t value) = 0;
     virtual void SnapshotVram(std::vector<uint8_t> &out) const = 0;
     virtual GSTransferSnapshot GetTransferSnapshot() const = 0;
+
+    virtual bool HandlesRawGif() const { return false; }
+    virtual void ProcessGif(uint32_t path, const uint8_t *data, uint32_t sizeBytes) {}
+    virtual void WriteRegister(uint8_t regAddr, uint64_t value) {}
 };

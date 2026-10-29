@@ -998,24 +998,45 @@ namespace ps2_stubs
 
     void sceGsSetDefDispEnv(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
     {
-        uint32_t envAddr = getRegU32(ctx, 4);
-        uint32_t psm = getRegU32(ctx, 5);
-        uint32_t w = getRegU32(ctx, 6);
-        uint32_t h = getRegU32(ctx, 7);
+        // Mirrors libgraph: DISPLAY is in video clock units, so the width is magnified to the
+        // 2560-clock scanline and DX/DY are offset from the video mode's visible origin.
+        const uint32_t envAddr = getRegU32(ctx, 4);
+        const uint32_t psm = getRegU32(ctx, 5) & 0xFu;
+        int32_t w = static_cast<int16_t>(getRegU32(ctx, 6) & 0xFFFFu);
+        int32_t h = static_cast<int16_t>(getRegU32(ctx, 7) & 0xFFFFu);
         const GsTrailingArgs2 trailing = decodeGsTrailingArgs2(rdram, ctx);
-        uint32_t dx = trailing.arg0;
-        uint32_t dy = trailing.arg1;
+        const int32_t dx = static_cast<int16_t>(trailing.arg0 & 0xFFFFu);
+        const int32_t dy = static_cast<int16_t>(trailing.arg1 & 0xFFFFu);
 
-        if (w == 0)
+        if (w <= 0)
             w = 640;
-        if (h == 0)
+        if (h <= 0)
             h = 448;
 
-        uint32_t fbw = (w + 63) / 64;
-        uint64_t dispfb = makeDispFb(0, fbw, psm, 0, 0);
-        uint64_t display = makeDisplay(dx, dy, 0, 0, w - 1, h - 1);
+        const bool interlaced = (g_gparam.interlace & 0x1u) != 0u;
+        const bool fieldMode = (g_gparam.ffmode & 0x1u) != 0u;
+        const bool pal = g_gparam.omode == 3u;
 
-        writeGsDispEnv(rdram, envAddr, display, dispfb);
+        const int32_t mag = (w + 2559) / w;
+        const int32_t originX = pal ? 656 : 636;
+        const int32_t originY = interlaced ? (pal ? 72 : 50) : (pal ? 36 : 25);
+        const int32_t displayHeight = (interlaced && fieldMode) ? h * 2 : h;
+
+        GsDispEnvMem env{};
+        env.pmode = 0x66u;
+        env.smode2 = interlaced ? (fieldMode ? 3u : 1u) : 2u;
+        env.dispfb = makeDispFb(0, static_cast<uint32_t>((w + 63) / 64), psm, 0, 0);
+        env.display = makeDisplay(static_cast<uint32_t>(originX + dx * mag),
+                                  static_cast<uint32_t>(originY + dy),
+                                  static_cast<uint32_t>(mag - 1),
+                                  0u,
+                                  static_cast<uint32_t>(mag * w - 1),
+                                  static_cast<uint32_t>(displayHeight - 1));
+        env.bgcolor = 0u;
+        if (uint8_t *ptr = getMemPtr(rdram, envAddr))
+        {
+            std::memcpy(ptr, &env, sizeof(env));
+        }
         setReturnS32(ctx, 0);
     }
 

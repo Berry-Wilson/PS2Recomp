@@ -1,12 +1,14 @@
 #include "Common.h"
 #include "Pad.h"
 
+
 namespace ps2_stubs
 {
     namespace
     {
         constexpr uint8_t kPadModeDigital = 0x41;
         constexpr uint8_t kPadModeDualShock = 0x73;
+        constexpr uint8_t kPadModeDualShock2 = 0x79; // analog with pressure-sensitive buttons
         constexpr uint8_t kPadAnalogCenter = 0x80;
         constexpr int32_t kPadTypeDigital = 4;
         constexpr int32_t kPadTypeDualShock = 7;
@@ -245,7 +247,9 @@ namespace ps2_stubs
         void fillPadStatus(uint8_t *data, const PadInputState &state, const PadPortState &portState)
         {
             std::memset(data, 0, 32);
-            data[1] = portState.analogMode ? kPadModeDualShock : kPadModeDigital;
+            data[1] = portState.analogMode
+                          ? (portState.pressureEnabled ? kPadModeDualShock2 : kPadModeDualShock)
+                          : kPadModeDigital;
             data[2] = static_cast<uint8_t>(state.buttons & 0xFFu);
             data[3] = static_cast<uint8_t>((state.buttons >> 8) & 0xFFu);
             data[4] = state.rx;
@@ -529,14 +533,19 @@ namespace ps2_stubs
         case 3: // PAD_MODECUROFFS
             setReturnS32(ctx, 0);
             return;
-        case 4: // PAD_MODETABLE
+        case 4: // PAD_MODETABLE: a DualShock 2 offers digital and analog; games pick the
+                // index of the mode they want and pass it to scePadSetMainMode.
             if (index == -1)
             {
-                setReturnS32(ctx, 1); // one available mode
+                setReturnS32(ctx, 2);
             }
             else if (index == 0)
             {
-                setReturnS32(ctx, currentId);
+                setReturnS32(ctx, kPadTypeDigital);
+            }
+            else if (index == 1)
+            {
+                setReturnS32(ctx, kPadTypeDualShock);
             }
             else
             {

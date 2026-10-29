@@ -5,6 +5,12 @@
 #include "game_overrides.h"
 #include "ps2_runtime_macros.h"
 #include "runtime/gs/gs_frontend.h"
+
+#if defined(PS2X_HAS_PARALLEL_GS)
+
+#include "runtime/gs/gs_parallel_backend.h"
+
+#endif
 #include "runtime/ee_scheduler.h"
 #include "ThreadNaming.h"
 #include "Kernel/Stubs/Audio.h"
@@ -20,6 +26,8 @@
 #include <algorithm>
 #include <array>
 #include <cstring>
+#include <cstdio>
+#include <cstdlib>
 #include <limits>
 #include <chrono>
 #include <atomic>
@@ -451,6 +459,68 @@ static void UploadFrame(Texture2D &tex, PS2Runtime *rt, uint32_t &outWidth, uint
     s_lastHeight = height;
 
     std::fill(s_uploadBuffer.begin(), s_uploadBuffer.end(), 0u);
+    static uint64_t s_hostFrameCounter = 0;
+    const uint64_t frameIndex = (currentTick > 0) ? currentTick : s_hostFrameCounter++;
+    {
+        static const uint64_t s_maxTicks = []()
+        {
+            const char *m = std::getenv("PS2X_MAX_TICKS");
+            return m ? static_cast<uint64_t>(std::atoll(m)) : 0ull;
+        }();
+        if (s_maxTicks > 0 && frameIndex >= s_maxTicks)
+        {
+            std::cerr << "[ps2xRuntime] Reached max ticks (" << frameIndex << "), requesting stop." << std::endl;
+            rt->requestStop();
+        }
+    }
+    // Optional headless frame capture: PS2X_DUMP_FRAMES_DIR=<dir>, PS2X_DUMP_FRAMES_EVERY=<vsync ticks, default 60>
+    {
+        static const char *s_dumpDir = std::getenv("PS2X_DUMP_FRAMES_DIR");
+        static const uint64_t s_dumpEvery = []()
+        {
+            const char *e = std::getenv("PS2X_DUMP_FRAMES_EVERY");
+            const long long v = e ? std::atoll(e) : 60;
+            return static_cast<uint64_t>(v > 0 ? v : 60);
+        }();
+        if (s_dumpDir && !s_scratch.empty() && width != 0u && height != 0u &&
+            (frameIndex % s_dumpEvery) == 0u &&
+            s_scratch.size() >= static_cast<size_t>(width) * height * 4u)
+        {
+            char path[1024];
+            std::snprintf(path, sizeof(path), "%s/frame_%06llu.bmp", s_dumpDir,
+                          static_cast<unsigned long long>(frameIndex));
+            if (std::FILE *f = std::fopen(path, "wb"))
+            {
+                const uint32_t rowBytes = (width * 3u + 3u) & ~3u;
+                const uint32_t imgBytes = rowBytes * height;
+                uint8_t hdr[54] = {'B', 'M'};
+                auto put32 = [&hdr](size_t off, uint32_t v)
+                { hdr[off] = v & 0xFF; hdr[off + 1] = (v >> 8) & 0xFF; hdr[off + 2] = (v >> 16) & 0xFF; hdr[off + 3] = (v >> 24) & 0xFF; };
+                put32(2, 54u + imgBytes);
+                put32(10, 54u);
+                put32(14, 40u);
+                put32(18, width);
+                put32(22, height);
+                hdr[26] = 1;
+                hdr[28] = 24;
+                put32(34, imgBytes);
+                std::fwrite(hdr, 1, sizeof(hdr), f);
+                std::vector<uint8_t> row(rowBytes, 0u);
+                for (uint32_t y = 0; y < height; ++y)
+                {
+                    const uint8_t *src = s_scratch.data() + static_cast<size_t>(height - 1u - y) * width * 4u;
+                    for (uint32_t x = 0; x < width; ++x)
+                    {
+                        row[x * 3u + 0u] = src[x * 4u + 2u];
+                        row[x * 3u + 1u] = src[x * 4u + 1u];
+                        row[x * 3u + 2u] = src[x * 4u + 0u];
+                    }
+                    std::fwrite(row.data(), 1, rowBytes, f);
+                }
+                std::fclose(f);
+            }
+        }
+    }
     if (!s_scratch.empty() && width != 0u && height != 0u)
     {
         const uint32_t copyWidth = std::min<uint32_t>(width, FB_WIDTH);
@@ -665,8 +735,36 @@ bool PS2Runtime::syncCoreSubsystems()
     }
 
     m_gs.init(gsVram, static_cast<uint32_t>(PS2_GS_VRAM_SIZE), &m_memory.gs());
-    m_gifArbiter.setProcessPacketFn([this](const uint8_t *data, uint32_t size)
-                                    { m_gs.processGIFPacket(data, size); });
+
+#if defined(PS2X_HAS_PARALLEL_GS)
+
+    {
+
+        const char *gsBackendEnv = std::getenv("PS2X_GS_BACKEND");
+
+        bool useParallel = true;
+
+        if (gsBackendEnv && (_stricmp(gsBackendEnv, "cpu") == 0 || _stricmp(gsBackendEnv, "software") == 0))
+
+        {
+
+            useParallel = false;
+
+        }
+
+        if (useParallel)
+
+        {
+
+            m_gs.setRasterBackend(std::make_unique<GSParallelBackend>());
+
+        }
+
+    }
+
+#endif
+    m_gifArbiter.setProcessPacketFn([this](const uint8_t *data, uint32_t size, uint32_t path)
+                                    { m_gs.processGIFPacket(data, size, path); });
     m_memory.setGifArbiter(&m_gifArbiter);
     m_memory.setVu1MscalCallback([this](uint32_t startPC, uint32_t top, uint32_t itop)
                                  {
@@ -1353,16 +1451,24 @@ bool PS2Runtime::dispatchGuestBranch(uint8_t *rdram,
     ctx->pc = targetPc;
     const bool isCall = (kind == GuestBranchKind::DirectCall || kind == GuestBranchKind::IndirectCall);
 
-    // Every inter-function transfer is also a deterministic EE safe point.
-    // Backward edges inside generated functions use eeCheckpointDue(), while
-    // this charge bounds straight-line call chains that have no local loop.
-    if (m_eeScheduler && m_eeScheduler->checkpointDue(EeScheduler::kGuestDispatchCycles))
+    // Account cycles for inter-function transfers without aborting active C++ call frames.
+    if (m_eeScheduler)
     {
-        return false;
+        m_eeScheduler->accountCycles(EeScheduler::kGuestDispatchCycles);
     }
 
     if (!isCall)
     {
+        if (kind == GuestBranchKind::DirectJump || kind == GuestBranchKind::IndirectJump)
+        {
+            if (hasFunction(targetPc))
+            {
+                RecompiledFunction targetFn = lookupFunction(targetPc);
+                targetFn(rdram, ctx, this);
+                return false;
+            }
+        }
+
         if (!hasFunction(targetPc))
         {
             reportMissingFunction(rdram, ctx, targetPc, sourcePc, kind, debugName);
@@ -1483,12 +1589,34 @@ void PS2Runtime::handleBreak(uint8_t *rdram, R5900Context *ctx)
     raiseCop0Exception(ctx, EXCEPTION_BREAKPOINT);
 }
 
+void PS2Runtime::raisePendingGsInterrupts()
+{
+    // GS FINISH sets CSR bit 1; when IMR.FINISHMSK (bit 9) is clear the GS asserts
+    // INTC cause 0 (INTC_GS). Games that chain display lists from that handler
+    // (e.g. Drakengard's render device) stall without it.
+    constexpr uint64_t kCsrFinish = 0x2ull;
+    constexpr uint64_t kImrFinishMask = 0x200ull;
+    GSRegisters &gs = m_memory.gs();
+    if ((gs.csr.load() & kCsrFinish) == 0ull)
+    {
+        m_gsFinishIrqRaised = false;
+        return;
+    }
+    if (m_gsFinishIrqRaised || (gs.imr & kImrFinishMask) != 0ull)
+    {
+        return;
+    }
+    m_gsFinishIrqRaised = true;
+    eeScheduler().dispatchIrq(false, 0u);
+}
+
 void PS2Runtime::drainCompletedDmacHandlers(uint8_t *rdram)
 {
     for (uint32_t cause : m_memory.consumeCompletedDmacCauses())
     {
         ps2_syscalls::dispatchDmacHandlersForCause(rdram, this, cause);
     }
+    raisePendingGsInterrupts();
 }
 
 void PS2Runtime::handleTrap(uint8_t *rdram, R5900Context *ctx)
@@ -2211,7 +2339,11 @@ void PS2Runtime::postEeEvent(EeEvent event)
 
 bool PS2Runtime::eeCheckpointDue(uint32_t cycles) noexcept
 {
-    return m_eeScheduler->checkpointDue(cycles);
+    if (m_eeScheduler)
+    {
+        m_eeScheduler->accountCycles(cycles);
+    }
+    return false;
 }
 
 [[noreturn]] void PS2Runtime::eeWaitVSyncTicks(uint32_t ticks, uint32_t resumePc)

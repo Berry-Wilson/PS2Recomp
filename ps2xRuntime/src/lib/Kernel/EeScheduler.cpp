@@ -1281,7 +1281,7 @@ void EeScheduler::dispatchIrq(bool dmac, uint32_t cause)
         SET_GPR_U32(&invocation.context, 4, cause);
         SET_GPR_U32(&invocation.context, 5, handler.argument);
         SET_GPR_U32(&invocation.context, 28, handler.gp);
-        SET_GPR_U32(&invocation.context, 29, 0u);
+        SET_GPR_U32(&invocation.context, 29, 0u); // use invocationStackTop to avoid trashing thread stack
         SET_GPR_U32(&invocation.context, 31, 0u);
         queueInvocation(std::move(invocation));
     }
@@ -1316,7 +1316,7 @@ uint32_t EeScheduler::setGsVSyncCallback(uint32_t callback, uint32_t gp, uint32_
     const uint32_t previous = m_gsVSyncCallback;
     m_gsVSyncCallback = callback;
     m_gsVSyncCallbackGp = gp;
-    m_gsVSyncCallbackSp = 0u;
+    m_gsVSyncCallbackSp = sp;
     return previous;
 }
 
@@ -1896,11 +1896,13 @@ void EeScheduler::processEvent(const EeEvent &event)
             invocation.context.pc = m_gsVSyncCallback;
             SET_GPR_U32(&invocation.context, 4, static_cast<uint32_t>(m_vsyncTick));
             SET_GPR_U32(&invocation.context, 28, m_gsVSyncCallbackGp);
-            SET_GPR_U32(&invocation.context, 29, m_gsVSyncCallbackSp);
+            SET_GPR_U32(&invocation.context, 29, 0u); // use invocationStackTop to avoid trashing thread stack
             SET_GPR_U32(&invocation.context, 31, 0u);
             queueInvocation(std::move(invocation));
         }
         dispatchIrq(false, 2u);
+        // Backstop for a GS FINISH that landed after the DMA path last checked.
+        m_runtime.raisePendingGsInterrupts();
         break;
     case EeEventType::ExternalWake:
         completeExternalWait(event.id, event.value, KE_OK);
@@ -1926,7 +1928,7 @@ void EeScheduler::processEvent(const EeEvent &event)
         SET_GPR_U32(&invocation.context, 5, static_cast<uint32_t>(alarm.ticks));
         SET_GPR_U32(&invocation.context, 6, alarm.argument);
         SET_GPR_U32(&invocation.context, 28, alarm.gp);
-        SET_GPR_U32(&invocation.context, 29, 0u);
+        SET_GPR_U32(&invocation.context, 29, 0u); // use invocationStackTop to avoid trashing thread stack
         SET_GPR_U32(&invocation.context, 31, 0u);
         queueInvocation(std::move(invocation));
         break;
@@ -2144,3 +2146,4 @@ void EeScheduler::publishIdleDebugContext()
         publishDebugContext(selected->activeContext());
     }
 }
+

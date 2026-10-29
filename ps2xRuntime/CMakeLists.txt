@@ -382,7 +382,8 @@ add_library(ps2_runtime STATIC
     src/lib/ps2_audio_vag.cpp
     src/lib/gs/ps2_gs_memory.cpp
     src/lib/gs/gs_frontend.cpp
-    src/lib/gs/gs_cpu_backend.cpp
+    src/lib/gs/gs_cpu_backend.cpp
+    src/lib/gs/gs_parallel_backend.cpp
     src/lib/ps2_iop_host.cpp
     src/lib/ps2_memory.cpp
     src/lib/ps2_pad.cpp
@@ -437,8 +438,14 @@ target_sources(ps2_runtime PRIVATE
     ${KERNEL_SRC_FILES}
 )
 
+# Drakengard-PC repo root (this checkout lives at <root>/external/PS2Recomp)
+get_filename_component(DRAKENGARD_ROOT "${CMAKE_CURRENT_SOURCE_DIR}/../../.." ABSOLUTE)
+set(DRAKENGARD_RECOMP_DIR "${DRAKENGARD_ROOT}/recomp/batched")
+set(DRAKENGARD_SRC_DIR "${DRAKENGARD_ROOT}/src")
+
 file(GLOB RUNNER_SRC_FILES CONFIGURE_DEPENDS
-    "${CMAKE_CURRENT_SOURCE_DIR}/src/runner/*.cpp"
+    "${DRAKENGARD_RECOMP_DIR}/*.cpp"
+    "${DRAKENGARD_SRC_DIR}/*.cpp"
 )
 
 set(RUNNER_MAIN_CPP "${CMAKE_CURRENT_SOURCE_DIR}/src/runner/main.cpp")
@@ -462,12 +469,7 @@ else()
     )
 endif()
 
-if(PS2X_ENABLE_RUNNER_UNITY_BUILD)
-    set_target_properties(ps2EntryRunner PROPERTIES
-        UNITY_BUILD ON
-        UNITY_BUILD_BATCH_SIZE "${PS2X_RUNNER_UNITY_BUILD_BATCH_SIZE}"
-    )
-endif()
+target_include_directories(ps2EntryRunner PRIVATE "${DRAKENGARD_RECOMP_DIR}")
 
 if(PS2X_ENABLE_RUNNER_PCH)
     set(PS2X_RUNNER_PCH_HEADERS
@@ -476,8 +478,8 @@ if(PS2X_ENABLE_RUNNER_PCH)
     )
 
     foreach(PS2X_RUNNER_GENERATED_HEADER IN ITEMS
-        "${CMAKE_CURRENT_SOURCE_DIR}/include/ps2_recompiled_functions.h"
-        "${CMAKE_CURRENT_SOURCE_DIR}/include/ps2_recompiled_stubs.h")
+        "${DRAKENGARD_RECOMP_DIR}/ps2_recompiled_functions.h"
+        "${DRAKENGARD_RECOMP_DIR}/ps2_recompiled_stubs.h")
         if(EXISTS "${PS2X_RUNNER_GENERATED_HEADER}")
             list(APPEND PS2X_RUNNER_PCH_HEADERS "${PS2X_RUNNER_GENERATED_HEADER}")
         endif()
@@ -506,7 +508,22 @@ target_include_directories(ps2_runtime PUBLIC
     ${CMAKE_CURRENT_SOURCE_DIR}/src/lib/Kernel
 )
 
-target_link_libraries(ps2_runtime PUBLIC ps2_host_backend ffmpeg ps2_iop)
+target_link_libraries(ps2_runtime PUBLIC ps2_host_backend ffmpeg ps2_iop)
+
+if(TARGET parallel-gs)
+    target_link_libraries(ps2_runtime PUBLIC parallel-gs)
+    target_include_directories(ps2_runtime PUBLIC
+        "${PS2X_PARALLEL_GS_DIR}/gs"
+        "${PS2X_PARALLEL_GS_DIR}/Granite/vulkan"
+        "${PS2X_PARALLEL_GS_DIR}/Granite/math"
+        "${PS2X_PARALLEL_GS_DIR}/Granite/util"
+        "${PS2X_PARALLEL_GS_DIR}/Granite/threading"
+        "${PS2X_PARALLEL_GS_DIR}/Granite/filesystem"
+        "${PS2X_PARALLEL_GS_DIR}/Granite/third_party/volk"
+        "${PS2X_PARALLEL_GS_DIR}/Granite/third_party/vulkan-headers/include"
+    )
+    target_compile_definitions(ps2_runtime PUBLIC PS2X_HAS_PARALLEL_GS=1)
+endif()
 target_link_libraries(ps2EntryRunner
     PRIVATE
     ps2_runtime

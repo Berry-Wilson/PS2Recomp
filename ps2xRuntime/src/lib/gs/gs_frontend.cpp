@@ -638,11 +638,90 @@ bool GS::copyLatchedHostPresentationFrame(std::vector<uint8_t> &outPixels,
     return true;
 }
 
-void GS::processGIFPacket(const uint8_t *data, uint32_t sizeBytes)
+// Raw-GIF backends consume the stream themselves, so SIGNAL/FINISH/LABEL never reach
+// writeRegister(). Walk the GIFtags and apply only their privileged-register effects
+// (CSR bits, SIGLBLID) so INTC_GS and CSR polling still work.
+void GS::applyPrivilegedSideEffects(const uint8_t *data, uint32_t sizeBytes)
+{
+    if (!m_privRegs)
+        return;
+
+    uint32_t offset = 0u;
+    while (offset + 16u <= sizeBytes)
+    {
+        const uint64_t tagLo = loadLE64(data + offset);
+        const uint64_t tagHi = loadLE64(data + offset + 8u);
+        offset += 16u;
+
+        const uint32_t nloop = static_cast<uint32_t>(tagLo & 0x7FFFu);
+        const uint8_t flg = static_cast<uint8_t>((tagLo >> 58) & 0x3u);
+        uint32_t nreg = static_cast<uint32_t>((tagLo >> 60) & 0xFu);
+        if (nreg == 0u)
+            nreg = 16u;
+
+        if (flg == 0u) // PACKED
+        {
+            for (uint32_t i = 0u; i < nloop; ++i)
+            {
+                for (uint32_t r = 0u; r < nreg; ++r)
+                {
+                    if (offset + 16u > sizeBytes)
+                        return;
+                    const uint32_t desc = static_cast<uint32_t>((tagHi >> (r * 4u)) & 0xFu);
+                    if (desc == 0xEu) // A+D
+                    {
+                        const uint64_t value = loadLE64(data + offset);
+                        const uint8_t reg = static_cast<uint8_t>(loadLE64(data + offset + 8u) & 0xFFu);
+                        if (reg == GS_REG_SIGNAL)
+                        {
+                            const uint32_t id = static_cast<uint32_t>(value & 0xFFFFFFFFu);
+                            const uint32_t mask = static_cast<uint32_t>(value >> 32);
+                            uint32_t lo = static_cast<uint32_t>(m_privRegs->siglblid & 0xFFFFFFFFu);
+                            lo = (lo & ~mask) | (id & mask);
+                            m_privRegs->siglblid = (m_privRegs->siglblid & 0xFFFFFFFF00000000ULL) | lo;
+                            m_privRegs->csr.fetch_or(0x1);
+                        }
+                        else if (reg == GS_REG_FINISH)
+                        {
+                            m_privRegs->csr.fetch_or(0x2);
+                        }
+                        else if (reg == GS_REG_LABEL)
+                        {
+                            const uint32_t id = static_cast<uint32_t>(value & 0xFFFFFFFFu);
+                            const uint32_t mask = static_cast<uint32_t>(value >> 32);
+                            uint32_t hi = static_cast<uint32_t>(m_privRegs->siglblid >> 32);
+                            hi = (hi & ~mask) | (id & mask);
+                            m_privRegs->siglblid = (static_cast<uint64_t>(hi) << 32) | (m_privRegs->siglblid & 0xFFFFFFFFu);
+                        }
+                    }
+                    offset += 16u;
+                }
+            }
+        }
+        else if (flg == 1u) // REGLIST: 64-bit entries, no A+D
+        {
+            const uint64_t words = static_cast<uint64_t>(nloop) * nreg;
+            offset += static_cast<uint32_t>(((words + 1u) / 2u) * 16u);
+        }
+        else // IMAGE (FLG=2/3)
+        {
+            offset += nloop * 16u;
+        }
+    }
+}
+
+void GS::processGIFPacket(const uint8_t *data, uint32_t sizeBytes, uint32_t path)
 {
     std::lock_guard<std::recursive_mutex> lock(m_stateMutex);
     if (!data || sizeBytes < 16 || !m_backend)
         return;
+
+    if (m_backend->HandlesRawGif())
+    {
+        applyPrivilegedSideEffects(data, sizeBytes);
+        m_backend->ProcessGif(path, data, sizeBytes);
+        return;
+    }
 
     if (tryProcessNativeImageUploadPacket(data, sizeBytes))
         return;
@@ -1068,6 +1147,10 @@ void GS::writeRegister(uint8_t regAddr, uint64_t value)
 
 void GS::writeRegisterUnlocked(uint8_t regAddr, uint64_t value)
 {
+    if (m_backend && m_backend->HandlesRawGif())
+    {
+        m_backend->WriteRegister(regAddr, value);
+    }
     const bool interestingReg =
         regAddr == GS_REG_PRIM ||
         regAddr == GS_REG_RGBAQ ||

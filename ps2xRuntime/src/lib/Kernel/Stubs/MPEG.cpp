@@ -493,6 +493,9 @@ namespace ps2_stubs
             uint32_t imageBufferAddr = 0u;
             bool sawInput = false;
             bool sawSequenceEnd = false;
+            // Sequence end decoded and every picture handed out. Movies streamed out of a larger
+            // archive never reach CD EOF, so this is what ends them (as libmpeg's isEnd does).
+            bool videoDrained = false;
             bool streamEnded = false;
             bool decoderFailed = false;
             uint64_t cdStreamGeneration = 0u;
@@ -1082,6 +1085,7 @@ namespace ps2_stubs
                 playback.ptsPresentationBaseTickQ32 = 0u;
                 playback.waitingForVideoSequenceHeader = false;
                 playback.decoderFailed = false;
+                playback.videoDrained = false;
                 playback.decoder.reset();
                 playback.decodedFrames.clear();
             }
@@ -2206,6 +2210,23 @@ namespace ps2_stubs
                 });
             }
             setReturnS32(ctx, 0);
+            // Games call demux in a tight loop until it consumes data. The queue only drains as
+            // pictures become presentable, which needs EE vsync time to pass, and a spinning guest
+            // barely advances it. Yield until the next vsync, then report nothing consumed.
+            if (runtime != nullptr)
+            {
+                runtime->eeScheduler().waitVSync(
+                    runtime->eeScheduler().currentVSyncTick(),
+                    -1,
+                    [](R5900Context &resumeContext)
+                    {
+                        if (static_cast<int32_t>(getRegU32(&resumeContext, 2)) < 0)
+                        {
+                            return;
+                        }
+                        setReturnS32(&resumeContext, 0);
+                    });
+            }
             return;
         }
         const bool currentStreamCompleted = std::find(completedMpegIds.begin(), completedMpegIds.end(), mpegAddr) != completedMpegIds.end();
@@ -2292,9 +2313,23 @@ namespace ps2_stubs
         {
             std::unique_lock<std::mutex> lock(g_mpeg_stub_mutex);
             MpegPlaybackState &playback = getPlaybackState(mpegAddr);
+            if (playback.decodedFrames.empty() && playback.sawSequenceEnd && !playback.videoDrained)
+            {
+                // Nothing more can arrive while the caller is blocked here, so drain the decoder
+                // and, if that yields nothing, report the end instead of waiting forever.
+                if (playback.decoder)
+                {
+                    playback.decoder->flush(playback.decodedFrames);
+                }
+                if (playback.decodedFrames.empty())
+                {
+                    playback.videoDrained = true;
+                }
+            }
             if (playback.decodedFrames.empty() &&
                 !g_mpeg_stub_state.currentCdStreamEofSeen &&
                 !playback.streamEnded &&
+                !playback.videoDrained &&
                 !playback.decoderFailed)
             {
                 if (g_mpeg_stub_state.getPictureWaitTraceCount < 32u)
@@ -2461,8 +2496,9 @@ namespace ps2_stubs
         const bool producerEnded =
             g_mpeg_stub_state.currentCdStreamEofSeen &&
             playback.cdStreamGeneration == g_mpeg_stub_state.cdStreamGeneration;
-        const bool ended = producerEnded &&
-                           (playback.streamEnded || (playback.decoderFailed && playback.sawInput));
+        const bool ended = (producerEnded &&
+                            (playback.streamEnded || (playback.decoderFailed && playback.sawInput))) ||
+                           playback.videoDrained;
         const uint64_t presentationEnd = playback.presentationEndTickQ32;
         const uint64_t currentTickQ32 = runtime != nullptr
                                             ? (runtime->eeScheduler().currentVSyncTick() << 32u)
