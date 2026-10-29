@@ -150,7 +150,7 @@ namespace ps2_stubs
             // Keyboard mapping (PS2 -> keys):
             // D-Pad: arrows, Square/Cross/Circle/Triangle: Z/X/C/V
             // L1/R1: Q/E, L2/R2: 1/3, Start/Select: Enter/RightShift
-            // L3/R3: LeftCtrl/RightCtrl, Analog left: WASD
+            // L3/R3: LeftCtrl/RightCtrl, Analog left: WASD, Analog right: IJKL
             setButton(state, kPadBtnUp, IsKeyDown(KEY_UP));
             setButton(state, kPadBtnDown, IsKeyDown(KEY_DOWN));
             setButton(state, kPadBtnLeft, IsKeyDown(KEY_LEFT));
@@ -191,6 +191,23 @@ namespace ps2_stubs
             {
                 state.lx = axisToByte(ax);
                 state.ly = axisToByte(ay);
+            }
+
+            float rx = 0.0f;
+            float ry = 0.0f;
+            if (IsKeyDown(KEY_L))
+                rx += 1.0f;
+            if (IsKeyDown(KEY_J))
+                rx -= 1.0f;
+            if (IsKeyDown(KEY_K))
+                ry += 1.0f;
+            if (IsKeyDown(KEY_I))
+                ry -= 1.0f;
+
+            if (rx != 0.0f || ry != 0.0f)
+            {
+                state.rx = axisToByte(rx);
+                state.ry = axisToByte(ry);
             }
         }
 

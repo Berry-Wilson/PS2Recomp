@@ -149,14 +149,30 @@ bool PSPadBackend::readState(int /*port*/, int /*slot*/, uint8_t *data, size_t s
     }
     else
     {
-        if (IsKeyDown(KEY_UP) || IsKeyDown(KEY_W))
+        // D-pad: arrow keys. Left stick: WASD. Right stick: IJKL.
+        if (IsKeyDown(KEY_UP))
             clearBit(PAD_UP);
-        if (IsKeyDown(KEY_DOWN) || IsKeyDown(KEY_S))
+        if (IsKeyDown(KEY_DOWN))
             clearBit(PAD_DOWN);
-        if (IsKeyDown(KEY_LEFT) || IsKeyDown(KEY_A))
+        if (IsKeyDown(KEY_LEFT))
             clearBit(PAD_LEFT);
-        if (IsKeyDown(KEY_RIGHT) || IsKeyDown(KEY_D))
+        if (IsKeyDown(KEY_RIGHT))
             clearBit(PAD_RIGHT);
+
+        auto keyAxis = [](int negativeKey, int positiveKey) -> uint8_t
+        {
+            int value = 0;
+            if (IsKeyDown(negativeKey))
+                value -= 127;
+            if (IsKeyDown(positiveKey))
+                value += 127;
+            return static_cast<uint8_t>(kPadStickCenter + value);
+        };
+        data[6] = keyAxis(KEY_A, KEY_D); // left X
+        data[7] = keyAxis(KEY_W, KEY_S); // left Y
+        data[4] = keyAxis(KEY_J, KEY_L); // right X
+        data[5] = keyAxis(KEY_I, KEY_K); // right Y
+
         if (IsKeyDown(KEY_X) || IsKeyDown(KEY_SPACE))
             clearBit(PAD_CROSS);
         if (IsKeyDown(KEY_C) || IsKeyDown(KEY_ESCAPE))
