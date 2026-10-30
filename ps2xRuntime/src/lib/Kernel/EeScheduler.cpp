@@ -1847,11 +1847,20 @@ void EeScheduler::processDueDeadlines()
         {
             if (scheduled.event.type == EeEventType::VBlankStart)
             {
+                // Pace from the previous deadline so small jitter averages out, but don't
+                // carry debt: if the host fell a whole frame behind (slow scene), restart
+                // from now instead of replaying the missed vblanks faster than 60 Hz.
+                auto nextVBlankHost = scheduled.hostDeadline + kVBlankPeriod;
+                const auto vblankNow = std::chrono::steady_clock::now();
+                if (nextVBlankHost < vblankNow)
+                {
+                    nextVBlankHost = vblankNow;
+                }
                 scheduleEvent(scheduled.deadlineCycle + kVBlankDurationCycles,
                               scheduled.hostDeadline + kVBlankDuration,
                               EeEvent{EeEventType::VBlankEnd, 0, m_vsyncTick + 1u});
                 scheduleEvent(scheduled.deadlineCycle + kVBlankPeriodCycles,
-                              scheduled.hostDeadline + kVBlankPeriod,
+                              nextVBlankHost,
                               EeEvent{EeEventType::VBlankStart, 0, 0});
             }
             processEvent(scheduled.event);
