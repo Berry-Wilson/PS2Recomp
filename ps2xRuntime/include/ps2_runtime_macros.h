@@ -432,6 +432,105 @@ inline bool ps2_fcmp_le(float a, float b)
     return ps2_fexp255(a, b) ? ps2_fkey(a) <= ps2_fkey(b) : a <= b;
 }
 
+// MAC and status flags left by a COP2 macro FMAC instruction (ADD/SUB/MUL/MADD/MSUB in all forms,
+// OPMULA/OPMSUB). `dest` is the VU destination mask (x = 8 ... w = 1); lanes not written report no
+// flags. MAC: zero bits 0-3, sign 4-7, underflow 8-11, overflow 12-15, each with x in the top bit of
+// its nibble. Status: Z/S/U/O in bits 0-3 and their sticky copies in bits 6-9; I/D (bits 4, 5, 10,
+// 11) belong to the divider and are preserved. Denormal results count as zero plus underflow.
+inline void ps2_vu0_fmac_flags(R5900Context *ctx, __m128 res, uint32_t dest)
+{
+    const __m128i bits = _mm_castps_si128(res);
+    const __m128i expo = _mm_and_si128(bits, _mm_set1_epi32(0x7F800000));
+    const __m128i expZero = _mm_cmpeq_epi32(expo, _mm_setzero_si128());
+    const __m128i mantZero = _mm_cmpeq_epi32(_mm_and_si128(bits, _mm_set1_epi32(0x007FFFFF)), _mm_setzero_si128());
+    const uint32_t zero = static_cast<uint32_t>(_mm_movemask_ps(_mm_castsi128_ps(expZero)));
+    const uint32_t sign = static_cast<uint32_t>(_mm_movemask_ps(res));
+    const uint32_t under = static_cast<uint32_t>(_mm_movemask_ps(_mm_castsi128_ps(_mm_andnot_si128(mantZero, expZero))));
+    const uint32_t over = static_cast<uint32_t>(
+        _mm_movemask_ps(_mm_castsi128_ps(_mm_cmpeq_epi32(expo, _mm_set1_epi32(0x7F800000)))));
+    // movemask puts x in bit 0; MAC nibbles put x in bit 3.
+    static constexpr uint8_t kReverse[16] = {0, 8, 4, 12, 2, 10, 6, 14, 1, 9, 5, 13, 3, 11, 7, 15};
+    dest &= 0xFu;
+    const uint32_t z = kReverse[zero] & dest, s = kReverse[sign] & dest;
+    const uint32_t u = kReverse[under] & dest, o = kReverse[over] & dest;
+    ctx->vu0_mac_flags = z | (s << 4) | (u << 8) | (o << 12);
+    const uint32_t now = (z ? 1u : 0u) | (s ? 2u : 0u) | (u ? 4u : 0u) | (o ? 8u : 0u);
+    ctx->vu0_status = static_cast<uint16_t>((ctx->vu0_status & 0xFF0u) | now | (now << 6));
+}
+
+// FDIV unit (DIV/SQRT/RSQRT into Q). Each op replaces status I (bit 4, invalid) and D (bit 5, divide
+// by zero) and ORs them into the sticky bits 10/11. The PS2 has no Inf/NaN: a zero divisor gives
+// +-max, negative roots use the magnitude, and denormal operands count as zero.
+inline bool ps2_fzero(float f)
+{
+    return (std::bit_cast<uint32_t>(f) & 0x7F800000u) == 0u;
+}
+
+inline float ps2_fsigned_max(bool negative)
+{
+    return std::bit_cast<float>(negative ? 0xFFFFFFFFu : 0x7FFFFFFFu);
+}
+
+// Exponent-255 PS2 values as the nearest host float, so host arithmetic never sees Inf/NaN.
+inline float ps2_fhost(float f)
+{
+    const uint32_t b = std::bit_cast<uint32_t>(f);
+    return (b & 0x7F800000u) == 0x7F800000u ? std::bit_cast<float>((b & 0x80000000u) | 0x7F7FFFFFu) : f;
+}
+
+// Host results that overflowed to Inf become the PS2's +-max.
+inline float ps2_fresult(float f)
+{
+    const uint32_t b = std::bit_cast<uint32_t>(f);
+    return (b & 0x7F800000u) == 0x7F800000u ? ps2_fsigned_max((b & 0x80000000u) != 0u) : f;
+}
+
+inline void ps2_vu0_fdiv_status(R5900Context *ctx, bool invalid, bool divZero)
+{
+    const uint32_t now = (invalid ? 0x10u : 0u) | (divZero ? 0x20u : 0u);
+    ctx->vu0_status = static_cast<uint16_t>((ctx->vu0_status & ~0x30u) | now | (now << 6));
+}
+
+inline void ps2_vu0_div(R5900Context *ctx, float fs, float ft)
+{
+    if (ps2_fzero(ft))
+    {
+        // 0/0 is invalid, x/0 is divide by zero; both give +-max with the sign of fs ^ ft.
+        ctx->vu0_q = ps2_fsigned_max(std::signbit(fs) != std::signbit(ft));
+        ps2_vu0_fdiv_status(ctx, ps2_fzero(fs), !ps2_fzero(fs));
+        return;
+    }
+    ctx->vu0_q = ps2_fresult(ps2_fhost(fs) / ps2_fhost(ft));
+    ps2_vu0_fdiv_status(ctx, false, false);
+}
+
+inline void ps2_vu0_sqrt(R5900Context *ctx, float ft)
+{
+    ctx->vu0_q = ps2_fzero(ft) ? 0.0f : std::sqrt(std::fabs(ps2_fhost(ft)));
+    ps2_vu0_fdiv_status(ctx, !ps2_fzero(ft) && std::signbit(ft), false);
+}
+
+inline void ps2_vu0_rsqrt(R5900Context *ctx, float fs, float ft)
+{
+    if (ps2_fzero(ft))
+    {
+        ctx->vu0_q = ps2_fsigned_max(std::signbit(fs) != std::signbit(ft));
+        ps2_vu0_fdiv_status(ctx, ps2_fzero(fs), !ps2_fzero(fs));
+        return;
+    }
+    ctx->vu0_q = ps2_fresult(ps2_fhost(fs) / std::sqrt(std::fabs(ps2_fhost(ft))));
+    ps2_vu0_fdiv_status(ctx, std::signbit(ft), false);
+}
+
+// VFTOI: float to int32 with saturation (the host conversion returns 0x80000000 for every overflow).
+inline __m128i ps2_vftoi(__m128 v)
+{
+    const __m128i res = _mm_cvttps_epi32(v);
+    const __m128i overflow = _mm_cmpeq_epi32(res, _mm_set1_epi32(static_cast<int32_t>(0x80000000u)));
+    const __m128i positive = _mm_cmpgt_epi32(_mm_castps_si128(v), _mm_set1_epi32(-1));
+    return _mm_xor_si128(res, _mm_and_si128(_mm_and_si128(overflow, positive), _mm_set1_epi32(-1)));
+}
+
 // PS2 VU (Vector Unit) operations
 #define PS2_VMAX(a, b) ps2_vmax((__m128)(a), (__m128)(b))
 #define PS2_VMINI(a, b) ps2_vmini((__m128)(a), (__m128)(b))

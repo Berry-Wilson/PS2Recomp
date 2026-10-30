@@ -28,6 +28,7 @@
 #include <iostream>
 #include <cctype>
 #include <cmath>
+#include <stdexcept>
 #include <vector>
 
 namespace ps2recomp
@@ -269,9 +270,36 @@ namespace ps2recomp
         return code;
     }
 
+    namespace
+    {
+        // COP2 macro instructions executed by the FMAC unit, which update the MAC and status flags:
+        // ADD/SUB/MADD/MSUB/MUL with bc, q, i or full operands (and their ACC forms) and OPMULA/OPMSUB.
+        // MAX/MINI, ABS, ITOF/FTOI, CLIP, MOVE/MR32 and the integer/lower-unit operations leave them alone.
+        bool vuMacroSetsFmacFlags(const Instruction &inst)
+        {
+            if (inst.opcode != OPCODE_COP2 || inst.rs < COP2_CO)
+                return false;
+            uint8_t op = static_cast<uint8_t>(inst.function & 0x3F);
+            if (op >= 0x3C)
+                op = static_cast<uint8_t>((((inst.raw >> 6) & 0x1F) << 2) | (inst.raw & 0x3));
+            return op <= 0x0F || (op >= 0x18 && op <= 0x1C) || op == 0x1E ||
+                   (op >= 0x20 && op <= 0x2A) || (op >= 0x2C && op <= 0x2E);
+        }
+    }
+
     std::string CodeGenerator::translateVUInstruction(const Instruction &inst)
     {
-        return discardVf0Writes(VuTranslator(*this).translate(inst));
+        std::string code = discardVf0Writes(VuTranslator(*this).translate(inst));
+        if (vuMacroSetsFmacFlags(inst))
+        {
+            // Every FMAC translation is a single block computing `res` before blending it into the
+            // destination; update the flags from it inside that block.
+            const size_t close = code.rfind('}');
+            if (code.find("__m128 res") == std::string::npos || close == std::string::npos)
+                throw std::runtime_error(fmt::format("FMAC translation at 0x{:X} has no result block", inst.address));
+            code.insert(close, fmt::format("ps2_vu0_fmac_flags(ctx, res, {}u); ", inst.vectorInfo.vectorField & 0xFu));
+        }
+        return code;
     }
 
     CodeGenerator::AnalysisResult CodeGenerator::collectInternalBranchTargets(

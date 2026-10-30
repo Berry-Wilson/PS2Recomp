@@ -848,6 +848,8 @@ namespace ps2recomp
             m_skipFunctionStarts.clear();
             m_stubFunctions.clear();
             m_stubFunctionStarts.clear();
+            m_recompileFunctions.clear();
+            m_recompileFunctionStarts.clear();
             m_stubHandlerBindingsByStart.clear();
             m_entryPointHintStarts.clear();
             m_correctnessCriticalFunctionStarts.clear();
@@ -890,6 +892,14 @@ namespace ps2recomp
                         m_stubHandlerBindingsByStart[*selector.start] = selector.name;
                     }
                 }
+            }
+            for (const auto &name : m_config.recompileFunctions)
+            {
+                const FunctionSelector selector = parseFunctionSelector(name);
+                if (selector.start.has_value())
+                    m_recompileFunctionStarts.insert(*selector.start);
+                else if (!selector.name.empty())
+                    m_recompileFunctions.insert(selector.name);
             }
             for (const auto &hint : m_config.entryPointHints)
             {
@@ -2221,6 +2231,12 @@ namespace ps2recomp
 
     bool PS2Recompiler::isStubFunction(const Function &function) const
     {
+        // `recompile` entries win over both configured and built-in (runtime name) stubs.
+        if (m_recompileFunctionStarts.contains(function.start) || m_recompileFunctions.contains(function.name))
+        {
+            return false;
+        }
+
         if (m_stubFunctionStarts.contains(function.start))
         {
             return true;

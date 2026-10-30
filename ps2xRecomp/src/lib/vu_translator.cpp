@@ -79,7 +79,8 @@ namespace ps2recomp
             switch (rd)
             {
             case VU0_CR_STATUS:
-                return fmt::format("ctx->vu0_status = static_cast<uint16_t>(GPR_U32(ctx, {}) & 0xFFFFu);", rt);
+                // Only the sticky flags (bits 6-11) are writable; Z/S/U/O/I/D come from the FMAC and FDIV units.
+                return fmt::format("ctx->vu0_status = static_cast<uint16_t>((ctx->vu0_status & 0x3Fu) | (GPR_U32(ctx, {}) & 0xFC0u));", rt);
             case VU0_CR_MAC:
             case VU0_CR_TPC:
             case VU0_CR_VPU_STAT:
@@ -268,7 +269,7 @@ namespace ps2recomp
 
                     return fmt::format(
                         "{{ __m128 fs = ctx->vu0_vf[{}]; "
-                        "__m128 ft = _mm_shuffle_ps(ctx->vu0_vf[{}], ctx->vu0_vf[{}], {}); "
+                        "__m128 ft = _mm_and_ps(_mm_shuffle_ps(ctx->vu0_vf[{}], ctx->vu0_vf[{}], {}), _mm_castsi128_ps(_mm_set1_epi32(0x7FFFFFFF))); "
                         "__m128 neg_ft = _mm_xor_ps(ft, _mm_castsi128_ps(_mm_set1_epi32(0x80000000))); "
                         "__m128 gt = _mm_cmpgt_ps(fs, ft); "
                         "__m128 lt = _mm_cmplt_ps(fs, neg_ft); "

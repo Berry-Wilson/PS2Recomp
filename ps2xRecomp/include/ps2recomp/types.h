@@ -187,6 +187,8 @@ namespace ps2recomp
         std::vector<std::string> skipFunctions;
         std::unordered_map<uint32_t, std::string> patches;
         std::vector<std::string> stubImplementations;
+        // Functions translated from the ELF even when the runtime has a stub of the same name.
+        std::vector<std::string> recompileFunctions;
         std::vector<std::string> entryPointHints;
         std::unordered_map<uint32_t, uint32_t> mmioByInstructionAddress;
         std::vector<JumpTable> jumpTables;
