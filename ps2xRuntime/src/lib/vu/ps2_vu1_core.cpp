@@ -919,7 +919,9 @@ void VU1Interpreter::finishXgkick()
     if (!m_xgkick.active)
         return;
 
-    if (m_activeMemory)
+    if (m_kickSink)
+        m_kickSink(m_kickSinkUser, m_xgkick.packet.data(), m_xgkick.totalBytes);
+    else if (m_activeMemory)
         m_activeMemory->submitGifPacket(GifPathId::Path1, m_xgkick.packet.data(), m_xgkick.totalBytes);
     else if (m_activeGs)
         m_activeGs->processGIFPacket(m_xgkick.packet.data(), m_xgkick.totalBytes);

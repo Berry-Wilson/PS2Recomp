@@ -12,6 +12,8 @@
 
 #endif
 #include "runtime/ee_scheduler.h"
+#include "runtime/ps2_vu1_native.h"
+#include "runtime/gs/ps2_gif_arbiter.h"
 #include "ThreadNaming.h"
 #include "Kernel/Stubs/Audio.h"
 #include "Kernel/Stubs/GS.h"
@@ -95,6 +97,321 @@ struct ProgramHeader
 
 namespace
 {
+    // PS2X_VU1_DUMP_DIR / PS2X_VU0_DUMP_DIR: dump each distinct micro memory image seen when a
+    // microprogram starts and periodically log per-entry-point call counts, VU cycles and host time.
+    class VuProfiler
+    {
+    public:
+        static VuProfiler &vu1()
+        {
+            static VuProfiler s("PS2X_VU1_DUMP_DIR", "VU1", PS2_VU1_CODE_SIZE);
+            return s;
+        }
+        static VuProfiler &vu0()
+        {
+            static VuProfiler s("PS2X_VU0_DUMP_DIR", "VU0", PS2_VU0_CODE_SIZE);
+            return s;
+        }
+
+        bool enabled() const { return !m_dir.empty(); }
+
+        void record(const uint8_t *code, uint64_t generation, uint32_t startPC,
+                    uint64_t vuCycles, uint64_t hostNs)
+        {
+            if (generation != m_lastGeneration || !m_haveHash)
+            {
+                uint64_t h = 1469598103934665603ull;
+                for (uint32_t i = 0; i < m_codeSize; ++i)
+                    h = (h ^ code[i]) * 1099511628211ull;
+                m_hash = h;
+                m_haveHash = true;
+                m_lastGeneration = generation;
+                if (m_dumped.emplace(h, true).second)
+                {
+                    char path[512];
+                    std::snprintf(path, sizeof(path), "%s/%s_%016llx.bin", m_dir.c_str(), m_fileTag.c_str(),
+                                  static_cast<unsigned long long>(h));
+                    if (FILE *f = std::fopen(path, "wb"))
+                    {
+                        std::fwrite(code, 1, m_codeSize, f);
+                        std::fclose(f);
+                    }
+                }
+            }
+
+            Stat &s = m_stats[{m_hash, startPC}];
+            ++s.calls;
+            s.cycles += vuCycles;
+            s.ns += hostNs;
+            m_windowNs += hostNs;
+
+            const auto now = std::chrono::steady_clock::now();
+            if (now - m_lastReport >= std::chrono::seconds(5))
+            {
+                report(std::chrono::duration<double>(now - m_lastReport).count());
+                m_lastReport = now;
+                m_windowNs = 0;
+            }
+        }
+
+    private:
+        struct Key
+        {
+            uint64_t hash;
+            uint32_t pc;
+            bool operator==(const Key &o) const { return hash == o.hash && pc == o.pc; }
+        };
+        struct KeyHash
+        {
+            size_t operator()(const Key &k) const { return static_cast<size_t>(k.hash ^ (uint64_t(k.pc) * 0x9E3779B97F4A7C15ull)); }
+        };
+        struct Stat
+        {
+            uint64_t calls = 0;
+            uint64_t cycles = 0;
+            uint64_t ns = 0;
+        };
+
+        VuProfiler(const char *env, const char *tag, uint32_t codeSize)
+            : m_tag(tag), m_fileTag(tag), m_codeSize(codeSize)
+        {
+            if (const char *dir = std::getenv(env))
+                m_dir = dir;
+            std::transform(m_fileTag.begin(), m_fileTag.end(), m_fileTag.begin(),
+                           [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
+            m_lastReport = std::chrono::steady_clock::now();
+        }
+
+        void report(double windowSeconds)
+        {
+            std::fprintf(stderr, "[%sPROF] window %.1fs: %s host time %.1f%%\n", m_tag.c_str(), windowSeconds,
+                         m_tag.c_str(), 100.0 * double(m_windowNs) / (windowSeconds * 1e9));
+            for (const auto &[key, s] : m_stats)
+            {
+                std::fprintf(stderr, "[%sPROF]   code=%016llx pc=0x%04x calls=%llu cycles=%llu host_ms=%.1f\n",
+                             m_tag.c_str(), static_cast<unsigned long long>(key.hash), key.pc,
+                             static_cast<unsigned long long>(s.calls),
+                             static_cast<unsigned long long>(s.cycles), double(s.ns) / 1e6);
+            }
+            std::fflush(stderr);
+            m_stats.clear();
+        }
+
+        std::string m_dir;
+        std::string m_tag;
+        std::string m_fileTag;
+        uint32_t m_codeSize;
+        std::unordered_map<uint64_t, bool> m_dumped;
+        std::unordered_map<Key, Stat, KeyHash> m_stats;
+        std::chrono::steady_clock::time_point m_lastReport;
+        uint64_t m_lastGeneration = ~0ull;
+        uint64_t m_hash = 0;
+        uint64_t m_windowNs = 0;
+        bool m_haveHash = false;
+    };
+
+    // VU microprograms run as translated C++ (vu1n) when a translation matches micro memory,
+    // else in the interpreter. PS2X_VU1_NATIVE / PS2X_VU0_NATIVE = 0 forces the interpreter;
+    // = verify runs both on every call (the interpreter's results are kept) and logs any divergence.
+    enum class VuMode
+    {
+        Interpreter,
+        Native,
+        Verify
+    };
+
+    VuMode readVuMode(const char *env)
+    {
+        const char *e = std::getenv(env);
+        if (!e)
+            return VuMode::Native;
+        if (std::strcmp(e, "verify") == 0)
+            return VuMode::Verify;
+        return e[0] == '0' ? VuMode::Interpreter : VuMode::Native;
+    }
+
+    VuMode vu1Mode()
+    {
+        static const VuMode mode = readVuMode("PS2X_VU1_NATIVE");
+        return mode;
+    }
+
+    VuMode vu0Mode()
+    {
+        static const VuMode mode = readVuMode("PS2X_VU0_NATIVE");
+        return mode;
+    }
+
+    struct Vu1KickCapture
+    {
+        std::vector<std::vector<uint8_t>> packets;
+        PS2Memory *forward = nullptr;
+    };
+
+    void vu1CaptureKick(void *user, const uint8_t *packet, uint32_t bytes)
+    {
+        auto *capture = static_cast<Vu1KickCapture *>(user);
+        capture->packets.emplace_back(packet, packet + bytes);
+        if (capture->forward)
+            capture->forward->submitGifPacket(GifPathId::Path1, packet, bytes);
+    }
+
+    void vu1SubmitKick(void *user, const uint8_t *packet, uint32_t bytes)
+    {
+        static_cast<PS2Memory *>(user)->submitGifPacket(GifPathId::Path1, packet, bytes);
+    }
+
+    // Returns a description of the differences between the translated and interpreted runs.
+    std::string vuDiff(const VU1State &n, const VU1State &i, const uint8_t *nData, const uint8_t *iData,
+                       uint32_t dataSize, const Vu1KickCapture &nKicks, const Vu1KickCapture &iKicks)
+    {
+        std::ostringstream out;
+        int reported = 0;
+        auto note = [&](const std::string &s)
+        {
+            if (reported++ < 8)
+                out << ' ' << s;
+        };
+        char buf[160];
+        for (int r = 1; r < 32; ++r)
+            for (int l = 0; l < 4; ++l)
+                if (std::memcmp(&n.vf[r][l], &i.vf[r][l], 4) != 0)
+                {
+                    uint32_t a, b;
+                    std::memcpy(&a, &n.vf[r][l], 4);
+                    std::memcpy(&b, &i.vf[r][l], 4);
+                    std::snprintf(buf, sizeof(buf), "vf%d.%c=%08x/%08x", r, "xyzw"[l], a, b);
+                    note(buf);
+                }
+        for (int r = 1; r < 16; ++r)
+            if (n.vi[r] != i.vi[r])
+            {
+                std::snprintf(buf, sizeof(buf), "vi%d=%d/%d", r, n.vi[r], i.vi[r]);
+                note(buf);
+            }
+        if (std::memcmp(n.acc, i.acc, sizeof(n.acc)) != 0)
+            note("acc");
+        if (std::memcmp(&n.q, &i.q, 4) != 0 || std::memcmp(&n.p, &i.p, 4) != 0 || std::memcmp(&n.i, &i.i, 4) != 0)
+            note("q/p/i");
+        if ((n.mac & 0xFFFFu) != (i.mac & 0xFFFFu) || n.clip != i.clip)
+        {
+            std::snprintf(buf, sizeof(buf), "mac=%04x/%04x clip=%06x/%06x", n.mac & 0xFFFFu, i.mac & 0xFFFFu, n.clip, i.clip);
+            note(buf);
+        }
+        if (n.pc != i.pc)
+        {
+            std::snprintf(buf, sizeof(buf), "pc=%04x/%04x", n.pc, i.pc);
+            note(buf);
+        }
+        for (uint32_t off = 0; off < dataSize; off += 16)
+            if (std::memcmp(nData + off, iData + off, 16) != 0)
+            {
+                std::snprintf(buf, sizeof(buf), "data@%04x", off);
+                note(buf);
+                break;
+            }
+        if (nKicks.packets.size() != iKicks.packets.size())
+        {
+            std::snprintf(buf, sizeof(buf), "kicks=%zu/%zu", nKicks.packets.size(), iKicks.packets.size());
+            note(buf);
+        }
+        else
+            for (size_t k = 0; k < nKicks.packets.size(); ++k)
+                if (nKicks.packets[k] != iKicks.packets[k])
+                {
+                    std::snprintf(buf, sizeof(buf), "kick%zu(%zu/%zu bytes)", k, nKicks.packets[k].size(), iKicks.packets[k].size());
+                    note(buf);
+                    break;
+                }
+        return out.str();
+    }
+
+    void runVu1Program(VU1Interpreter &vu1, PS2Memory &memory, GS &gs, bool resume,
+                       uint32_t startPC, uint32_t top, uint32_t itop)
+    {
+        uint8_t *code = memory.getVU1Code();
+        uint8_t *data = memory.getVU1Data();
+        const uint64_t generation = memory.getVU1CodeGeneration();
+        if (resume)
+            startPC = vu1.state().pc;
+        auto interpret = [&]
+        {
+            if (resume)
+                vu1.resume(code, PS2_VU1_CODE_SIZE, data, PS2_VU1_DATA_SIZE, gs, &memory, top, itop, 65536);
+            else
+                vu1.execute(code, PS2_VU1_CODE_SIZE, data, PS2_VU1_DATA_SIZE, gs, &memory, startPC, top, itop, 65536);
+        };
+        auto logUntranslated = [&]
+        {
+            static std::unordered_map<uint64_t, bool> seen;
+            const uint64_t key = (generation << 16) | startPC;
+            if (seen.emplace(key, true).second && seen.size() <= 64)
+                std::fprintf(stderr, "[VU1N] no translation for entry pc=0x%04x (code generation %llu); interpreting\n",
+                             startPC, static_cast<unsigned long long>(generation));
+        };
+
+        const VuMode mode = vu1Mode();
+        if (mode == VuMode::Interpreter)
+        {
+            interpret();
+            return;
+        }
+
+        if (mode == VuMode::Native)
+        {
+            const vu1n::RunResult r = vu1n::run(vu1n::Unit::VU1, vu1.state(), code, generation, data, startPC, top, itop,
+                                                65536, vu1SubmitKick, &memory);
+            if (r == vu1n::RunResult::NotTranslated)
+            {
+                logUntranslated();
+                interpret();
+            }
+            else if (r == vu1n::RunResult::Bailed)
+            {
+                vu1.resetPipelines();
+                vu1.resume(code, PS2_VU1_CODE_SIZE, data, PS2_VU1_DATA_SIZE, gs, &memory, top, itop, 65536);
+            }
+            return;
+        }
+
+        static uint64_t verified = 0, mismatches = 0, skipped = 0;
+        static auto lastReport = std::chrono::steady_clock::now();
+        VU1State nativeState = vu1.state();
+        std::vector<uint8_t> nativeData(data, data + PS2_VU1_DATA_SIZE);
+        Vu1KickCapture nativeKicks;
+        const vu1n::RunResult r = vu1n::run(vu1n::Unit::VU1, nativeState, code, generation, nativeData.data(), startPC,
+                                            top, itop, 65536, vu1CaptureKick, &nativeKicks);
+        Vu1KickCapture interpKicks;
+        interpKicks.forward = &memory;
+        vu1.setXgkickSink(vu1CaptureKick, &interpKicks);
+        interpret();
+        vu1.setXgkickSink(nullptr, nullptr);
+
+        if (r != vu1n::RunResult::Done)
+        {
+            if (r == vu1n::RunResult::NotTranslated)
+                logUntranslated();
+            ++skipped;
+        }
+        else
+        {
+            ++verified;
+            const std::string diff = vuDiff(nativeState, vu1.state(), nativeData.data(), data, PS2_VU1_DATA_SIZE,
+                                            nativeKicks, interpKicks);
+            if (!diff.empty() && ++mismatches <= 40)
+                std::fprintf(stderr, "[VU1VERIFY] mismatch entry=0x%04x gen=%llu native/interp:%s\n", startPC,
+                             static_cast<unsigned long long>(generation), diff.c_str());
+        }
+        const auto now = std::chrono::steady_clock::now();
+        if (now - lastReport >= std::chrono::seconds(5))
+        {
+            lastReport = now;
+            std::fprintf(stderr, "[VU1VERIFY] verified=%llu mismatches=%llu skipped=%llu\n",
+                         static_cast<unsigned long long>(verified), static_cast<unsigned long long>(mismatches),
+                         static_cast<unsigned long long>(skipped));
+        }
+    }
+
     constexpr uint32_t kGuestHeapDefaultBase = 0x00100000u;
     constexpr uint32_t kGuestHeapDefaultAlignment = 16u;
     constexpr uint32_t kGuestHeapSafetyPad = 0x1000u;
@@ -777,9 +1094,18 @@ bool PS2Runtime::syncCoreSubsystems()
                                          (cpuContext->vu0_fbrst & (1u << 10)) != 0u;
                                      m_vu1.state().tBitEnabled =
                                          (cpuContext->vu0_fbrst & (1u << 11)) != 0u;
-                                     m_vu1.execute(m_memory.getVU1Code(), PS2_VU1_CODE_SIZE,
-                                                   m_memory.getVU1Data(), PS2_VU1_DATA_SIZE,
-                                                   m_gs, &m_memory, startPC, top, itop, 65536);
+                                     VuProfiler &prof = VuProfiler::vu1();
+                                     const auto t0 = std::chrono::steady_clock::now();
+                                     const uint64_t cycles0 = m_vu1.state().cycles;
+                                     runVu1Program(m_vu1, m_memory, m_gs, false, startPC, top, itop);
+                                     if (prof.enabled())
+                                     {
+                                         const auto ns = std::chrono::duration_cast<std::chrono::nanoseconds>(
+                                                             std::chrono::steady_clock::now() - t0)
+                                                             .count();
+                                         prof.record(m_memory.getVU1Code(), m_memory.getVU1CodeGeneration(),
+                                                     startPC, m_vu1.state().cycles - cycles0, static_cast<uint64_t>(ns));
+                                     }
                                      cpuContext->vu0_vpu_stat =
                                          (cpuContext->vu0_vpu_stat & ~0x0600u) |
                                          (m_vu1.state().stoppedByD ? 0x0200u : 0u) |
@@ -795,9 +1121,7 @@ bool PS2Runtime::syncCoreSubsystems()
                                          (cpuContext->vu0_fbrst & (1u << 10)) != 0u;
                                      m_vu1.state().tBitEnabled =
                                          (cpuContext->vu0_fbrst & (1u << 11)) != 0u;
-                                     m_vu1.resume(m_memory.getVU1Code(), PS2_VU1_CODE_SIZE,
-                                                  m_memory.getVU1Data(), PS2_VU1_DATA_SIZE,
-                                                  m_gs, &m_memory, top, itop, 65536);
+                                     runVu1Program(m_vu1, m_memory, m_gs, true, 0u, top, itop);
                                      cpuContext->vu0_vpu_stat =
                                          (cpuContext->vu0_vpu_stat & ~0x0600u) |
                                          (m_vu1.state().stoppedByD ? 0x0200u : 0u) |
@@ -1543,13 +1867,89 @@ void PS2Runtime::executeVU0Microprogram(uint8_t *rdram, R5900Context *ctx, uint3
         return;
     }
 
+    VuProfiler &prof = VuProfiler::vu0();
+    const auto t0 = std::chrono::steady_clock::now();
+    constexpr uint32_t kVu0Budget = 4096;
+    const uint64_t generation = m_memory.getVU0CodeGeneration();
     m_vu0.reset();
     copyVu0ContextToState(ctx, m_vu0.state());
-    m_vu0.execute(vu0Code, PS2_VU0_CODE_SIZE,
-                  vu0Data, PS2_VU0_DATA_SIZE,
-                  m_gs, &m_memory,
-                  startPC, 0u, ctx->vu0_itop, 4096);
+    auto interpret = [&]
+    {
+        m_vu0.execute(vu0Code, PS2_VU0_CODE_SIZE, vu0Data, PS2_VU0_DATA_SIZE, m_gs, &m_memory,
+                      startPC, 0u, ctx->vu0_itop, kVu0Budget);
+    };
+    auto logUntranslated = [&]
+    {
+        static std::unordered_map<uint64_t, bool> seen;
+        if (seen.emplace((generation << 16) | startPC, true).second && seen.size() <= 64)
+            std::fprintf(stderr, "[VU0N] no translation for entry pc=0x%04x (code generation %llu); interpreting\n",
+                         startPC, static_cast<unsigned long long>(generation));
+    };
+
+    const VuMode mode = vu0Mode();
+    if (mode == VuMode::Interpreter)
+    {
+        interpret();
+    }
+    else if (mode == VuMode::Native)
+    {
+        VU1State &state = m_vu0.state();
+        const vu1n::RunResult r = vu1n::run(vu1n::Unit::VU0, state, vu0Code, generation, vu0Data, startPC, 0u,
+                                            ctx->vu0_itop, kVu0Budget, nullptr, nullptr);
+        if (r == vu1n::RunResult::NotTranslated)
+        {
+            logUntranslated();
+            interpret();
+        }
+        else if (r == vu1n::RunResult::Bailed)
+        {
+            const uint32_t used = static_cast<uint32_t>(std::min<uint64_t>(state.cycles, kVu0Budget));
+            m_vu0.resetPipelines();
+            m_vu0.resume(vu0Code, PS2_VU0_CODE_SIZE, vu0Data, PS2_VU0_DATA_SIZE, m_gs, &m_memory, 0u,
+                         ctx->vu0_itop, kVu0Budget - used);
+        }
+    }
+    else
+    {
+        static uint64_t verified = 0, mismatches = 0, skipped = 0;
+        static auto lastReport = std::chrono::steady_clock::now();
+        VU1State nativeState = m_vu0.state();
+        std::vector<uint8_t> nativeData(vu0Data, vu0Data + PS2_VU0_DATA_SIZE);
+        const vu1n::RunResult r = vu1n::run(vu1n::Unit::VU0, nativeState, vu0Code, generation, nativeData.data(),
+                                            startPC, 0u, ctx->vu0_itop, kVu0Budget, nullptr, nullptr);
+        interpret();
+        if (r != vu1n::RunResult::Done)
+        {
+            if (r == vu1n::RunResult::NotTranslated)
+                logUntranslated();
+            ++skipped;
+        }
+        else
+        {
+            ++verified;
+            const Vu1KickCapture noKicks;
+            const std::string diff = vuDiff(nativeState, m_vu0.state(), nativeData.data(), vu0Data, PS2_VU0_DATA_SIZE,
+                                            noKicks, noKicks);
+            if (!diff.empty() && ++mismatches <= 40)
+                std::fprintf(stderr, "[VU0VERIFY] mismatch entry=0x%04x gen=%llu native/interp:%s\n", startPC,
+                             static_cast<unsigned long long>(generation), diff.c_str());
+        }
+        const auto now = std::chrono::steady_clock::now();
+        if (now - lastReport >= std::chrono::seconds(5))
+        {
+            lastReport = now;
+            std::fprintf(stderr, "[VU0VERIFY] verified=%llu mismatches=%llu skipped=%llu\n",
+                         static_cast<unsigned long long>(verified), static_cast<unsigned long long>(mismatches),
+                         static_cast<unsigned long long>(skipped));
+        }
+    }
     copyVu0StateToContext(m_vu0.state(), ctx);
+    if (prof.enabled())
+    {
+        const auto ns = std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - t0).count();
+        prof.record(vu0Code, m_memory.getVU0CodeGeneration(), startPC, m_vu0.state().cycles,
+                    static_cast<uint64_t>(ns));
+    }
 }
 
 void PS2Runtime::vu0StartMicroProgram(uint8_t *rdram, R5900Context *ctx, uint32_t address)

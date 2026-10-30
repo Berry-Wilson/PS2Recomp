@@ -62,7 +62,21 @@ public:
     VU1State &state() { return m_state; }
     const VU1State &state() const { return m_state; }
 
+    // When set, finished XGKICK packets go to the sink instead of the GIF.
+    using XgkickSink = void (*)(void *user, const uint8_t *packet, uint32_t bytes);
+    void setXgkickSink(XgkickSink sink, void *user)
+    {
+        m_kickSink = sink;
+        m_kickSinkUser = user;
+    }
+
+    // Re-derive pipeline state from VU1State after code outside the interpreter changed it.
+    void resetPipelines() { resetScheduler(); }
+
 private:
+    XgkickSink m_kickSink = nullptr;
+    void *m_kickSinkUser = nullptr;
+
     enum Pipeline : uint8_t
     {
         PipelineNone = 0,
