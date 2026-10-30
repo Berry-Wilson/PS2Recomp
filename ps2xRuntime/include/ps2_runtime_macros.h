@@ -522,6 +522,242 @@ inline void ps2_vu0_rsqrt(R5900Context *ctx, float fs, float ft)
     ps2_vu0_fdiv_status(ctx, std::signbit(ft), false);
 }
 
+// EE MMI multiply/divide. LO and HI are 128 bits on the EE: words 0-1 live in lo/hi (shared with
+// MULT/DIV) and words 2-3 in lo1/hi1 (shared with MULT1/DIV1). The parallel ops write separate
+// products into separate words, and PMFHL picks words or halfwords back out of both registers.
+struct Ps2LoHi
+{
+    int32_t lo[4];
+    int32_t hi[4];
+};
+
+inline Ps2LoHi ps2_lohi_get(const R5900Context *ctx)
+{
+    Ps2LoHi r;
+    r.lo[0] = static_cast<int32_t>(ctx->lo);
+    r.lo[1] = static_cast<int32_t>(ctx->lo >> 32);
+    r.lo[2] = static_cast<int32_t>(ctx->lo1);
+    r.lo[3] = static_cast<int32_t>(ctx->lo1 >> 32);
+    r.hi[0] = static_cast<int32_t>(ctx->hi);
+    r.hi[1] = static_cast<int32_t>(ctx->hi >> 32);
+    r.hi[2] = static_cast<int32_t>(ctx->hi1);
+    r.hi[3] = static_cast<int32_t>(ctx->hi1 >> 32);
+    return r;
+}
+
+inline void ps2_lohi_set(R5900Context *ctx, const Ps2LoHi &r)
+{
+    auto pack = [](int32_t a, int32_t b)
+    { return static_cast<uint64_t>(static_cast<uint32_t>(a)) | (static_cast<uint64_t>(static_cast<uint32_t>(b)) << 32); };
+    ctx->lo = pack(r.lo[0], r.lo[1]);
+    ctx->lo1 = pack(r.lo[2], r.lo[3]);
+    ctx->hi = pack(r.hi[0], r.hi[1]);
+    ctx->hi1 = pack(r.hi[2], r.hi[3]);
+}
+
+inline __m128i ps2_words_vec(int32_t w0, int32_t w1, int32_t w2, int32_t w3)
+{
+    return _mm_set_epi32(w3, w2, w1, w0);
+}
+
+// Signed 16x16 products of all eight halfword lanes.
+inline void ps2_halfword_products(__m128i rs, __m128i rt, int32_t p[8])
+{
+    alignas(16) int16_t a[8], b[8];
+    _mm_store_si128(reinterpret_cast<__m128i *>(a), rs);
+    _mm_store_si128(reinterpret_cast<__m128i *>(b), rt);
+    for (int i = 0; i < 8; ++i)
+        p[i] = static_cast<int32_t>(a[i]) * static_cast<int32_t>(b[i]);
+}
+
+// PMULTH/PMADDH/PMSUBH: products 0,1,4,5 go to LO words 0-3 and 2,3,6,7 to HI words 0-3;
+// rd receives LO0, HI0, LO2, HI2. sign: 0 = multiply, +1 = add, -1 = subtract.
+inline __m128i ps2_pmulth_family(R5900Context *ctx, __m128i rs, __m128i rt, int sign)
+{
+    int32_t p[8];
+    ps2_halfword_products(rs, rt, p);
+    Ps2LoHi r = sign == 0 ? Ps2LoHi{} : ps2_lohi_get(ctx);
+    static constexpr int kLo[4] = {0, 1, 4, 5}, kHi[4] = {2, 3, 6, 7};
+    for (int w = 0; w < 4; ++w)
+    {
+        const int32_t pl = p[kLo[w]], ph = p[kHi[w]];
+        r.lo[w] = sign < 0 ? r.lo[w] - pl : sign > 0 ? r.lo[w] + pl : pl;
+        r.hi[w] = sign < 0 ? r.hi[w] - ph : sign > 0 ? r.hi[w] + ph : ph;
+    }
+    ps2_lohi_set(ctx, r);
+    return ps2_words_vec(r.lo[0], r.hi[0], r.lo[2], r.hi[2]);
+}
+
+// PHMADH (sub = false) / PHMSBH (sub = true): pairwise sums (or odd - even differences) into
+// LO0, HI0, LO2, HI2; rd receives the same four words.
+inline __m128i ps2_phmadh(R5900Context *ctx, __m128i rs, __m128i rt, bool sub)
+{
+    int32_t p[8];
+    ps2_halfword_products(rs, rt, p);
+    Ps2LoHi r = ps2_lohi_get(ctx);
+    auto pair = [&](int i)
+    { return sub ? p[i + 1] - p[i] : p[i + 1] + p[i]; };
+    r.lo[0] = pair(0);
+    r.hi[0] = pair(2);
+    r.lo[2] = pair(4);
+    r.hi[2] = pair(6);
+    ps2_lohi_set(ctx, r);
+    return ps2_words_vec(r.lo[0], r.hi[0], r.lo[2], r.hi[2]);
+}
+
+// PMULTW/PMULTUW/PMADDW/PMADDUW/PMSUBW: 32x32 products of words 0 and 2. Each 64-bit result
+// (accumulated with HI:LO of its lane) is split into LO and HI words, each sign-extended to 64
+// bits; rd receives the two 64-bit results.
+inline __m128i ps2_pmultw_family(R5900Context *ctx, __m128i rs, __m128i rt, bool isUnsigned, int sign)
+{
+    alignas(16) int32_t a[4], b[4];
+    _mm_store_si128(reinterpret_cast<__m128i *>(a), rs);
+    _mm_store_si128(reinterpret_cast<__m128i *>(b), rt);
+    Ps2LoHi r = ps2_lohi_get(ctx);
+    int64_t out[2];
+    for (int lane = 0; lane < 2; ++lane)
+    {
+        const int w = lane * 2;
+        const int64_t prod = isUnsigned
+                                 ? static_cast<int64_t>(static_cast<uint64_t>(static_cast<uint32_t>(a[w])) *
+                                                        static_cast<uint64_t>(static_cast<uint32_t>(b[w])))
+                                 : static_cast<int64_t>(a[w]) * static_cast<int64_t>(b[w]);
+        const int64_t acc = static_cast<int64_t>((static_cast<uint64_t>(static_cast<uint32_t>(r.hi[w])) << 32) |
+                                                 static_cast<uint32_t>(r.lo[w]));
+        const int64_t res = sign == 0 ? prod : sign > 0 ? acc + prod : acc - prod;
+        r.lo[w] = static_cast<int32_t>(res);
+        r.lo[w + 1] = r.lo[w] < 0 ? -1 : 0;
+        r.hi[w] = static_cast<int32_t>(res >> 32);
+        r.hi[w + 1] = r.hi[w] < 0 ? -1 : 0;
+        out[lane] = res;
+    }
+    ps2_lohi_set(ctx, r);
+    return _mm_set_epi64x(out[1], out[0]);
+}
+
+// PDIVW/PDIVUW: words 0 and 2 of rs divided by the same words of rt; quotient to LO, remainder
+// to HI, each sign-extended to 64 bits. Division by zero leaves the EE's documented results.
+inline void ps2_pdivw(R5900Context *ctx, __m128i rs, __m128i rt, bool isUnsigned)
+{
+    alignas(16) int32_t a[4], b[4];
+    _mm_store_si128(reinterpret_cast<__m128i *>(a), rs);
+    _mm_store_si128(reinterpret_cast<__m128i *>(b), rt);
+    Ps2LoHi r = ps2_lohi_get(ctx);
+    for (int w = 0; w < 4; w += 2)
+    {
+        int32_t q, m;
+        if (isUnsigned)
+        {
+            const uint32_t ua = static_cast<uint32_t>(a[w]), ub = static_cast<uint32_t>(b[w]);
+            q = ub ? static_cast<int32_t>(ua / ub) : -1;
+            m = ub ? static_cast<int32_t>(ua % ub) : a[w];
+        }
+        else if (b[w] == 0)
+        {
+            q = a[w] < 0 ? 1 : -1;
+            m = a[w];
+        }
+        else if (b[w] == -1 && a[w] == INT32_MIN)
+        {
+            q = INT32_MIN;
+            m = 0;
+        }
+        else
+        {
+            q = a[w] / b[w];
+            m = a[w] % b[w];
+        }
+        r.lo[w] = q;
+        r.lo[w + 1] = q < 0 ? -1 : 0;
+        r.hi[w] = m;
+        r.hi[w + 1] = m < 0 ? -1 : 0;
+    }
+    ps2_lohi_set(ctx, r);
+}
+
+// PDIVBW: all four words of rs divided by halfword 0 of rt; quotients to LO words, remainders to
+// HI words.
+inline void ps2_pdivbw(R5900Context *ctx, __m128i rs, __m128i rt)
+{
+    alignas(16) int32_t a[4];
+    _mm_store_si128(reinterpret_cast<__m128i *>(a), rs);
+    const int32_t d = static_cast<int16_t>(_mm_cvtsi128_si32(rt));
+    Ps2LoHi r;
+    for (int w = 0; w < 4; ++w)
+    {
+        if (d == 0)
+        {
+            r.lo[w] = a[w] < 0 ? 1 : -1;
+            r.hi[w] = a[w];
+        }
+        else if (d == -1 && a[w] == INT32_MIN)
+        {
+            r.lo[w] = INT32_MIN;
+            r.hi[w] = 0;
+        }
+        else
+        {
+            r.lo[w] = a[w] / d;
+            r.hi[w] = a[w] % d;
+        }
+    }
+    ps2_lohi_set(ctx, r);
+}
+
+inline int32_t ps2_sat32(int64_t v)
+{
+    return v > INT32_MAX ? INT32_MAX : v < INT32_MIN ? INT32_MIN : static_cast<int32_t>(v);
+}
+
+inline int16_t ps2_sat16(int32_t v)
+{
+    return static_cast<int16_t>(v > 32767 ? 32767 : v < -32768 ? -32768 : v);
+}
+
+// PMFHL: variant 0 LW, 1 UW, 2 SLW, 3 LH, 4 SH.
+inline __m128i ps2_pmfhl(const R5900Context *ctx, int variant)
+{
+    const Ps2LoHi r = ps2_lohi_get(ctx);
+    switch (variant)
+    {
+    case 0:
+        return ps2_words_vec(r.lo[0], r.hi[0], r.lo[2], r.hi[2]);
+    case 1:
+        return ps2_words_vec(r.lo[1], r.hi[1], r.lo[3], r.hi[3]);
+    case 2:
+    {
+        auto lane = [&](int w)
+        {
+            const int64_t v = static_cast<int64_t>((static_cast<uint64_t>(static_cast<uint32_t>(r.hi[w])) << 32) |
+                                                   static_cast<uint32_t>(r.lo[w]));
+            return static_cast<int64_t>(ps2_sat32(v));
+        };
+        return _mm_set_epi64x(lane(2), lane(0));
+    }
+    case 3:
+        return _mm_setr_epi16(static_cast<int16_t>(r.lo[0]), static_cast<int16_t>(r.lo[1]),
+                              static_cast<int16_t>(r.hi[0]), static_cast<int16_t>(r.hi[1]),
+                              static_cast<int16_t>(r.lo[2]), static_cast<int16_t>(r.lo[3]),
+                              static_cast<int16_t>(r.hi[2]), static_cast<int16_t>(r.hi[3]));
+    default:
+        return _mm_setr_epi16(ps2_sat16(r.lo[0]), ps2_sat16(r.lo[1]), ps2_sat16(r.hi[0]), ps2_sat16(r.hi[1]),
+                              ps2_sat16(r.lo[2]), ps2_sat16(r.lo[3]), ps2_sat16(r.hi[2]), ps2_sat16(r.hi[3]));
+    }
+}
+
+// PMTHL.LW: rs words 0-3 to LO0, HI0, LO2, HI2.
+inline void ps2_pmthl_lw(R5900Context *ctx, __m128i rs)
+{
+    alignas(16) int32_t a[4];
+    _mm_store_si128(reinterpret_cast<__m128i *>(a), rs);
+    Ps2LoHi r = ps2_lohi_get(ctx);
+    r.lo[0] = a[0];
+    r.hi[0] = a[1];
+    r.lo[2] = a[2];
+    r.hi[2] = a[3];
+    ps2_lohi_set(ctx, r);
+}
+
 // VFTOI: float to int32 with saturation (the host conversion returns 0x80000000 for every overflow).
 inline __m128i ps2_vftoi(__m128 v)
 {
@@ -879,8 +1115,9 @@ inline __m128i ps2_psubsw(__m128i a, __m128i b)
 #define PS2_PCEQB(a, b) _mm_cmpeq_epi8((__m128i)(a), (__m128i)(b))
 
 // Packed Absolute (PABS)
-#define PS2_PABSW(a) _mm_abs_epi32((__m128i)(a))
-#define PS2_PABSH(a) _mm_abs_epi16((__m128i)(a))
+// PABSW/PABSH saturate: the absolute value of the most negative number is the most positive one.
+#define PS2_PABSW(a) _mm_min_epu32(_mm_abs_epi32((__m128i)(a)), _mm_set1_epi32(0x7FFFFFFF))
+#define PS2_PABSH(a) _mm_min_epu16(_mm_abs_epi16((__m128i)(a)), _mm_set1_epi16(0x7FFF))
 #define PS2_PABSB(a) _mm_abs_epi8((__m128i)(a))
 
 // Packed Pack (PPAC) - Packs larger elements into smaller ones
@@ -930,16 +1167,43 @@ inline __m128i ps2_ppacb(__m128i rs, __m128i rt)
 #define PS2_PPACB(a, b) ps2_ppacb((__m128i)(a), (__m128i)(b))
 
 // Packed Interleave (PINT)
-#define PS2_PINTH(a, b) _mm_unpacklo_epi16(_mm_shuffle_epi32((__m128i)(b), _MM_SHUFFLE(3, 2, 1, 0)), _mm_shuffle_epi32((__m128i)(a), _MM_SHUFFLE(3, 2, 1, 0)))
-#define PS2_PINTEH(a, b) _mm_unpackhi_epi16(_mm_shuffle_epi32((__m128i)(b), _MM_SHUFFLE(3, 2, 1, 0)), _mm_shuffle_epi32((__m128i)(a), _MM_SHUFFLE(3, 2, 1, 0)))
+// PINTH rd, rs, rt: rt's lower four halfwords interleaved with rs's upper four
+// (rd = rt.h0, rs.h4, rt.h1, rs.h5, ...).
+#define PS2_PINTH(a, b) _mm_unpacklo_epi16((__m128i)(b), _mm_srli_si128((__m128i)(a), 8))
+// PINTEH rd, rs, rt: the even halfwords of rt and rs interleaved (rd.h2i = rt.h2i, rd.h2i+1 = rs.h2i).
+#define PS2_PINTEH(a, b) _mm_or_si128(_mm_and_si128((__m128i)(b), _mm_set1_epi32(0xFFFF)), _mm_slli_epi32((__m128i)(a), 16))
 
 // Packed Multiply-Add (PMADD)
 #define PS2_PMADDW(a, b) _mm_add_epi32(_mm_mullo_epi32(_mm_shuffle_epi32((__m128i)(a), _MM_SHUFFLE(1, 0, 3, 2)), _mm_shuffle_epi32((__m128i)(b), _MM_SHUFFLE(1, 0, 3, 2))), _mm_mullo_epi32(_mm_shuffle_epi32((__m128i)(a), _MM_SHUFFLE(3, 2, 1, 0)), _mm_shuffle_epi32((__m128i)(b), _MM_SHUFFLE(3, 2, 1, 0))))
 
 // Packed Variable Shifts
-#define PS2_PSLLVW(a, b) _mm_custom_sllv_epi32((__m128i)(a), (__m128i)(b))
-#define PS2_PSRLVW(a, b) _mm_custom_srlv_epi32((__m128i)(a), (__m128i)(b))
-#define PS2_PSRAVW(a, b) _mm_custom_srav_epi32((__m128i)(a), (__m128i)(b))
+// PSLLVW/PSRLVW/PSRAVW rd, rt, rs: words 0 and 2 of rt shifted by the low 5 bits of the same words
+// of rs; each 32-bit result is sign-extended into its 64-bit half. Call sites pass (rs, rt).
+// kind: 0 = left logical, 1 = right logical, 2 = right arithmetic.
+inline __m128i ps2_pshiftvw(__m128i rs, __m128i rt, int kind)
+{
+    alignas(16) int32_t v[4], c[4];
+    _mm_store_si128(reinterpret_cast<__m128i *>(v), rt);
+    _mm_store_si128(reinterpret_cast<__m128i *>(c), rs);
+    int64_t out[2];
+    for (int lane = 0; lane < 2; ++lane)
+    {
+        const int w = lane * 2;
+        const uint32_t s = static_cast<uint32_t>(c[w]) & 0x1Fu;
+        int32_t r;
+        if (kind == 0)
+            r = static_cast<int32_t>(static_cast<uint32_t>(v[w]) << s);
+        else if (kind == 1)
+            r = static_cast<int32_t>(static_cast<uint32_t>(v[w]) >> s);
+        else
+            r = v[w] >> s;
+        out[lane] = r;
+    }
+    return _mm_set_epi64x(out[1], out[0]);
+}
+#define PS2_PSLLVW(rs, rt) ps2_pshiftvw((__m128i)(rs), (__m128i)(rt), 0)
+#define PS2_PSRLVW(rs, rt) ps2_pshiftvw((__m128i)(rs), (__m128i)(rt), 1)
+#define PS2_PSRAVW(rs, rt) ps2_pshiftvw((__m128i)(rs), (__m128i)(rt), 2)
 
 inline __m128i _mm_custom_sllv_epi32(__m128i a, __m128i count)
 {
@@ -1131,9 +1395,11 @@ inline __m128i ps2_qfsrv(__m128i rs, __m128i rt, uint32_t sa)
 }
 #define PS2_QFSRV(rs, rt, sa) ps2_qfsrv((__m128i)(rs), (__m128i)(rt), (uint32_t)(sa))
 #define PS2_PCPYLD(rs, rt) _mm_unpacklo_epi64(rt, rs)
-#define PS2_PEXEH(rs) _mm_shufflelo_epi16(_mm_shufflehi_epi16(rs, _MM_SHUFFLE(2, 3, 0, 1)), _MM_SHUFFLE(2, 3, 0, 1))
-#define PS2_PEXEW(rs) _mm_shuffle_epi32(rs, _MM_SHUFFLE(2, 3, 0, 1))
-#define PS2_PROT3W(rs) _mm_shuffle_epi32(rs, _MM_SHUFFLE(0, 3, 2, 1))
+// PEXEH swaps halfwords 0<->2 and 4<->6; PEXEW swaps words 0<->2; PROT3W rotates words 0-2
+// (rd = rt.w1, rt.w2, rt.w0, rt.w3).
+#define PS2_PEXEH(rs) _mm_shufflelo_epi16(_mm_shufflehi_epi16(rs, _MM_SHUFFLE(3, 0, 1, 2)), _MM_SHUFFLE(3, 0, 1, 2))
+#define PS2_PEXEW(rs) _mm_shuffle_epi32(rs, _MM_SHUFFLE(3, 0, 1, 2))
+#define PS2_PROT3W(rs) _mm_shuffle_epi32(rs, _MM_SHUFFLE(3, 0, 2, 1))
 
 // Additional VU0 operations
 #define PS2_VSQRT(x) sqrtf(x)
