@@ -23,6 +23,8 @@ struct GSParallelBackend::Impl
     // Field parity for interlaced scanout. parallel-gs deinterlaces from a history of
     // fields and expects consecutive vsyncs to alternate between phase 0 and 1.
     uint32_t fieldPhase = 0;
+    // Host-visible copy of the scanout image, reused across presents.
+    Vulkan::BufferHandle readback;
 
     bool init();
     void processGif(uint32_t path, const uint8_t *data, uint32_t sizeBytes);
@@ -211,27 +213,34 @@ PresentationFrame GSParallelBackend::Impl::present(const GSPresentationRequest &
                                VK_PIPELINE_STAGE_2_FRAGMENT_SHADER_BIT, 0,
                                VK_PIPELINE_STAGE_2_COPY_BIT, VK_ACCESS_2_TRANSFER_READ_BIT);
 
-            Vulkan::BufferCreateInfo bufinfo = {};
-            bufinfo.size = static_cast<VkDeviceSize>(width) * height * sizeof(uint32_t);
-            bufinfo.usage = VK_BUFFER_USAGE_TRANSFER_DST_BIT;
-            bufinfo.domain = Vulkan::BufferDomain::CachedHost;
-            auto readback = device.create_buffer(bufinfo);
+            const VkDeviceSize bytes = static_cast<VkDeviceSize>(width) * height * sizeof(uint32_t);
+            if (!readback || readback->get_create_info().size < bytes)
+            {
+                Vulkan::BufferCreateInfo bufinfo = {};
+                bufinfo.size = bytes;
+                bufinfo.usage = VK_BUFFER_USAGE_TRANSFER_DST_BIT;
+                bufinfo.domain = Vulkan::BufferDomain::CachedHost;
+                readback = device.create_buffer(bufinfo);
+            }
 
             cmd->copy_image_to_buffer(*readback, *scanout.image, 0, {},
                                       { width, height, 1 },
                                       0, 0, { VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1 });
             cmd->barrier(VK_PIPELINE_STAGE_2_COPY_BIT, VK_ACCESS_2_TRANSFER_WRITE_BIT,
                          VK_PIPELINE_STAGE_2_HOST_BIT, VK_ACCESS_2_HOST_READ_BIT);
-            device.submit(cmd);
-            device.wait_idle();
+            // Wait for this copy only. Device::wait_idle() would also free Granite's buffer pools,
+            // forcing every later command buffer to allocate fresh uniform/staging VkBuffers.
+            Vulkan::Fence fence;
+            device.submit(cmd, &fence);
+            fence->wait();
 
             const auto *mapped = static_cast<const uint8_t *>(device.map_host_buffer(*readback, Vulkan::MEMORY_ACCESS_READ_BIT));
             if (mapped)
             {
                 result.width = width;
                 result.height = height;
-                result.pixels.resize(bufinfo.size);
-                std::memcpy(result.pixels.data(), mapped, bufinfo.size);
+                result.pixels.resize(bytes);
+                std::memcpy(result.pixels.data(), mapped, bytes);
 
                 // Scanout alpha is not meaningful for presentation.
                 for (size_t i = 3; i < result.pixels.size(); i += 4)
