@@ -97,6 +97,77 @@ struct ProgramHeader
 
 namespace
 {
+    // PS2X_VU0_SNAPSHOT_DIR + PS2X_VU0_SNAPSHOT_AT=<seconds>: from that time on, save VU0 state for
+    // the next 12 microprogram calls, before and after, as vu0snap_<n>_<pre|post>.bin:
+    // {u32 startPC, u32 fromVif0, vf[32][4] floats, u16 vi[16], 4KB data}.
+    const std::chrono::steady_clock::time_point g_processStart = std::chrono::steady_clock::now();
+
+    struct Vu0Snapshot
+    {
+        static Vu0Snapshot &instance()
+        {
+            static Vu0Snapshot s;
+            return s;
+        }
+        bool armed()
+        {
+            if (dir.empty() || taken >= 12)
+                return false;
+            return std::chrono::steady_clock::now() >= from;
+        }
+        void save(bool post, uint32_t pc, bool fromVif0, const R5900Context *ctx, const uint8_t *data, const uint8_t *ram)
+        {
+            if (!post && taken == 0)
+            {
+                if (std::FILE *f = std::fopen((dir + "/ram.bin").c_str(), "wb"))
+                {
+                    std::fwrite(ram, 1, PS2_RAM_SIZE, f);
+                    std::fclose(f);
+                }
+                if (std::FILE *f = std::fopen((dir + "/spr.bin").c_str(), "wb"))
+                {
+                    std::fwrite(ps2GetScratchpadHostPtr(), 1, PS2_SCRATCHPAD_SIZE, f);
+                    std::fclose(f);
+                }
+            }
+            char path[600];
+            std::snprintf(path, sizeof(path), "%s/vu0snap_%02u_%s.bin", dir.c_str(), taken, post ? "post" : "pre");
+            if (std::FILE *f = std::fopen(path, "wb"))
+            {
+                const uint32_t head[2] = {pc, fromVif0 ? 1u : 0u};
+                std::fwrite(head, sizeof(head), 1, f);
+                std::fwrite(ctx->vu0_vf, 16, 32, f);
+                std::fwrite(ctx->vi, 2, 16, f);
+                std::fwrite(data, 1, PS2_VU0_DATA_SIZE, f);
+                std::fclose(f);
+            }
+            if (post)
+                ++taken;
+        }
+        std::string dir;
+        std::chrono::steady_clock::time_point from;
+        uint32_t taken = 0;
+
+    private:
+        Vu0Snapshot()
+        {
+            if (const char *d = std::getenv("PS2X_VU0_SNAPSHOT_DIR"))
+                dir = d;
+            const char *at = std::getenv("PS2X_VU0_SNAPSHOT_AT");
+            from = g_processStart +
+                   std::chrono::milliseconds(static_cast<int64_t>((at ? std::atof(at) : 0.0) * 1000.0));
+        }
+    };
+    thread_local bool t_vu0FromVif0 = false;
+}
+
+void ps2xSetGifCaptureRam(const uint8_t *ram, uint32_t size); // gs_frontend.cpp
+void ps2xInstallWriteWatch(uint8_t *ram, uint32_t ramSize, uint8_t *scratchpad, uint32_t scratchpadSize,
+                           std::function<uint32_t()> guestPc); // ps2_write_watch.cpp
+void ps2xSetWriteWatchDescriber(std::function<std::string()> describe); // ps2_write_watch.cpp
+
+namespace
+{
     // PS2X_VU1_DUMP_DIR / PS2X_VU0_DUMP_DIR: dump each distinct micro memory image seen when a
     // microprogram starts and periodically log per-entry-point call counts, VU cycles and host time.
     class VuProfiler
@@ -326,8 +397,83 @@ namespace
         return out.str();
     }
 
+    // PS2X_VU1_SNAPSHOT_DIR + PS2X_VU1_SNAPSHOT_AT=<seconds>: from that time on, save VU1 state for
+    // the next 64 microprogram runs, before and after, as vu1snap_<n>_<pre|post>.bin:
+    // {u32 startPC, u32 resume, u32 top, u32 itop, vf[32][4] floats, i32 vi[16], 16KB data}.
+    // The code memory at the first snapshot is saved as vu1code.bin.
+    struct Vu1Snapshot
+    {
+        static Vu1Snapshot &instance()
+        {
+            static Vu1Snapshot s;
+            return s;
+        }
+        bool armed()
+        {
+            if (dir.empty() || taken >= 64)
+                return false;
+            return std::chrono::steady_clock::now() >= from;
+        }
+        void save(bool post, uint32_t pc, bool resume, uint32_t top, uint32_t itop, const VU1State &st,
+                  const uint8_t *code, const uint8_t *data)
+        {
+            if (!post && taken == 0)
+            {
+                if (std::FILE *f = std::fopen((dir + "/vu1code.bin").c_str(), "wb"))
+                {
+                    std::fwrite(code, 1, PS2_VU1_CODE_SIZE, f);
+                    std::fclose(f);
+                }
+            }
+            char path[600];
+            std::snprintf(path, sizeof(path), "%s/vu1snap_%02u_%s.bin", dir.c_str(), taken, post ? "post" : "pre");
+            if (std::FILE *f = std::fopen(path, "wb"))
+            {
+                const uint32_t head[4] = {pc, resume ? 1u : 0u, top, itop};
+                std::fwrite(head, sizeof(head), 1, f);
+                std::fwrite(st.vf, 16, 32, f);
+                std::fwrite(st.vi, 4, 16, f);
+                std::fwrite(data, 1, PS2_VU1_DATA_SIZE, f);
+                std::fclose(f);
+            }
+            if (post)
+                ++taken;
+        }
+        std::string dir;
+        std::chrono::steady_clock::time_point from;
+        uint32_t taken = 0;
+
+    private:
+        Vu1Snapshot()
+        {
+            if (const char *d = std::getenv("PS2X_VU1_SNAPSHOT_DIR"))
+                dir = d;
+            const char *at = std::getenv("PS2X_VU1_SNAPSHOT_AT");
+            from = g_processStart +
+                   std::chrono::milliseconds(static_cast<int64_t>((at ? std::atof(at) : 0.0) * 1000.0));
+        }
+    };
+
+    void runVu1ProgramImpl(VU1Interpreter &vu1, PS2Memory &memory, GS &gs, bool resume,
+                           uint32_t startPC, uint32_t top, uint32_t itop);
+
     void runVu1Program(VU1Interpreter &vu1, PS2Memory &memory, GS &gs, bool resume,
                        uint32_t startPC, uint32_t top, uint32_t itop)
+    {
+        Vu1Snapshot &snap = Vu1Snapshot::instance();
+        if (!snap.armed())
+        {
+            runVu1ProgramImpl(vu1, memory, gs, resume, startPC, top, itop);
+            return;
+        }
+        const uint32_t pc = resume ? vu1.state().pc : startPC;
+        snap.save(false, pc, resume, top, itop, vu1.state(), memory.getVU1Code(), memory.getVU1Data());
+        runVu1ProgramImpl(vu1, memory, gs, resume, startPC, top, itop);
+        snap.save(true, pc, resume, top, itop, vu1.state(), memory.getVU1Code(), memory.getVU1Data());
+    }
+
+    void runVu1ProgramImpl(VU1Interpreter &vu1, PS2Memory &memory, GS &gs, bool resume,
+                           uint32_t startPC, uint32_t top, uint32_t itop)
     {
         uint8_t *code = memory.getVU1Code();
         uint8_t *data = memory.getVU1Data();
@@ -1110,6 +1256,37 @@ bool PS2Runtime::syncCoreSubsystems()
                                          (cpuContext->vu0_vpu_stat & ~0x0600u) |
                                          (m_vu1.state().stoppedByD ? 0x0200u : 0u) |
                                          (m_vu1.state().stoppedByT ? 0x0400u : 0u); });
+    ps2xSetGifCaptureRam(m_memory.getRDRAM(), PS2_RAM_SIZE);
+    ps2xInstallWriteWatch(m_memory.getRDRAM(), PS2_RAM_SIZE, m_memory.getScratchpad(), PS2_SCRATCHPAD_SIZE, [this]() -> uint32_t
+                          {
+                              R5900Context *c = m_eeScheduler ? m_eeScheduler->currentContext() : nullptr;
+                              return c ? c->pc : 0u; });
+    ps2xSetWriteWatchDescriber([this]() -> std::string
+                               {
+                                   R5900Context *c = m_eeScheduler ? m_eeScheduler->currentContext() : nullptr;
+                                   if (!c)
+                                       return {};
+                                   char buf[400];
+                                   std::snprintf(buf, sizeof(buf), "a0=%08x a1=%08x a2=%08x a3=%08x v0=%08x v1=%08x sp=%08x ra=%08x "
+                                                                   "s0=%08x s1=%08x s2=%08x s3=%08x s4=%08x s5=%08x s6=%08x s7=%08x",
+                                                 GPR_U32(c, 4), GPR_U32(c, 5), GPR_U32(c, 6), GPR_U32(c, 7),
+                                                 GPR_U32(c, 2), GPR_U32(c, 3), GPR_U32(c, 29), GPR_U32(c, 31),
+                                                 GPR_U32(c, 16), GPR_U32(c, 17), GPR_U32(c, 18), GPR_U32(c, 19),
+                                                 GPR_U32(c, 20), GPR_U32(c, 21), GPR_U32(c, 22), GPR_U32(c, 23));
+                                   return buf; });
+    m_memory.setVu0MicroCallback([this](bool resume, uint32_t startPC, uint32_t itop)
+                                 {
+                                     R5900Context *cpuContext = m_eeScheduler ? m_eeScheduler->currentContext() : nullptr;
+                                     if (!cpuContext)
+                                     {
+                                         cpuContext = &m_cpuContext;
+                                     }
+                                     // VIF0 latches ITOPS into VU0's ITOP when it starts the program.
+                                     cpuContext->vu0_itop = itop;
+                                     t_vu0FromVif0 = true;
+                                     executeVU0Microprogram(m_memory.getRDRAM(), cpuContext,
+                                                            resume ? cpuContext->vu0_tpc : startPC);
+                                     t_vu0FromVif0 = false; });
     m_memory.setVu1MscntCallback([this](uint32_t top, uint32_t itop)
                                  {
                                      R5900Context *cpuContext = m_eeScheduler ? m_eeScheduler->currentContext() : nullptr;
@@ -1866,6 +2043,24 @@ void PS2Runtime::executeVU0Microprogram(uint8_t *rdram, R5900Context *ctx, uint3
         seedVu0IdleSuccess(ctx);
         return;
     }
+    Vu0Snapshot &snap = Vu0Snapshot::instance();
+    const bool snapshot = snap.armed();
+    if (snapshot)
+        snap.save(false, startPC, t_vu0FromVif0, ctx, vu0Data, m_memory.getRDRAM());
+    struct SnapshotPost
+    {
+        Vu0Snapshot &snap;
+        bool active;
+        uint32_t pc;
+        R5900Context *ctx;
+        const uint8_t *data;
+        const uint8_t *ram;
+        ~SnapshotPost()
+        {
+            if (active)
+                snap.save(true, pc, t_vu0FromVif0, ctx, data, ram);
+        }
+    } snapshotPost{snap, snapshot, startPC, ctx, vu0Data, m_memory.getRDRAM()};
 
     VuProfiler &prof = VuProfiler::vu0();
     const auto t0 = std::chrono::steady_clock::now();

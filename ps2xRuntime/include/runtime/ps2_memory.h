@@ -321,6 +321,9 @@ public:
     void setVu1MscalCallback(Vu1MscalCallback cb) { m_vu1MscalCallback = std::move(cb); }
     using Vu1MscntCallback = std::function<void(uint32_t top, uint32_t itop)>;
     void setVu1MscntCallback(Vu1MscntCallback cb) { m_vu1MscntCallback = std::move(cb); }
+    // VIF0 MSCAL/MSCALF (resume=false, startPC from the VIFcode) and MSCNT (resume=true).
+    using Vu0MicroCallback = std::function<void(bool resume, uint32_t startPC, uint32_t itop)>;
+    void setVu0MicroCallback(Vu0MicroCallback cb) { m_vu0MicroCallback = std::move(cb); }
 
     uint8_t *getVU1Code() { return m_vu1Code; }
     const uint8_t *getVU1Code() const { return m_vu1Code; }
@@ -401,6 +404,7 @@ public:
     GifArbiter *m_gifArbiter = nullptr;
     Vu1MscalCallback m_vu1MscalCallback;
     Vu1MscntCallback m_vu1MscntCallback;
+    Vu0MicroCallback m_vu0MicroCallback;
 
     uint8_t *m_vu0Code = nullptr;
     uint8_t *m_vu0Data = nullptr;

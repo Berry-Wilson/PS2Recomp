@@ -3,6 +3,9 @@
 #include "ps2_log.h"
 #include "runtime/ps2_memory.h"
 #include <atomic>
+#include <chrono>
+#include <cstdlib>
+#include <string>
 #include <algorithm>
 #include <cmath>
 #include <cstdio>
@@ -710,11 +713,108 @@ void GS::applyPrivilegedSideEffects(const uint8_t *data, uint32_t sizeBytes)
     }
 }
 
+namespace
+{
+    // PS2X_GIF_CAPTURE=<file>, PS2X_GIF_CAPTURE_AT=<seconds after the first GIF packet>: record
+    // every GIF packet for PS2X_GIF_CAPTURE_VSYNCS (default 3) vsyncs as
+    // {u32 path, u32 bytes, u64 vsync, bytes...} records. EE RAM at the start of the capture is
+    // written to <file>.ram.
+    const uint8_t *g_captureRam = nullptr;
+    uint32_t g_captureRamSize = 0;
+
+    class GifCapture
+    {
+    public:
+        void record(const uint8_t *data, uint32_t sizeBytes, uint32_t path, uint64_t vsync)
+        {
+            if (m_done)
+                return;
+            const auto now = std::chrono::steady_clock::now();
+            if (!m_started)
+            {
+                m_started = true;
+                m_t0 = now;
+            }
+            if (!m_file)
+            {
+                if (now - m_t0 < m_delay)
+                    return;
+                m_file = std::fopen(m_path.c_str(), "wb");
+                m_firstVsync = vsync;
+                if (!m_file)
+                {
+                    m_done = true;
+                    return;
+                }
+                std::fprintf(stderr, "[gifcap] capturing from vsync %llu to %s\n",
+                             static_cast<unsigned long long>(vsync), m_path.c_str());
+                if (g_captureRam)
+                {
+                    if (std::FILE *ram = std::fopen((m_path + ".ram").c_str(), "wb"))
+                    {
+                        std::fwrite(g_captureRam, 1, g_captureRamSize, ram);
+                        std::fclose(ram);
+                    }
+                }
+            }
+            if (vsync >= m_firstVsync + m_vsyncs)
+            {
+                std::fclose(m_file);
+                m_file = nullptr;
+                m_done = true;
+                std::fprintf(stderr, "[gifcap] done\n");
+                return;
+            }
+            const uint32_t header[2] = {path, sizeBytes};
+            std::fwrite(header, sizeof(header), 1, m_file);
+            std::fwrite(&vsync, sizeof(vsync), 1, m_file);
+            std::fwrite(data, 1, sizeBytes, m_file);
+        }
+
+        static GifCapture *instance()
+        {
+            static GifCapture *capture = []() -> GifCapture *
+            {
+                const char *path = std::getenv("PS2X_GIF_CAPTURE");
+                if (!path || !*path)
+                    return nullptr;
+                auto *c = new GifCapture();
+                c->m_path = path;
+                if (const char *at = std::getenv("PS2X_GIF_CAPTURE_AT"))
+                    c->m_delay = std::chrono::milliseconds(static_cast<int64_t>(std::atof(at) * 1000.0));
+                if (const char *n = std::getenv("PS2X_GIF_CAPTURE_VSYNCS"))
+                    c->m_vsyncs = static_cast<uint64_t>(std::max(1, std::atoi(n)));
+                return c;
+            }();
+            return capture;
+        }
+
+    private:
+        std::string m_path;
+        std::chrono::steady_clock::duration m_delay{};
+        std::chrono::steady_clock::time_point m_t0{};
+        std::FILE *m_file = nullptr;
+        uint64_t m_firstVsync = 0;
+        uint64_t m_vsyncs = 3;
+        bool m_started = false;
+        bool m_done = false;
+    };
+}
+
+void ps2xSetGifCaptureRam(const uint8_t *ram, uint32_t size)
+{
+    g_captureRam = ram;
+    g_captureRamSize = size;
+}
+
 void GS::processGIFPacket(const uint8_t *data, uint32_t sizeBytes, uint32_t path)
 {
     std::lock_guard<std::recursive_mutex> lock(m_stateMutex);
     if (!data || sizeBytes < 16 || !m_backend)
         return;
+
+    if (GifCapture *capture = GifCapture::instance())
+        capture->record(data, sizeBytes, path, m_privRegs ? m_privRegs->vsyncTick.load(std::memory_order_acquire) : 0u);
 
     if (m_backend->HandlesRawGif())
     {

@@ -77,6 +77,7 @@ namespace ps2recomp
         std::string emitUnhandledInstruction(const Instruction &inst, const std::string &message);
         std::string translateMMIInstruction(const Instruction &inst);
         std::string translateVUInstruction(const Instruction &inst);
+        static std::string discardVf0Writes(std::string code);
         std::string translateFPUInstruction(const Instruction &inst);
         std::string translateCOP0Instruction(const Instruction &inst);
         std::string translateRegimmInstruction(const Instruction &inst);

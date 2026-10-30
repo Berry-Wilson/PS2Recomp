@@ -258,9 +258,20 @@ namespace ps2recomp
         return MmiTranslator(*this).translate(inst);
     }
 
+    std::string CodeGenerator::discardVf0Writes(std::string code)
+    {
+        // VF0 is hardwired to (0, 0, 0, 1): VU writes to it are discarded. Games use it as the
+        // destination of flag-only tests (e.g. vsub.xyzw $vf0, $vf13, $vf12), so keep the right-hand
+        // side for its effects and drop the store.
+        static const std::string kStore = "ctx->vu0_vf[0] = ";
+        for (size_t at = code.find(kStore); at != std::string::npos; at = code.find(kStore, at))
+            code.replace(at, kStore.size(), "(void)");
+        return code;
+    }
+
     std::string CodeGenerator::translateVUInstruction(const Instruction &inst)
     {
-        return VuTranslator(*this).translate(inst);
+        return discardVf0Writes(VuTranslator(*this).translate(inst));
     }
 
     CodeGenerator::AnalysisResult CodeGenerator::collectInternalBranchTargets(

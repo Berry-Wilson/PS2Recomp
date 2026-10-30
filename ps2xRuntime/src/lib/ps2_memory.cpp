@@ -1608,18 +1608,30 @@ bool PS2Memory::tryProcessScratchpadDma(uint32_t channelBase, uint32_t chcr)
     const uint32_t originalMadr = m_ioRegisters[channelBase + 0x10u] & 0x7FFFFFF0u;
     const uint32_t originalSadr = m_ioRegisters[channelBase + 0x80u] & 0x3FF0u;
 
+    // MADR may point into VU micro/data memory (0x11000000-0x1100FFFF) as well as main RAM;
+    // games use toSPR from VU0 data memory to collect VU0 microprogram output.
+    uint8_t *mainBase = m_rdram;
     uint32_t mainOffset = 0u;
-    try
+    uint32_t vuLimit = 0u;
+    uint8_t *vuMem = mapVuMemory(originalMadr, byteCount, mainOffset, vuLimit);
+    if (vuMem)
     {
-        mainOffset = translateAddress(originalMadr);
+        mainBase = vuMem;
     }
-    catch (const std::exception &)
+    else
     {
-        return false;
-    }
+        try
+        {
+            mainOffset = translateAddress(originalMadr);
+        }
+        catch (const std::exception &)
+        {
+            return false;
+        }
 
-    if (mainOffset > PS2_RAM_SIZE || byteCount > PS2_RAM_SIZE - mainOffset)
-        return false;
+        if (mainOffset > PS2_RAM_SIZE || byteCount > PS2_RAM_SIZE - mainOffset)
+            return false;
+    }
 
     const bool fromScratchpad = channelBase == kSprFromChannel;
     uint32_t scratchOffset = originalSadr;
@@ -1631,18 +1643,23 @@ bool PS2Memory::tryProcessScratchpadDma(uint32_t channelBase, uint32_t chcr)
         const uint32_t chunk = std::min(bytesLeft, scratchChunk);
         if (fromScratchpad)
         {
-            std::memcpy(m_rdram + mainOffset + copied, m_scratchpad + scratchOffset, chunk);
-            markModified(mainOffset + copied, chunk);
+            std::memcpy(mainBase + mainOffset + copied, m_scratchpad + scratchOffset, chunk);
+            if (!vuMem)
+                markModified(mainOffset + copied, chunk);
         }
         else
         {
-            std::memcpy(m_scratchpad + scratchOffset, m_rdram + mainOffset + copied, chunk);
+            std::memcpy(m_scratchpad + scratchOffset, mainBase + mainOffset + copied, chunk);
         }
 
         copied += chunk;
         bytesLeft -= chunk;
         scratchOffset = (scratchOffset + chunk) & (PS2_SCRATCHPAD_SIZE - 1u);
     }
+    if (fromScratchpad && vuMem == m_vu0Code)
+        markVU0CodeModified();
+    else if (fromScratchpad && vuMem == m_vu1Code)
+        markVU1CodeModified();
 
     m_ioRegisters[channelBase + 0x10u] = (originalMadr + byteCount) & 0x7FFFFFF0u;
     m_ioRegisters[channelBase + 0x20u] = 0u;

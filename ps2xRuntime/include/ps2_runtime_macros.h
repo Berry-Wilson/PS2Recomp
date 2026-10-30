@@ -369,7 +369,72 @@ inline __m128 ps2_vmul(__m128 a, __m128 b)
     return ps2_vfinish(a, b, _mm_mul_ps(a, b), Ps2VecOp::Mul);
 }
 
+// The PS2 has no Inf/NaN: exponent 255 is an ordinary (largest) exponent, so 0x7FFFFFFF is the most
+// positive value and 0xFFFFFFFF the most negative. Flipping the magnitude bits of negative values
+// turns the sign-magnitude encoding into an integer order that holds for every bit pattern.
+inline int32_t ps2_fkey(float f)
+{
+    const uint32_t b = std::bit_cast<uint32_t>(f);
+    return static_cast<int32_t>(b ^ (static_cast<uint32_t>(static_cast<int32_t>(b) >> 31) & 0x7FFFFFFFu));
+}
+
+inline __m128i ps2_vkey(__m128 v)
+{
+    const __m128i b = _mm_castps_si128(v);
+    return _mm_xor_si128(b, _mm_and_si128(_mm_srai_epi32(b, 31), _mm_set1_epi32(0x7FFFFFFF)));
+}
+
+// VU MAX/MINI: the larger/smaller operand bit for bit, with no IEEE NaN rules.
+inline __m128 ps2_vmax(__m128 a, __m128 b)
+{
+    const __m128i aGreater = _mm_cmpgt_epi32(ps2_vkey(a), ps2_vkey(b));
+    return _mm_castsi128_ps(_mm_or_si128(_mm_and_si128(aGreater, _mm_castps_si128(a)),
+                                         _mm_andnot_si128(aGreater, _mm_castps_si128(b))));
+}
+
+inline __m128 ps2_vmini(__m128 a, __m128 b)
+{
+    const __m128i aLess = _mm_cmplt_epi32(ps2_vkey(a), ps2_vkey(b));
+    return _mm_castsi128_ps(_mm_or_si128(_mm_and_si128(aLess, _mm_castps_si128(a)),
+                                         _mm_andnot_si128(aLess, _mm_castps_si128(b))));
+}
+
+inline float ps2_fmax(float a, float b)
+{
+    return ps2_fkey(a) > ps2_fkey(b) ? a : b;
+}
+
+inline float ps2_fmin(float a, float b)
+{
+    return ps2_fkey(a) < ps2_fkey(b) ? a : b;
+}
+
+// FPU compares. Values with exponent 255 are ordinary numbers on the PS2, so they are ordered by
+// ps2_fkey; everything else keeps the host comparison (+0 == -0).
+inline bool ps2_fexp255(float a, float b)
+{
+    return ((std::bit_cast<uint32_t>(a) & 0x7F800000u) == 0x7F800000u) ||
+           ((std::bit_cast<uint32_t>(b) & 0x7F800000u) == 0x7F800000u);
+}
+
+inline bool ps2_fcmp_eq(float a, float b)
+{
+    return ps2_fexp255(a, b) ? std::bit_cast<uint32_t>(a) == std::bit_cast<uint32_t>(b) : a == b;
+}
+
+inline bool ps2_fcmp_lt(float a, float b)
+{
+    return ps2_fexp255(a, b) ? ps2_fkey(a) < ps2_fkey(b) : a < b;
+}
+
+inline bool ps2_fcmp_le(float a, float b)
+{
+    return ps2_fexp255(a, b) ? ps2_fkey(a) <= ps2_fkey(b) : a <= b;
+}
+
 // PS2 VU (Vector Unit) operations
+#define PS2_VMAX(a, b) ps2_vmax((__m128)(a), (__m128)(b))
+#define PS2_VMINI(a, b) ps2_vmini((__m128)(a), (__m128)(b))
 #define PS2_VADD(a, b) ps2_vadd((__m128)(a), (__m128)(b))
 #define PS2_VSUB(a, b) ps2_vsub((__m128)(a), (__m128)(b))
 #define PS2_VMUL(a, b) ps2_vmul((__m128)(a), (__m128)(b))
@@ -866,22 +931,23 @@ inline int32_t ps2_fpu_cvt_w_s(float value)
 }
 #define FPU_CVT_W_S(a) ps2_fpu_cvt_w_s((float)(a))
 #define FPU_CVT_L_S(a) ((int64_t)(float)(a))
+// The EE FPU has no unordered results (no NaN), so the U*/NG* forms equal their ordered ones.
 #define FPU_C_F_S(a, b) (0)
-#define FPU_C_UN_S(a, b) (isnan((float)(a)) || isnan((float)(b)))
-#define FPU_C_EQ_S(a, b) ((float)(a) == (float)(b))
-#define FPU_C_UEQ_S(a, b) ((float)(a) == (float)(b) || isnan((float)(a)) || isnan((float)(b)))
-#define FPU_C_OLT_S(a, b) ((float)(a) < (float)(b))
-#define FPU_C_ULT_S(a, b) ((float)(a) < (float)(b) || isnan((float)(a)) || isnan((float)(b)))
-#define FPU_C_OLE_S(a, b) ((float)(a) <= (float)(b))
-#define FPU_C_ULE_S(a, b) ((float)(a) <= (float)(b) || isnan((float)(a)) || isnan((float)(b)))
+#define FPU_C_UN_S(a, b) (0)
+#define FPU_C_EQ_S(a, b) ps2_fcmp_eq((float)(a), (float)(b))
+#define FPU_C_UEQ_S(a, b) ps2_fcmp_eq((float)(a), (float)(b))
+#define FPU_C_OLT_S(a, b) ps2_fcmp_lt((float)(a), (float)(b))
+#define FPU_C_ULT_S(a, b) ps2_fcmp_lt((float)(a), (float)(b))
+#define FPU_C_OLE_S(a, b) ps2_fcmp_le((float)(a), (float)(b))
+#define FPU_C_ULE_S(a, b) ps2_fcmp_le((float)(a), (float)(b))
 #define FPU_C_SF_S(a, b) (0)
-#define FPU_C_NGLE_S(a, b) (isnan((float)(a)) || isnan((float)(b)))
-#define FPU_C_SEQ_S(a, b) ((float)(a) == (float)(b))
-#define FPU_C_NGL_S(a, b) ((float)(a) == (float)(b) || isnan((float)(a)) || isnan((float)(b)))
-#define FPU_C_LT_S(a, b) ((float)(a) < (float)(b))
-#define FPU_C_NGE_S(a, b) ((float)(a) < (float)(b) || isnan((float)(a)) || isnan((float)(b)))
-#define FPU_C_LE_S(a, b) ((float)(a) <= (float)(b))
-#define FPU_C_NGT_S(a, b) ((float)(a) <= (float)(b) || isnan((float)(a)) || isnan((float)(b)))
+#define FPU_C_NGLE_S(a, b) (0)
+#define FPU_C_SEQ_S(a, b) ps2_fcmp_eq((float)(a), (float)(b))
+#define FPU_C_NGL_S(a, b) ps2_fcmp_eq((float)(a), (float)(b))
+#define FPU_C_LT_S(a, b) ps2_fcmp_lt((float)(a), (float)(b))
+#define FPU_C_NGE_S(a, b) ps2_fcmp_lt((float)(a), (float)(b))
+#define FPU_C_LE_S(a, b) ps2_fcmp_le((float)(a), (float)(b))
+#define FPU_C_NGT_S(a, b) ps2_fcmp_le((float)(a), (float)(b))
 
 // QFSRV: Quadword Funnel Shift Right Variable
 // Concatenates rs || rt (256 bits) and right-shifts by SA bits, taking lower 128 bits.
