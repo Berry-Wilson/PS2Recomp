@@ -6,6 +6,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <cmath>
 #include <functional>
 #include <mutex>
 #include <set>
@@ -13,6 +14,7 @@
 #include <utility>
 #include <algorithm>
 #include <chrono>
+#include <thread>
 #include <vector>
 
 #if defined(_WIN32)
@@ -44,6 +46,7 @@ namespace
     bool g_values = false;
     bool g_badFloatOnly = false; // PS2X_WATCH_VALUES=inf: only log stores that leave an Inf/NaN word
     uint32_t g_minExponent = 0xFF; // PS2X_WATCH_VALUES=big: also log floats with |x| >= 2^20
+    float g_jump = 0.0f; // PS2X_WATCH_VALUES=jump[:delta]: log stores that move a float word by more than delta
     uint32_t g_valueLines = 0;
     thread_local uintptr_t t_valueHost = 0;
     thread_local uint32_t t_valueGuest = 0;
@@ -106,7 +109,16 @@ namespace
                 // filtered value.
                 bool hit = false;
                 for (int w = 0; w < 4; ++w)
+                {
                     hit |= q[w] != t_before[w] && ((q[w] >> 23) & 0xFFu) >= g_minExponent;
+                    if (g_jump > 0.0f && q[w] != t_before[w])
+                    {
+                        float now, was;
+                        std::memcpy(&now, &q[w], 4);
+                        std::memcpy(&was, &t_before[w], 4);
+                        hit |= !(std::fabs(now - was) <= g_jump);
+                    }
+                }
                 if (g_badFloatOnly && !hit)
                 {
                     t_valueHost = 0;
@@ -118,6 +130,13 @@ namespace
                 std::fprintf(stderr, "[watchv] t=%.2f pc=0x%08x addr=0x%08x qw=%08x %08x %08x %08x\n",
                              std::chrono::duration<double>(std::chrono::steady_clock::now() - g_start).count(),
                              t_valuePc, t_valueGuest & ~0xFu, q[0], q[1], q[2], q[3]);
+                if (g_jump > 0.0f)
+                {
+                    float f[8];
+                    std::memcpy(f, t_before, 16);
+                    std::memcpy(f + 4, q, 16);
+                    std::fprintf(stderr, "[watchv]   (%g %g %g %g) -> (%g %g %g %g)\n", f[0], f[1], f[2], f[3], f[4], f[5], f[6], f[7]);
+                }
                 if (!t_valueDesc.empty())
                     std::fprintf(stderr, "[watchv]   %s\n", t_valueDesc.c_str());
                 if (!t_hostStack.empty())
@@ -177,9 +196,46 @@ void ps2xSetWriteWatchDescriber(std::function<std::string()> describe)
     g_describe = std::move(describe);
 }
 
+// PS2X_PEEK=<guest hex addr>:<hex length> prints those EE RAM quadwords as floats every PS2X_PEEK_MS
+// milliseconds (default 100) from PS2X_WATCH_AFTER seconds on: a sampled view of values the game
+// rewrites in place several times per frame.
+static void startPeek(uint8_t *ram, uint32_t ramSize)
+{
+    const char *spec = std::getenv("PS2X_PEEK");
+    if (!spec || !*spec || !ram)
+        return;
+    const char *colon = std::strchr(spec, ':');
+    const uint32_t start = static_cast<uint32_t>(std::strtoul(spec, nullptr, 16)) & 0x01FFFFF0u;
+    const uint32_t len = colon ? static_cast<uint32_t>(std::strtoul(colon + 1, nullptr, 16)) : 0x10u;
+    if (start >= ramSize)
+        return;
+    const uint32_t end = std::min(ramSize, start + len);
+    const char *ms = std::getenv("PS2X_PEEK_MS");
+    const auto period = std::chrono::milliseconds(ms ? std::atoi(ms) : 100);
+    const char *after = std::getenv("PS2X_WATCH_AFTER");
+    const auto from = std::chrono::steady_clock::now() +
+                      std::chrono::milliseconds(static_cast<int64_t>((after ? std::atof(after) : 0.0) * 1000.0));
+    std::thread([=]()
+                {
+                    std::this_thread::sleep_until(from);
+                    for (;;)
+                    {
+                        const double t = std::chrono::duration<double>(std::chrono::steady_clock::now() - g_start).count();
+                        for (uint32_t a = start; a < end; a += 16)
+                        {
+                            float f[4];
+                            std::memcpy(f, ram + a, 16);
+                            std::fprintf(stderr, "[peek] t=%.2f 0x%08x %g %g %g %g\n", t, a, f[0], f[1], f[2], f[3]);
+                        }
+                        std::this_thread::sleep_for(period);
+                    } })
+        .detach();
+}
+
 void ps2xInstallWriteWatch(uint8_t *ram, uint32_t ramSize, uint8_t *scratchpad, uint32_t scratchpadSize,
                            std::function<uint32_t()> guestPc)
 {
+    startPeek(ram, ramSize);
     const char *spec = std::getenv("PS2X_WATCH");
     if (!spec || !*spec || !ram)
         return;
@@ -209,10 +265,15 @@ void ps2xInstallWriteWatch(uint8_t *ram, uint32_t ramSize, uint8_t *scratchpad, 
         }
     }
     const char *values = std::getenv("PS2X_WATCH_VALUES");
-    g_values = values && (values[0] == '1' || values[0] == 'i' || values[0] == 'b');
-    g_badFloatOnly = values && (values[0] == 'i' || values[0] == 'b');
+    g_values = values && (values[0] == '1' || values[0] == 'i' || values[0] == 'b' || values[0] == 'j');
+    g_badFloatOnly = values && (values[0] == 'i' || values[0] == 'b' || values[0] == 'j');
     if (values && values[0] == 'b')
         g_minExponent = 127 + 20;
+    if (values && values[0] == 'j')
+    {
+        const char *delta = std::strchr(values, ':');
+        g_jump = delta ? static_cast<float>(std::atof(delta + 1)) : 100.0f;
+    }
     const char *after = std::getenv("PS2X_WATCH_AFTER");
     g_logFrom = std::chrono::steady_clock::now() +
                 std::chrono::milliseconds(static_cast<int64_t>((after ? std::atof(after) : 0.0) * 1000.0));
