@@ -1952,6 +1952,67 @@ bool PS2Runtime::dispatchGuestBranch(uint8_t *rdram,
     ctx->pc = targetPc;
     const bool isCall = (kind == GuestBranchKind::DirectCall || kind == GuestBranchKind::IndirectCall);
 
+    // PS2X_CALLPROF=<start seconds>,<window seconds>: count guest calls per call site and target over
+    // the window, then print the busiest ones with per-vsync rates.
+    struct CallProfile
+    {
+        double start = -1.0, window = 0.0;
+        bool done = false;
+        uint64_t firstTick = 0;
+        std::unordered_map<uint64_t, uint64_t> counts; // (source << 32) | target
+        CallProfile()
+        {
+            if (const char *e = std::getenv("PS2X_CALLPROF"))
+                std::sscanf(e, "%lf,%lf", &start, &window);
+        }
+    };
+    static CallProfile s_prof;
+    if (s_prof.start >= 0.0 && !s_prof.done && isCall)
+    {
+        const double t = std::chrono::duration<double>(std::chrono::steady_clock::now() - g_processStart).count();
+        if (t >= s_prof.start)
+        {
+            const uint64_t tick = m_memory.gs().vsyncTick.load(std::memory_order_relaxed);
+            if (s_prof.counts.empty())
+                s_prof.firstTick = tick;
+            ++s_prof.counts[(static_cast<uint64_t>(sourcePc) << 32) | targetPc];
+            // PS2X_CALLPROF_ARGS=<hex target>: also log the arguments of the first 200 calls to it.
+            static const uint32_t s_argTarget = []() -> uint32_t
+            {
+                const char *e = std::getenv("PS2X_CALLPROF_ARGS");
+                return e ? static_cast<uint32_t>(std::strtoul(e, nullptr, 16)) : 0u;
+            }();
+            static uint32_t s_argLines = 0;
+            if (targetPc == s_argTarget && s_argLines++ < 200)
+                std::fprintf(stderr, "[callargs] vs=%llu from 0x%08x a0=%08x a1=%08x a2=%08x a3=%08x\n",
+                             static_cast<unsigned long long>(tick), sourcePc, GPR_U32(ctx, 4), GPR_U32(ctx, 5),
+                             GPR_U32(ctx, 6), GPR_U32(ctx, 7));
+            if (targetPc == s_argTarget && s_argLines <= 40)
+            {
+                // The 4x4 float matrix a1 points at (RAM only).
+                const uint32_t a1 = GPR_U32(ctx, 5) & 0x01FFFFF0u;
+                float m[16];
+                std::memcpy(m, rdram + a1, sizeof(m));
+                for (int r = 0; r < 4; ++r)
+                    std::fprintf(stderr, "[callargs]   a1[%d] %g %g %g %g\n", r, m[r * 4], m[r * 4 + 1], m[r * 4 + 2], m[r * 4 + 3]);
+            }
+            if (t >= s_prof.start + s_prof.window)
+            {
+                s_prof.done = true;
+                const uint64_t frames = std::max<uint64_t>(1u, tick - s_prof.firstTick);
+                std::vector<std::pair<uint64_t, uint64_t>> rows(s_prof.counts.begin(), s_prof.counts.end());
+                std::sort(rows.begin(), rows.end(), [](const auto &a, const auto &b)
+                          { return a.second > b.second; });
+                std::fprintf(stderr, "[callprof] %llu vsyncs, %zu call sites\n",
+                             static_cast<unsigned long long>(frames), rows.size());
+                for (const auto &[key, n] : rows)
+                    std::fprintf(stderr, "[callprof] 0x%08x -> 0x%08x %llu (%.2f/vsync)\n",
+                                 static_cast<uint32_t>(key >> 32), static_cast<uint32_t>(key),
+                                 static_cast<unsigned long long>(n), static_cast<double>(n) / frames);
+            }
+        }
+    }
+
     // Account cycles for inter-function transfers without aborting active C++ call frames.
     if (m_eeScheduler)
     {
