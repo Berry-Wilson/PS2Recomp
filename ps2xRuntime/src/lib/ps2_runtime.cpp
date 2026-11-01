@@ -301,16 +301,33 @@ namespace
         return e[0] == '0' ? VuMode::Interpreter : VuMode::Native;
     }
 
+    // PS2X_VU_VERIFY_AFTER=<seconds>: verify mode runs translated code alone until then, so a slow
+    // verified run can still reach a late scene.
+    VuMode verifyGate(VuMode mode)
+    {
+        if (mode != VuMode::Verify)
+            return mode;
+        static const double after = []()
+        {
+            const char *e = std::getenv("PS2X_VU_VERIFY_AFTER");
+            return e ? std::atof(e) : 0.0;
+        }();
+        static bool started = false;
+        if (!started)
+            started = std::chrono::duration<double>(std::chrono::steady_clock::now() - g_processStart).count() >= after;
+        return started ? VuMode::Verify : VuMode::Native;
+    }
+
     VuMode vu1Mode()
     {
         static const VuMode mode = readVuMode("PS2X_VU1_NATIVE");
-        return mode;
+        return verifyGate(mode);
     }
 
     VuMode vu0Mode()
     {
         static const VuMode mode = readVuMode("PS2X_VU0_NATIVE");
-        return mode;
+        return verifyGate(mode);
     }
 
     struct Vu1KickCapture
@@ -410,7 +427,7 @@ namespace
         }
         bool armed()
         {
-            if (dir.empty() || taken >= 64)
+            if (dir.empty() || taken >= limit)
                 return false;
             return std::chrono::steady_clock::now() >= from;
         }
@@ -425,8 +442,21 @@ namespace
                     std::fclose(f);
                 }
             }
+            // Micro memory changes between runs (MPG uploads): save each distinct version as
+            // vu1code_<first run index>.bin.
+            if (!post && (lastCode.empty() || std::memcmp(lastCode.data(), code, PS2_VU1_CODE_SIZE) != 0))
+            {
+                lastCode.assign(code, code + PS2_VU1_CODE_SIZE);
+                char cpath[600];
+                std::snprintf(cpath, sizeof(cpath), "%s/vu1code_%03u.bin", dir.c_str(), taken);
+                if (std::FILE *f = std::fopen(cpath, "wb"))
+                {
+                    std::fwrite(code, 1, PS2_VU1_CODE_SIZE, f);
+                    std::fclose(f);
+                }
+            }
             char path[600];
-            std::snprintf(path, sizeof(path), "%s/vu1snap_%02u_%s.bin", dir.c_str(), taken, post ? "post" : "pre");
+            std::snprintf(path, sizeof(path), "%s/vu1snap_%03u_%s.bin", dir.c_str(), taken, post ? "post" : "pre");
             if (std::FILE *f = std::fopen(path, "wb"))
             {
                 const uint32_t head[4] = {pc, resume ? 1u : 0u, top, itop};
@@ -442,12 +472,16 @@ namespace
         std::string dir;
         std::chrono::steady_clock::time_point from;
         uint32_t taken = 0;
+        uint32_t limit = 64;
+        std::vector<uint8_t> lastCode;
 
     private:
         Vu1Snapshot()
         {
             if (const char *d = std::getenv("PS2X_VU1_SNAPSHOT_DIR"))
                 dir = d;
+            if (const char *n = std::getenv("PS2X_VU1_SNAPSHOT_COUNT")) // default 64
+                limit = static_cast<uint32_t>(std::max(1, std::atoi(n)));
             const char *at = std::getenv("PS2X_VU1_SNAPSHOT_AT");
             from = g_processStart +
                    std::chrono::milliseconds(static_cast<int64_t>((at ? std::atof(at) : 0.0) * 1000.0));
@@ -505,8 +539,29 @@ namespace
 
         if (mode == VuMode::Native)
         {
+            // PS2X_VU_STATS=1: host time per VU cycle of translated VU1 runs, every 5 seconds.
+            static const bool s_stats = std::getenv("PS2X_VU_STATS") != nullptr;
+            const auto t0 = s_stats ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
+            const uint64_t cyc0 = vu1.state().cycles;
             const vu1n::RunResult r = vu1n::run(vu1n::Unit::VU1, vu1.state(), code, generation, data, startPC, top, itop,
                                                 65536, vu1SubmitKick, &memory);
+            if (s_stats)
+            {
+                static uint64_t s_ns = 0, s_cycles = 0, s_calls = 0;
+                static auto s_last = std::chrono::steady_clock::now();
+                const auto t1 = std::chrono::steady_clock::now();
+                s_ns += static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(t1 - t0).count());
+                s_cycles += vu1.state().cycles - cyc0;
+                ++s_calls;
+                if (t1 - s_last >= std::chrono::seconds(5))
+                {
+                    std::fprintf(stderr, "[VU1STATS] calls=%llu cycles=%llu host=%.1fms %.2f ns/cycle\n",
+                                 static_cast<unsigned long long>(s_calls), static_cast<unsigned long long>(s_cycles),
+                                 s_ns / 1e6, s_cycles ? static_cast<double>(s_ns) / s_cycles : 0.0);
+                    s_ns = s_cycles = s_calls = 0;
+                    s_last = t1;
+                }
+            }
             if (r == vu1n::RunResult::NotTranslated)
             {
                 logUntranslated();
@@ -945,7 +1000,20 @@ static void UploadFrame(Texture2D &tex, PS2Runtime *rt, uint32_t &outWidth, uint
             const long long v = e ? std::atoll(e) : 60;
             return static_cast<uint64_t>(v > 0 ? v : 60);
         }();
-        if (s_dumpDir && !s_scratch.empty() && width != 0u && height != 0u &&
+        // PS2X_DUMP_FRAMES_AFTER=<seconds since start>, PS2X_DUMP_FRAMES_COUNT=<n>: dump only a window.
+        static const double s_dumpAfter = []()
+        {
+            const char *e = std::getenv("PS2X_DUMP_FRAMES_AFTER");
+            return e ? std::atof(e) : 0.0;
+        }();
+        static uint64_t s_dumpLeft = []()
+        {
+            const char *e = std::getenv("PS2X_DUMP_FRAMES_COUNT");
+            return e ? static_cast<uint64_t>(std::atoll(e)) : ~0ull;
+        }();
+        const bool dumpWindow = s_dumpLeft > 0 &&
+                                std::chrono::duration<double>(std::chrono::steady_clock::now() - g_processStart).count() >= s_dumpAfter;
+        if (s_dumpDir && dumpWindow && !s_scratch.empty() && width != 0u && height != 0u &&
             (frameIndex % s_dumpEvery) == 0u &&
             s_scratch.size() >= static_cast<size_t>(width) * height * 4u)
         {
@@ -981,6 +1049,7 @@ static void UploadFrame(Texture2D &tex, PS2Runtime *rt, uint32_t &outWidth, uint
                     std::fwrite(row.data(), 1, rowBytes, f);
                 }
                 std::fclose(f);
+                --s_dumpLeft;
             }
         }
     }
@@ -2064,7 +2133,49 @@ bool PS2Runtime::dispatchGuestBranch(uint8_t *rdram,
 
     RecompiledFunction targetFn = lookupFunction(targetPc);
     const uint32_t entryPc = ctx->pc;
+
+    // PS2X_TRACE_FN=<hex target>[,...] (+PS2X_TRACE_FN_AFTER=<seconds>): logs the 64-bit argument
+    // registers and f12/f13 on entry and v0/v1/f0 on return for the first 400 calls to those targets.
+    struct FnTrace
+    {
+        std::vector<uint32_t> targets;
+        double after = 0.0;
+        uint32_t lines = 0;
+        uint32_t fromLo = 0u, fromHi = 0xFFFFFFFFu; // PS2X_TRACE_FN_FROM=<hex lo>-<hex hi>: call sites to trace
+        FnTrace()
+        {
+            if (const char *e = std::getenv("PS2X_TRACE_FN"))
+                for (const char *p = e; p && *p;)
+                {
+                    targets.push_back(static_cast<uint32_t>(std::strtoul(p, nullptr, 16)));
+                    p = std::strchr(p, ',');
+                    if (p)
+                        ++p;
+                }
+            if (const char *a = std::getenv("PS2X_TRACE_FN_AFTER"))
+                after = std::atof(a);
+            if (const char *r = std::getenv("PS2X_TRACE_FN_FROM"))
+                std::sscanf(r, "%x-%x", &fromLo, &fromHi);
+        }
+    };
+    static FnTrace s_trace;
+    const bool traced = !s_trace.targets.empty() && s_trace.lines < 400 &&
+                        std::find(s_trace.targets.begin(), s_trace.targets.end(), targetPc) != s_trace.targets.end() &&
+                        sourcePc >= s_trace.fromLo && sourcePc <= s_trace.fromHi &&
+                        std::chrono::duration<double>(std::chrono::steady_clock::now() - g_processStart).count() >= s_trace.after;
+    if (traced)
+    {
+        ++s_trace.lines;
+        std::fprintf(stderr, "[fn] > 0x%08x from 0x%08x a0=%016llx a1=%016llx a2=%016llx a3=%016llx f12=%.9g f13=%.9g\n",
+                     targetPc, sourcePc, static_cast<unsigned long long>(GPR_U64(ctx, 4)),
+                     static_cast<unsigned long long>(GPR_U64(ctx, 5)), static_cast<unsigned long long>(GPR_U64(ctx, 6)),
+                     static_cast<unsigned long long>(GPR_U64(ctx, 7)), ctx->f[12], ctx->f[13]);
+    }
     targetFn(rdram, ctx, this);
+    if (traced)
+        std::fprintf(stderr, "[fn] < 0x%08x v0=%016llx v1=%016llx f0=%.9g\n", targetPc,
+                     static_cast<unsigned long long>(GPR_U64(ctx, 2)), static_cast<unsigned long long>(GPR_U64(ctx, 3)),
+                     ctx->f[0]);
 
     if (isStopRequested() || ctx->pc == 0u)
     {

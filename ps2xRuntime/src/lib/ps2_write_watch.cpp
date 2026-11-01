@@ -196,20 +196,27 @@ void ps2xSetWriteWatchDescriber(std::function<std::string()> describe)
     g_describe = std::move(describe);
 }
 
-// PS2X_PEEK=<guest hex addr>:<hex length> prints those EE RAM quadwords as floats every PS2X_PEEK_MS
-// milliseconds (default 100) from PS2X_WATCH_AFTER seconds on: a sampled view of values the game
-// rewrites in place several times per frame.
+// PS2X_PEEK=<guest hex addr>:<hex length>[,...] prints those EE RAM quadwords as floats every
+// PS2X_PEEK_MS milliseconds (default 100) from PS2X_WATCH_AFTER seconds on: a sampled view of values
+// the game rewrites in place several times per frame. PS2X_PEEK_HEX=1 instead prints each range as one
+// line of raw hex words ("[peekx] t=<s> <addr> <w0> <w1> ...").
 static void startPeek(uint8_t *ram, uint32_t ramSize)
 {
     const char *spec = std::getenv("PS2X_PEEK");
     if (!spec || !*spec || !ram)
         return;
-    const char *colon = std::strchr(spec, ':');
-    const uint32_t start = static_cast<uint32_t>(std::strtoul(spec, nullptr, 16)) & 0x01FFFFF0u;
-    const uint32_t len = colon ? static_cast<uint32_t>(std::strtoul(colon + 1, nullptr, 16)) : 0x10u;
-    if (start >= ramSize)
-        return;
-    const uint32_t end = std::min(ramSize, start + len);
+    std::vector<std::pair<uint32_t, uint32_t>> ranges;
+    for (const char *p = spec; p && *p;)
+    {
+        const uint32_t start = static_cast<uint32_t>(std::strtoul(p, nullptr, 16)) & 0x01FFFFF0u;
+        const char *colon = std::strchr(p, ':');
+        const char *comma = std::strchr(p, ',');
+        const uint32_t len = colon && (!comma || colon < comma) ? static_cast<uint32_t>(std::strtoul(colon + 1, nullptr, 16)) : 0x10u;
+        if (start < ramSize)
+            ranges.emplace_back(start, std::min(ramSize, start + len));
+        p = comma ? comma + 1 : nullptr;
+    }
+    const bool hex = std::getenv("PS2X_PEEK_HEX") != nullptr;
     const char *ms = std::getenv("PS2X_PEEK_MS");
     const auto period = std::chrono::milliseconds(ms ? std::atoi(ms) : 100);
     const char *after = std::getenv("PS2X_WATCH_AFTER");
@@ -221,11 +228,30 @@ static void startPeek(uint8_t *ram, uint32_t ramSize)
                     for (;;)
                     {
                         const double t = std::chrono::duration<double>(std::chrono::steady_clock::now() - g_start).count();
-                        for (uint32_t a = start; a < end; a += 16)
+                        for (const auto &[start, end] : ranges)
                         {
-                            float f[4];
-                            std::memcpy(f, ram + a, 16);
-                            std::fprintf(stderr, "[peek] t=%.2f 0x%08x %g %g %g %g\n", t, a, f[0], f[1], f[2], f[3]);
+                            if (hex)
+                            {
+                                std::string line = "[peekx] t=" + std::to_string(t);
+                                char buf[16];
+                                std::snprintf(buf, sizeof(buf), " %08x", start);
+                                line += buf;
+                                for (uint32_t a = start; a < end; a += 4)
+                                {
+                                    uint32_t w;
+                                    std::memcpy(&w, ram + a, 4);
+                                    std::snprintf(buf, sizeof(buf), " %08x", w);
+                                    line += buf;
+                                }
+                                std::fprintf(stderr, "%s\n", line.c_str());
+                                continue;
+                            }
+                            for (uint32_t a = start; a < end; a += 16)
+                            {
+                                float f[4];
+                                std::memcpy(f, ram + a, 16);
+                                std::fprintf(stderr, "[peek] t=%.2f 0x%08x %g %g %g %g\n", t, a, f[0], f[1], f[2], f[3]);
+                            }
                         }
                         std::this_thread::sleep_for(period);
                     } })

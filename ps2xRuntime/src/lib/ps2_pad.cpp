@@ -68,6 +68,110 @@ namespace
         return events;
     }
 
+    // Input recording and replay, keyed by the number of port-0 pad reads (one per game frame), so a
+    // replay stays in step with the game's frames whatever the host speed.
+    // PS2X_INPUT_RECORD=<file>: appends "<read> <buttons hex> <lx> <ly> <rx> <ry> <seconds>" each time
+    //   the pad state changes.
+    // PS2X_INPUT_REPLAY=<file>: plays such a file back instead of live input, then hands control back.
+    struct PadSample
+    {
+        uint64_t read;
+        uint16_t buttons;
+        uint8_t sticks[4]; // lx, ly, rx, ry
+    };
+
+    struct InputLog
+    {
+        std::FILE *record = nullptr;
+        std::vector<PadSample> replay;
+        size_t replayPos = 0;
+        uint64_t reads = 0;
+        bool haveLast = false;
+        PadSample last{};
+
+        InputLog()
+        {
+            if (const char *path = std::getenv("PS2X_INPUT_REPLAY"))
+            {
+                if (std::FILE *f = std::fopen(path, "r"))
+                {
+                    char line[256];
+                    while (std::fgets(line, sizeof(line), f))
+                    {
+                        unsigned long long read = 0;
+                        unsigned int buttons = 0, lx = 0, ly = 0, rx = 0, ry = 0;
+                        if (std::sscanf(line, "%llu %x %u %u %u %u", &read, &buttons, &lx, &ly, &rx, &ry) == 6)
+                            replay.push_back({read, static_cast<uint16_t>(buttons),
+                                              {static_cast<uint8_t>(lx), static_cast<uint8_t>(ly),
+                                               static_cast<uint8_t>(rx), static_cast<uint8_t>(ry)}});
+                    }
+                    std::fclose(f);
+                    std::fprintf(stderr, "[input] replaying %zu pad changes from %s\n", replay.size(), path);
+                }
+                else
+                    std::fprintf(stderr, "[input] cannot open replay file %s\n", path);
+            }
+            if (const char *path = std::getenv("PS2X_INPUT_RECORD"))
+            {
+                record = std::fopen(path, "w");
+                if (record)
+                {
+                    std::fprintf(record, "# ps2x pad input v1: read buttons(hex, active low) lx ly rx ry seconds\n");
+                    std::fflush(record);
+                    std::fprintf(stderr, "[input] recording pad input to %s\n", path);
+                }
+                else
+                    std::fprintf(stderr, "[input] cannot create record file %s\n", path);
+            }
+        }
+
+        // Replays (when a recording covers this read), then records the state the game will see.
+        void apply(uint8_t *data)
+        {
+            if (replayPos < replay.size())
+            {
+                // The latest recorded state at or before this read; live input once the last change is past.
+                while (replayPos + 1 < replay.size() && replay[replayPos + 1].read <= reads)
+                    ++replayPos;
+                if (replayPos + 1 == replay.size() && reads > replay[replayPos].read)
+                {
+                    std::fprintf(stderr, "[input] replay finished at pad read %llu; live input from here\n",
+                                 static_cast<unsigned long long>(reads));
+                    replayPos = replay.size();
+                }
+                else if (replay[replayPos].read <= reads)
+                {
+                    const PadSample &s = replay[replayPos];
+                    data[2] = static_cast<uint8_t>(s.buttons & 0xFF);
+                    data[3] = static_cast<uint8_t>(s.buttons >> 8);
+                    data[6] = s.sticks[0];
+                    data[7] = s.sticks[1];
+                    data[4] = s.sticks[2];
+                    data[5] = s.sticks[3];
+                }
+            }
+            if (record)
+            {
+                const PadSample s{reads, static_cast<uint16_t>(data[2] | (data[3] << 8)), {data[6], data[7], data[4], data[5]}};
+                if (!haveLast || s.buttons != last.buttons || std::memcmp(s.sticks, last.sticks, 4) != 0)
+                {
+                    std::fprintf(record, "%llu %04x %u %u %u %u %.3f\n", static_cast<unsigned long long>(s.read), s.buttons,
+                                 s.sticks[0], s.sticks[1], s.sticks[2], s.sticks[3], GetTime());
+                    std::fflush(record);
+                    last = s;
+                    haveLast = true;
+                }
+            }
+            ++reads;
+        }
+    };
+
+    InputLog &inputLog()
+    {
+        static InputLog log;
+        return log;
+    }
+
     uint16_t autoPadPressedMask()
     {
         const auto &events = autoPadEvents();
@@ -85,7 +189,7 @@ namespace
     }
 }
 
-bool PSPadBackend::readState(int /*port*/, int /*slot*/, uint8_t *data, size_t size)
+bool PSPadBackend::readState(int port, int /*slot*/, uint8_t *data, size_t size)
 {
     if (!data || size < 32)
         return false;
@@ -199,5 +303,7 @@ bool PSPadBackend::readState(int /*port*/, int /*slot*/, uint8_t *data, size_t s
 
     data[2] = static_cast<uint8_t>(btns & 0xFF);
     data[3] = static_cast<uint8_t>(btns >> 8);
+    if (port == 0)
+        inputLog().apply(data);
     return true;
 }

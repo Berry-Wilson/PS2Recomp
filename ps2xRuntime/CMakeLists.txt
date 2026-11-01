@@ -450,6 +450,15 @@ file(GLOB RUNNER_SRC_FILES CONFIGURE_DEPENDS
     "${DRAKENGARD_SRC_DIR}/*.cpp"
 )
 
+# Full debug info for the translated VU microprograms so samplers can attribute time to source
+# lines (the release link already has /DEBUG). They do not use the runner PCH.
+if(MSVC)
+    file(GLOB DRAKENGARD_VU_SRC_FILES CONFIGURE_DEPENDS "${DRAKENGARD_SRC_DIR}/vu*_programs_*.cpp")
+    set_source_files_properties(${DRAKENGARD_VU_SRC_FILES} PROPERTIES
+        COMPILE_OPTIONS "/Zi"
+        SKIP_PRECOMPILE_HEADERS ON)
+endif()
+
 set(RUNNER_MAIN_CPP "${CMAKE_CURRENT_SOURCE_DIR}/src/runner/main.cpp")
 set(ROOT_MAIN_CPP "${CMAKE_CURRENT_SOURCE_DIR}/src/main.cpp")
 
