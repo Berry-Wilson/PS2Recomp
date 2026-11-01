@@ -1347,7 +1347,7 @@ bool PS2Memory::writeIORegister(uint32_t address, uint32_t value)
                     // Only a guard against looping chains: texture upload chains can carry
                     // thousands of tags, and truncating one desyncs the GIF stream.
                     const int kMaxChainTags = 1 << 20;
-                    std::vector<uint8_t> chainBuf;
+                    std::vector<uint8_t> chainBuf = takeChainBuf();
 
                     auto appendData = [&](uint32_t srcAddr, uint32_t qwCount)
                     {
@@ -1685,6 +1685,26 @@ void PS2Memory::completeDmacChannel(uint32_t channelBase, uint32_t cause)
     queueCompletedDmacCause(cause);
 }
 
+std::vector<uint8_t> PS2Memory::takeChainBuf()
+{
+    if (m_chainBufPool.empty())
+        return {};
+    std::vector<uint8_t> buf = std::move(m_chainBufPool.back());
+    m_chainBufPool.pop_back();
+    buf.clear();
+    return buf;
+}
+
+void PS2Memory::recycleChainBufs(std::vector<PendingTransfer> &transfers)
+{
+    for (PendingTransfer &p : transfers)
+    {
+        if (p.chainData.capacity() != 0u && m_chainBufPool.size() < 8u)
+            m_chainBufPool.push_back(std::move(p.chainData));
+    }
+    transfers.clear();
+}
+
 void PS2Memory::processPendingTransfers()
 {
     const bool hadGif = !m_pendingGifTransfers.empty();
@@ -1766,7 +1786,7 @@ void PS2Memory::processPendingTransfers()
             }
         }
     }
-    m_pendingGifTransfers.clear();
+    recycleChainBufs(m_pendingGifTransfers);
 
     const bool hadVif0 = !m_pendingVif0Transfers.empty();
     for (auto &p : m_pendingVif0Transfers)
@@ -1824,7 +1844,7 @@ void PS2Memory::processPendingTransfers()
             }
         }
     }
-    m_pendingVif0Transfers.clear();
+    recycleChainBufs(m_pendingVif0Transfers);
 
     const bool hadVif1 = !m_pendingVif1Transfers.empty();
     for (auto &p : m_pendingVif1Transfers)
@@ -1882,7 +1902,7 @@ void PS2Memory::processPendingTransfers()
             }
         }
     }
-    m_pendingVif1Transfers.clear();
+    recycleChainBufs(m_pendingVif1Transfers);
 
     if (m_gifArbiter)
         m_gifArbiter->drain();

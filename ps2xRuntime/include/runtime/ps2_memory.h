@@ -425,6 +425,11 @@ public:
     std::vector<PendingTransfer> m_pendingGifTransfers;
     std::vector<PendingTransfer> m_pendingVif0Transfers;
     std::vector<PendingTransfer> m_pendingVif1Transfers;
+    // Chain-mode DMA gathers each transfer into a buffer; reusing them avoids regrowing a fresh
+    // vector (and copying what it already holds) on every chain DMA.
+    std::vector<std::vector<uint8_t>> m_chainBufPool;
+    std::vector<uint8_t> takeChainBuf();
+    void recycleChainBufs(std::vector<PendingTransfer> &transfers);
     std::mutex m_completedDmacMutex;
     std::vector<uint32_t> m_completedDmacCauses;
 
