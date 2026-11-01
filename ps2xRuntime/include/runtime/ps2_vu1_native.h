@@ -245,8 +245,9 @@ namespace vu1n
     };
 
     // a, b, acc must already be normalized. Returns the result for all lanes (only Dest
-    // lanes are meaningful) and pushes the MAC flags the interpreter would compute.
-    template <int Op, int Dest>
+    // lanes are meaningful) and pushes the MAC flags the interpreter would compute. The translator
+    // passes Flags = false when it has proved no later read can observe this push.
+    template <int Op, int Dest, bool Flags = true>
     VU1N_INLINE __m128 fmac(Ctx &c, __m128 a, __m128 b, __m128 acc)
     {
         constexpr int DSFast = kRev4[Dest];
@@ -287,8 +288,11 @@ namespace vu1n
             }
             if ((_mm_movemask_ps(_mm_castsi128_ps(ok)) & DSFast) == DSFast)
             {
-                const int negM = _mm_movemask_ps(r) & DSFast;
-                pushMac(c, static_cast<uint32_t>(kRev4[negM]) << 4);
+                if constexpr (Flags)
+                {
+                    const int negM = _mm_movemask_ps(r) & DSFast;
+                    pushMac(c, static_cast<uint32_t>(kRev4[negM]) << 4);
+                }
                 return r;
             }
         }
@@ -357,7 +361,7 @@ namespace vu1n
             r = _mm_load_ps(reinterpret_cast<const float *>(bits));
         }
 
-        if constexpr (Dest != 0)
+        if constexpr (Dest != 0 && Flags)
         {
             const uint32_t mac = static_cast<uint32_t>(kRev4[zeroM | underM]) |
                                  (static_cast<uint32_t>(kRev4[negM]) << 4) |
