@@ -1,6 +1,9 @@
 // Based on Blackline Interactive implementation
 #include "runtime/ps2_memory.h"
+#include <cstdio>
+#include <cstdlib>
 #include <cstring>
+#include <vector>
 
 enum VIFCmd : uint8_t
 {
@@ -83,8 +86,38 @@ namespace
     // UNPACK into VU data memory, shared by VIF0 and VIF1. Addresses wrap at the VU's data size.
     // Returns the number of source bytes the command consumes.
     uint32_t vifUnpack(VIFRegisters &regs, uint8_t *vuData, uint32_t vuDataSize, uint8_t opcode, uint16_t imm,
-                       uint8_t num, const uint8_t *src, uint32_t available)
+                       uint8_t num, const uint8_t *src, uint32_t available, bool allowFast = true)
     {
+        // PS2X_VIF_VERIFY=1: run every UNPACK through both paths and report any difference.
+        static const bool s_verify = [] { const char *e = std::getenv("PS2X_VIF_VERIFY"); return e && e[0] && e[0] != '0'; }();
+        static thread_local bool s_inVerify = false;
+        if (s_verify && allowFast && vuData && !s_inVerify)
+        {
+            struct Guard
+            {
+                Guard() { s_inVerify = true; }
+                ~Guard() { s_inVerify = false; }
+            } guard;
+            static std::vector<uint8_t> s_ref;
+            static uint64_t s_checked = 0, s_mismatches = 0;
+            s_ref.assign(vuData, vuData + vuDataSize);
+            VIFRegisters refRegs = regs;
+            const uint32_t refBytes = vifUnpack(refRegs, s_ref.data(), vuDataSize, opcode, imm, num, src, available, false);
+            const uint32_t bytes = vifUnpack(regs, vuData, vuDataSize, opcode, imm, num, src, available, true);
+            ++s_checked;
+            if ((bytes != refBytes || std::memcmp(s_ref.data(), vuData, vuDataSize) != 0) && ++s_mismatches <= 20)
+            {
+                uint32_t at = 0;
+                while (at < vuDataSize && s_ref[at] == vuData[at])
+                    ++at;
+                std::fprintf(stderr, "[VIFVERIFY] mismatch op=0x%02x imm=0x%04x num=%u cycle=0x%04x mode=%u bytes=%u/%u first diff at 0x%x\n",
+                             opcode, imm, num, regs.cycle, regs.mode, bytes, refBytes, at);
+            }
+            if ((s_checked & 0xFFFFF) == 0)
+                std::fprintf(stderr, "[VIFVERIFY] checked=%llu mismatches=%llu\n",
+                             static_cast<unsigned long long>(s_checked), static_cast<unsigned long long>(s_mismatches));
+            return bytes;
+        }
         const uint32_t qwMask = vuDataSize / 16u - 1u;
         uint8_t vn = (opcode >> 2) & 0x3;
         uint8_t vl = opcode & 0x3;
@@ -139,6 +172,62 @@ namespace
             vuAddr = (vuAddr + (regs.tops & 0x3FFu)) & qwMask;
 
         const bool zeroExtend = (imm & 0x4000u) != 0u;
+
+        // Fast path for the common case: no write mask, no row addition (STMOD 0) and no fill
+        // cycles (CL >= WL). Every write then takes the next source vector, and the generic loop
+        // below reduces to writing the decoded components over the destination (lanes a narrower
+        // format does not decode keep their value; a single component is broadcast).
+        const bool knownFormat = vl != 3u || vn == 3u;
+        if (allowFast && vuData && totalBytes > 0 && totalBytes <= available && !maskEnable && (regs.mode & 3u) == 0u &&
+            cl >= wl && knownFormat)
+        {
+            const uint8_t *srcVec = src;
+            uint32_t cyclePos = 0u;
+            uint32_t blockBase = vuAddr;
+            for (uint32_t writeIndex = 0; writeIndex < writeVectorCount; ++writeIndex, srcVec += bytesPerVector)
+            {
+                uint32_t *dst = reinterpret_cast<uint32_t *>(vuData + ((blockBase + cyclePos) & qwMask) * 16u);
+                if (++cyclePos == wl)
+                {
+                    cyclePos = 0u;
+                    blockBase += cl;
+                }
+                if (vl == 3u) // V4-5
+                {
+                    uint16_t packed = 0;
+                    std::memcpy(&packed, srcVec, sizeof(packed));
+                    dst[0] = packed & 0x1Fu;
+                    dst[1] = (packed >> 5) & 0x1Fu;
+                    dst[2] = (packed >> 10) & 0x1Fu;
+                    dst[3] = (packed >> 15) & 0x01u;
+                    continue;
+                }
+                uint32_t v[4];
+                for (int c = 0; c < components; ++c)
+                {
+                    if (vl == 0u)
+                        std::memcpy(&v[c], srcVec + c * 4u, sizeof(uint32_t));
+                    else if (vl == 1u)
+                    {
+                        uint16_t raw = 0;
+                        std::memcpy(&raw, srcVec + c * 2u, sizeof(raw));
+                        v[c] = zeroExtend ? static_cast<uint32_t>(raw)
+                                          : static_cast<uint32_t>(static_cast<int32_t>(static_cast<int16_t>(raw)));
+                    }
+                    else
+                    {
+                        const uint8_t raw = srcVec[c];
+                        v[c] = zeroExtend ? static_cast<uint32_t>(raw)
+                                          : static_cast<uint32_t>(static_cast<int32_t>(static_cast<int8_t>(raw)));
+                    }
+                }
+                if (components == 1)
+                    dst[0] = dst[1] = dst[2] = dst[3] = v[0];
+                else
+                    std::memcpy(dst, v, static_cast<size_t>(components) * sizeof(uint32_t));
+            }
+            return totalBytes;
+        }
 
         if (vuData && totalBytes > 0 && totalBytes <= available)
         {
