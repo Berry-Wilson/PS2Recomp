@@ -31,6 +31,16 @@ namespace ps2_stubs
         uint32_t g_cdStReadTraceCount = 0u;
         CdStreamTimingState g_cdStreamTiming;
 
+        // PS2X_CD_STREAM_LOG=1 logs stream starts and the first reads of each stream.
+        bool cdStreamLogEnabled()
+        {
+            static const bool enabled = [] {
+                const char *e = std::getenv("PS2X_CD_STREAM_LOG");
+                return e != nullptr && e[0] != '\0' && e[0] != '0';
+            }();
+            return enabled;
+        }
+
         uint64_t currentCdStreamTick(PS2Runtime *runtime)
         {
             return runtime != nullptr ? runtime->eeScheduler().currentVSyncTick() : 0u;
@@ -825,7 +835,7 @@ namespace ps2_stubs
                 const bool hitStreamEnd = g_cdStreamingEndLbn != 0xFFFFFFFFu && g_cdStreamingLbn >= g_cdStreamingEndLbn;
                 notifyMpegCdStreamDataProduced(static_cast<uint32_t>(readBytes), hitStreamEnd);
 
-                if (g_cdStReadTraceCount < 32u)
+                if (cdStreamLogEnabled() && g_cdStReadTraceCount < 32u)
                 {
                     std::cerr << "[sceCdStRead] requested=" << state.requestedSectors
                               << " accumulated=" << state.sectorsRead
@@ -981,12 +991,15 @@ namespace ps2_stubs
 
         notifyMpegCdStreamStart(runtime);
 
-        std::cerr << "[sceCdStStart] lbn=0x" << std::hex << g_cdStreamingLbn
-                  << " endLbn=0x" << g_cdStreamingEndLbn << std::dec
-                  << " rate=" << g_cdStreamTiming.sectorsPerSecond << " sectors/s"
-                  << " buffer=" << g_cdStreamTiming.capacitySectors << " sectors"
-                  << " bank=" << g_cdStreamTiming.sectorsPerBank << " sectors"
-                  << std::endl;
+        if (cdStreamLogEnabled())
+        {
+            std::cerr << "[sceCdStStart] lbn=0x" << std::hex << g_cdStreamingLbn
+                      << " endLbn=0x" << g_cdStreamingEndLbn << std::dec
+                      << " rate=" << g_cdStreamTiming.sectorsPerSecond << " sectors/s"
+                      << " buffer=" << g_cdStreamTiming.capacitySectors << " sectors"
+                      << " bank=" << g_cdStreamTiming.sectorsPerBank << " sectors"
+                      << std::endl;
+        }
         setReturnS32(ctx, 1);
     }
 
