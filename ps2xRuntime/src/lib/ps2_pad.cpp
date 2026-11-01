@@ -1,5 +1,6 @@
 #include "runtime/ps2_pad.h"
 #include "ps2_host_backend.h"
+#include <cmath>
 #include <cstring>
 #include <cstdio>
 #include <cstdlib>
@@ -202,102 +203,121 @@ bool PSPadBackend::readState(int port, int /*slot*/, uint8_t *data, size_t size)
     data[4] = data[5] = data[6] = data[7] = kPadStickCenter;
 
     uint16_t btns = 0xFFFFu;
-    constexpr int kGamepad = 0;
-    const bool useGamepad = IsGamepadAvailable(kGamepad);
     auto clearBit = [&btns](uint16_t mask)
     { btns &= ~mask; };
 
-    if (useGamepad)
+    // Each stick axis takes whichever source is pushed furthest from centre, so the keyboard and
+    // every connected gamepad can be used together (an idle or wrongly mapped pad in slot 0 must
+    // not shut out the others).
+    float axes[4] = {0.0f, 0.0f, 0.0f, 0.0f}; // lx, ly, rx, ry in [-1, 1]
+    auto mergeAxis = [&axes](int index, float value)
     {
-        if (IsGamepadButtonDown(kGamepad, GAMEPAD_BUTTON_LEFT_FACE_UP))
-            clearBit(PAD_UP);
-        if (IsGamepadButtonDown(kGamepad, GAMEPAD_BUTTON_LEFT_FACE_DOWN))
-            clearBit(PAD_DOWN);
-        if (IsGamepadButtonDown(kGamepad, GAMEPAD_BUTTON_LEFT_FACE_LEFT))
-            clearBit(PAD_LEFT);
-        if (IsGamepadButtonDown(kGamepad, GAMEPAD_BUTTON_LEFT_FACE_RIGHT))
-            clearBit(PAD_RIGHT);
-        if (IsGamepadButtonDown(kGamepad, GAMEPAD_BUTTON_RIGHT_FACE_DOWN))
-            clearBit(PAD_CROSS);
-        if (IsGamepadButtonDown(kGamepad, GAMEPAD_BUTTON_RIGHT_FACE_RIGHT))
-            clearBit(PAD_CIRCLE);
-        if (IsGamepadButtonDown(kGamepad, GAMEPAD_BUTTON_RIGHT_FACE_LEFT))
-            clearBit(PAD_SQUARE);
-        if (IsGamepadButtonDown(kGamepad, GAMEPAD_BUTTON_RIGHT_FACE_UP))
-            clearBit(PAD_TRIANGLE);
-        if (IsGamepadButtonDown(kGamepad, GAMEPAD_BUTTON_LEFT_TRIGGER_1))
-            clearBit(PAD_L1);
-        if (IsGamepadButtonDown(kGamepad, GAMEPAD_BUTTON_RIGHT_TRIGGER_1))
-            clearBit(PAD_R1);
-        if (IsGamepadButtonDown(kGamepad, GAMEPAD_BUTTON_LEFT_TRIGGER_2))
-            clearBit(PAD_L2);
-        if (IsGamepadButtonDown(kGamepad, GAMEPAD_BUTTON_RIGHT_TRIGGER_2))
-            clearBit(PAD_R2);
-        if (IsGamepadButtonDown(kGamepad, GAMEPAD_BUTTON_MIDDLE_RIGHT))
-            clearBit(PAD_START);
-        if (IsGamepadButtonDown(kGamepad, GAMEPAD_BUTTON_MIDDLE_LEFT))
-            clearBit(PAD_SELECT);
-        if (IsGamepadButtonDown(kGamepad, GAMEPAD_BUTTON_LEFT_THUMB))
-            clearBit(PAD_L3);
-        if (IsGamepadButtonDown(kGamepad, GAMEPAD_BUTTON_RIGHT_THUMB))
-            clearBit(PAD_R3);
+        if (std::fabs(value) > std::fabs(axes[index]))
+            axes[index] = value;
+    };
 
-        float lx = GetGamepadAxisMovement(kGamepad, GAMEPAD_AXIS_LEFT_X);
-        float ly = GetGamepadAxisMovement(kGamepad, GAMEPAD_AXIS_LEFT_Y);
-        float rx = GetGamepadAxisMovement(kGamepad, GAMEPAD_AXIS_RIGHT_X);
-        float ry = GetGamepadAxisMovement(kGamepad, GAMEPAD_AXIS_RIGHT_Y);
-        data[6] = static_cast<uint8_t>(128 + lx * 127);
-        data[7] = static_cast<uint8_t>(128 + ly * 127);
-        data[4] = static_cast<uint8_t>(128 + rx * 127);
-        data[5] = static_cast<uint8_t>(128 + ry * 127);
-    }
-    else
+    constexpr int kMaxGamepads = 4;
+    static bool s_padConnected[kMaxGamepads] = {};
+    for (int pad = 0; pad < kMaxGamepads; ++pad)
     {
-        // D-pad: arrow keys. Left stick: WASD. Right stick: IJKL.
-        if (IsKeyDown(KEY_UP))
-            clearBit(PAD_UP);
-        if (IsKeyDown(KEY_DOWN))
-            clearBit(PAD_DOWN);
-        if (IsKeyDown(KEY_LEFT))
-            clearBit(PAD_LEFT);
-        if (IsKeyDown(KEY_RIGHT))
-            clearBit(PAD_RIGHT);
-
-        auto keyAxis = [](int negativeKey, int positiveKey) -> uint8_t
+        const bool available = IsGamepadAvailable(pad);
+        if (available != s_padConnected[pad])
         {
-            int value = 0;
-            if (IsKeyDown(negativeKey))
-                value -= 127;
-            if (IsKeyDown(positiveKey))
-                value += 127;
-            return static_cast<uint8_t>(kPadStickCenter + value);
+            s_padConnected[pad] = available;
+            if (available)
+                std::fprintf(stderr, "[pad] gamepad %d connected: %s\n", pad, GetGamepadName(pad));
+            else
+                std::fprintf(stderr, "[pad] gamepad %d disconnected\n", pad);
+        }
+        if (!available)
+            continue;
+        static constexpr struct
+        {
+            int button;
+            uint16_t mask;
+        } kButtonMap[] = {
+            {GAMEPAD_BUTTON_LEFT_FACE_UP, PAD_UP},
+            {GAMEPAD_BUTTON_LEFT_FACE_DOWN, PAD_DOWN},
+            {GAMEPAD_BUTTON_LEFT_FACE_LEFT, PAD_LEFT},
+            {GAMEPAD_BUTTON_LEFT_FACE_RIGHT, PAD_RIGHT},
+            {GAMEPAD_BUTTON_RIGHT_FACE_DOWN, PAD_CROSS},
+            {GAMEPAD_BUTTON_RIGHT_FACE_RIGHT, PAD_CIRCLE},
+            {GAMEPAD_BUTTON_RIGHT_FACE_LEFT, PAD_SQUARE},
+            {GAMEPAD_BUTTON_RIGHT_FACE_UP, PAD_TRIANGLE},
+            {GAMEPAD_BUTTON_LEFT_TRIGGER_1, PAD_L1},
+            {GAMEPAD_BUTTON_RIGHT_TRIGGER_1, PAD_R1},
+            {GAMEPAD_BUTTON_LEFT_TRIGGER_2, PAD_L2},
+            {GAMEPAD_BUTTON_RIGHT_TRIGGER_2, PAD_R2},
+            {GAMEPAD_BUTTON_MIDDLE_RIGHT, PAD_START},
+            {GAMEPAD_BUTTON_MIDDLE_LEFT, PAD_SELECT},
+            {GAMEPAD_BUTTON_LEFT_THUMB, PAD_L3},
+            {GAMEPAD_BUTTON_RIGHT_THUMB, PAD_R3},
         };
-        data[6] = keyAxis(KEY_A, KEY_D); // left X
-        data[7] = keyAxis(KEY_W, KEY_S); // left Y
-        data[4] = keyAxis(KEY_J, KEY_L); // right X
-        data[5] = keyAxis(KEY_I, KEY_K); // right Y
-
-        if (IsKeyDown(KEY_X) || IsKeyDown(KEY_SPACE))
-            clearBit(PAD_CROSS);
-        if (IsKeyDown(KEY_C) || IsKeyDown(KEY_ESCAPE))
-            clearBit(PAD_CIRCLE);
-        if (IsKeyDown(KEY_Z) || IsKeyDown(KEY_KP_0))
-            clearBit(PAD_SQUARE);
-        if (IsKeyDown(KEY_V) || IsKeyDown(KEY_KP_1))
-            clearBit(PAD_TRIANGLE);
-        if (IsKeyDown(KEY_Q))
-            clearBit(PAD_L1);
-        if (IsKeyDown(KEY_E))
-            clearBit(PAD_R1);
-        if (IsKeyDown(KEY_LEFT_SHIFT))
-            clearBit(PAD_L2);
-        if (IsKeyDown(KEY_RIGHT_SHIFT))
-            clearBit(PAD_R2);
-        if (IsKeyDown(KEY_ENTER))
-            clearBit(PAD_START);
-        if (IsKeyDown(KEY_TAB))
-            clearBit(PAD_SELECT);
+        for (const auto &entry : kButtonMap)
+        {
+            if (IsGamepadButtonDown(pad, entry.button))
+                clearBit(entry.mask);
+        }
+        mergeAxis(0, GetGamepadAxisMovement(pad, GAMEPAD_AXIS_LEFT_X));
+        mergeAxis(1, GetGamepadAxisMovement(pad, GAMEPAD_AXIS_LEFT_Y));
+        mergeAxis(2, GetGamepadAxisMovement(pad, GAMEPAD_AXIS_RIGHT_X));
+        mergeAxis(3, GetGamepadAxisMovement(pad, GAMEPAD_AXIS_RIGHT_Y));
     }
+
+    // Keyboard. D-pad: arrow keys. Left stick: WASD. Right stick: IJKL.
+    if (IsKeyDown(KEY_UP))
+        clearBit(PAD_UP);
+    if (IsKeyDown(KEY_DOWN))
+        clearBit(PAD_DOWN);
+    if (IsKeyDown(KEY_LEFT))
+        clearBit(PAD_LEFT);
+    if (IsKeyDown(KEY_RIGHT))
+        clearBit(PAD_RIGHT);
+
+    auto keyAxis = [](int negativeKey, int positiveKey) -> float
+    {
+        float value = 0.0f;
+        if (IsKeyDown(negativeKey))
+            value -= 1.0f;
+        if (IsKeyDown(positiveKey))
+            value += 1.0f;
+        return value;
+    };
+    mergeAxis(0, keyAxis(KEY_A, KEY_D));
+    mergeAxis(1, keyAxis(KEY_W, KEY_S));
+    mergeAxis(2, keyAxis(KEY_J, KEY_L));
+    mergeAxis(3, keyAxis(KEY_I, KEY_K));
+
+    if (IsKeyDown(KEY_X) || IsKeyDown(KEY_SPACE))
+        clearBit(PAD_CROSS);
+    if (IsKeyDown(KEY_C) || IsKeyDown(KEY_ESCAPE))
+        clearBit(PAD_CIRCLE);
+    if (IsKeyDown(KEY_Z) || IsKeyDown(KEY_KP_0))
+        clearBit(PAD_SQUARE);
+    if (IsKeyDown(KEY_V) || IsKeyDown(KEY_KP_1))
+        clearBit(PAD_TRIANGLE);
+    if (IsKeyDown(KEY_Q))
+        clearBit(PAD_L1);
+    if (IsKeyDown(KEY_E))
+        clearBit(PAD_R1);
+    if (IsKeyDown(KEY_LEFT_SHIFT))
+        clearBit(PAD_L2);
+    if (IsKeyDown(KEY_RIGHT_SHIFT))
+        clearBit(PAD_R2);
+    if (IsKeyDown(KEY_ENTER))
+        clearBit(PAD_START);
+    if (IsKeyDown(KEY_TAB))
+        clearBit(PAD_SELECT);
+
+    auto stickByte = [](float value) -> uint8_t
+    {
+        value = std::fmax(-1.0f, std::fmin(1.0f, value));
+        return static_cast<uint8_t>(kPadStickCenter + static_cast<int>(value * 127.0f));
+    };
+    data[6] = stickByte(axes[0]);
+    data[7] = stickByte(axes[1]);
+    data[4] = stickByte(axes[2]);
+    data[5] = stickByte(axes[3]);
 
     btns &= static_cast<uint16_t>(~autoPadPressedMask());
 
