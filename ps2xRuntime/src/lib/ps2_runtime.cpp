@@ -516,6 +516,7 @@ namespace
             startPC = vu1.state().pc;
         auto interpret = [&]
         {
+            vu1n::invalidateRegisters(vu1n::Unit::VU1);
             if (resume)
                 vu1.resume(code, PS2_VU1_CODE_SIZE, data, PS2_VU1_DATA_SIZE, gs, &memory, top, itop, 65536);
             else
@@ -569,6 +570,7 @@ namespace
             }
             else if (r == vu1n::RunResult::Bailed)
             {
+                vu1n::invalidateRegisters(vu1n::Unit::VU1);
                 vu1.resetPipelines();
                 vu1.resume(code, PS2_VU1_CODE_SIZE, data, PS2_VU1_DATA_SIZE, gs, &memory, top, itop, 65536);
             }
@@ -1375,6 +1377,7 @@ bool PS2Runtime::syncCoreSubsystems()
     resetIop();
     m_vu0.reset();
     m_vu1.reset();
+    vu1n::invalidateRegisters(vu1n::Unit::VU1);
 
     m_boundRdram = rdram;
     m_boundGSVram = gsVram;

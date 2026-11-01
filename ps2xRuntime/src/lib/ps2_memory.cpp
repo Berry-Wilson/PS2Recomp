@@ -402,6 +402,8 @@ bool PS2Memory::initialize(size_t ramSize)
 void PS2Memory::resetEeTimers() noexcept
 {
     m_eeTimers = {};
+    m_eeTimerPendingCycles = 0u;
+    m_eeTimerBudget = 0u;
 }
 
 uint32_t PS2Memory::advanceEeTimers(uint64_t eeCycles) noexcept
@@ -411,12 +413,44 @@ uint32_t PS2Memory::advanceEeTimers(uint64_t eeCycles) noexcept
         return 0u;
     }
 
-    constexpr uint32_t kGifStat = 0x10003020u;
-    constexpr uint32_t kGifFqcMask = 0x1F000000u;
-    auto gifStatIt = m_ioRegisters.find(kGifStat);
-    if (gifStatIt != m_ioRegisters.end())
-        gifStatIt->second &= ~kGifFqcMask;
+    if (m_gifFqcSet)
+    {
+        constexpr uint32_t kGifStat = 0x10003020u;
+        constexpr uint32_t kGifFqcMask = 0x1F000000u;
+        auto gifStatIt = m_ioRegisters.find(kGifStat);
+        if (gifStatIt != m_ioRegisters.end())
+            gifStatIt->second &= ~kGifFqcMask;
+        m_gifFqcSet = false;
+    }
 
+    m_eeTimerPendingCycles += eeCycles;
+    if (m_eeTimerPendingCycles < m_eeTimerBudget)
+    {
+        return 0u;
+    }
+    return flushEeTimers();
+}
+
+uint32_t PS2Memory::flushEeTimers() noexcept
+{
+    const uint64_t cycles = m_eeTimerPendingCycles;
+    m_eeTimerPendingCycles = 0u;
+    const uint32_t mask = cycles != 0u ? applyEeTimerCycles(cycles) : 0u;
+    m_eeTimerBudget = computeCyclesUntilNextEeTimerInterrupt();
+    return mask;
+}
+
+uint64_t PS2Memory::cyclesUntilNextEeTimerInterrupt() const noexcept
+{
+    if (m_eeTimerBudget == std::numeric_limits<uint64_t>::max())
+    {
+        return m_eeTimerBudget;
+    }
+    return m_eeTimerBudget > m_eeTimerPendingCycles ? m_eeTimerBudget - m_eeTimerPendingCycles : 1u;
+}
+
+uint32_t PS2Memory::applyEeTimerCycles(uint64_t eeCycles) noexcept
+{
     uint32_t interruptMask = 0u;
     for (size_t index = 0; index < m_eeTimers.size(); ++index)
     {
@@ -480,7 +514,7 @@ uint32_t PS2Memory::advanceEeTimers(uint64_t eeCycles) noexcept
     return interruptMask;
 }
 
-uint64_t PS2Memory::cyclesUntilNextEeTimerInterrupt() const noexcept
+uint64_t PS2Memory::computeCyclesUntilNextEeTimerInterrupt() const noexcept
 {
     uint64_t nearest = std::numeric_limits<uint64_t>::max();
     for (const EeTimer &timer : m_eeTimers)
@@ -1128,6 +1162,13 @@ bool PS2Memory::writeIORegister(uint32_t address, uint32_t value)
     uint32_t timerOffset = 0u;
     if (decodeEeTimerRegister(address, timerIndex, timerOffset))
     {
+        // Pending cycles are below the interrupt budget, so flushing raises nothing.
+        (void)flushEeTimers();
+        struct Rebudget
+        {
+            PS2Memory &m;
+            ~Rebudget() { m.m_eeTimerBudget = m.computeCyclesUntilNextEeTimerInterrupt(); }
+        } rebudget{*this};
         EeTimer &timer = m_eeTimers[timerIndex];
         switch (timerOffset)
         {
@@ -1722,6 +1763,7 @@ void PS2Memory::processPendingTransfers()
         constexpr uint32_t kGifFqcMask = 0x1F000000u;
         uint32_t &gifStat = m_ioRegisters[kGifStat];
         gifStat = (gifStat & ~kGifFqcMask) | (observedGifQwc << 24u);
+        m_gifFqcSet = true;
     }
 
     for (size_t idx = 0; idx < m_pendingGifTransfers.size(); ++idx)
@@ -2329,6 +2371,7 @@ uint32_t PS2Memory::readIORegister(uint32_t address)
     uint32_t timerOffset = 0u;
     if (decodeEeTimerRegister(address, timerIndex, timerOffset))
     {
+        (void)flushEeTimers(); // below the interrupt budget: brings counts up to date, raises nothing
         const EeTimer &timer = m_eeTimers[timerIndex];
         switch (timerOffset)
         {

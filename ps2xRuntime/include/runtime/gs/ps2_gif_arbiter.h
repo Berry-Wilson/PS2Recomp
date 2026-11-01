@@ -33,11 +33,13 @@ public:
     void submit(GifPathId pathId, const uint8_t *data, uint32_t sizeBytes, bool path2DirectHl = false);
 
     void drain();
-    bool empty() const { return m_queue.empty(); }
+    bool empty() const { return m_count == 0u; }
 
 private:
     ProcessPacketFn m_processFn;
+    // Entries [0, m_count) are queued; later entries keep their buffers for reuse.
     std::vector<GifArbiterPacket> m_queue;
+    size_t m_count = 0u;
 
     static bool isImagePacket(const uint8_t *data, uint32_t sizeBytes);
     static uint8_t pathPriority(GifPathId id);

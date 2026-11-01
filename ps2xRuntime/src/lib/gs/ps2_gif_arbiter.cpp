@@ -24,13 +24,13 @@ void GifArbiter::submit(GifPathId pathId, const uint8_t *data, uint32_t sizeByte
     if (!data || sizeBytes < 16 || !m_processFn)
         return;
 
-    GifArbiterPacket pkt;
+    if (m_count == m_queue.size())
+        m_queue.emplace_back();
+    GifArbiterPacket &pkt = m_queue[m_count++];
     pkt.pathId = pathId;
     pkt.path2DirectHl = (pathId == GifPathId::Path2) && path2DirectHl;
     pkt.path3Image = (pathId == GifPathId::Path3) && isImagePacket(data, sizeBytes);
-    pkt.data.resize(sizeBytes);
-    std::memcpy(pkt.data.data(), data, sizeBytes);
-    m_queue.push_back(std::move(pkt));
+    pkt.data.assign(data, data + sizeBytes);
 }
 
 void GifArbiter::drain()
@@ -38,21 +38,24 @@ void GifArbiter::drain()
     if (!m_processFn)
         return;
 
-    std::stable_sort(m_queue.begin(), m_queue.end(),
-                     [](const GifArbiterPacket &a, const GifArbiterPacket &b)
-                     {
-                         // DIRECTHL cannot preempt PATH3 IMAGE transfers.
-                         if (a.path2DirectHl != b.path2DirectHl || a.path3Image != b.path3Image)
-                         {
-                             if (a.path3Image && b.path2DirectHl)
-                                 return true;
-                             if (a.path2DirectHl && b.path3Image)
-                                 return false;
-                         }
-                         return pathPriority(a.pathId) < pathPriority(b.pathId);
-                     });
+    const auto before = [](const GifArbiterPacket &a, const GifArbiterPacket &b)
+    {
+        // DIRECTHL cannot preempt PATH3 IMAGE transfers.
+        if (a.path2DirectHl != b.path2DirectHl || a.path3Image != b.path3Image)
+        {
+            if (a.path3Image && b.path2DirectHl)
+                return true;
+            if (a.path2DirectHl && b.path3Image)
+                return false;
+        }
+        return pathPriority(a.pathId) < pathPriority(b.pathId);
+    };
+    // The queue is usually already in order (one path); a stable sort would then change nothing.
+    const auto end = m_queue.begin() + static_cast<std::ptrdiff_t>(m_count);
+    if (!std::is_sorted(m_queue.begin(), end, before))
+        std::stable_sort(m_queue.begin(), end, before);
 
-    for (size_t i = 0; i < m_queue.size(); ++i)
+    for (size_t i = 0; i < m_count; ++i)
     {
         auto &pkt = m_queue[i];
         if (!pkt.data.empty())
@@ -60,7 +63,7 @@ void GifArbiter::drain()
             m_processFn(pkt.data.data(), static_cast<uint32_t>(pkt.data.size()), static_cast<uint32_t>(pkt.pathId));
         }
     }
-    m_queue.clear();
+    m_count = 0u;
 }
 
 uint8_t GifArbiter::pathPriority(GifPathId id)

@@ -119,6 +119,10 @@ namespace vu1n
     RunResult run(Unit unit, VU1State &state, const uint8_t *code, uint64_t codeGeneration, uint8_t *data,
                   uint32_t startPc, uint32_t top, uint32_t itop, uint32_t maxCycles, KickSink sink, void *sinkUser);
 
+    // run() reuses the registers it left in its context when called again with the same state.
+    // Call this whenever anything else (the interpreter, a reset) changes that state's registers.
+    void invalidateRegisters(Unit unit);
+
     // ---------------------------------------------------------------------
     // Helpers used by generated code
     // ---------------------------------------------------------------------

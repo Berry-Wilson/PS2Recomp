@@ -458,6 +458,15 @@ public:
     };
 
     std::array<EeTimer, 4> m_eeTimers{};
+    // advanceEeTimers runs for every few EE cycles, so cycles are only accumulated until they
+    // reach the next possible timer interrupt (m_eeTimerBudget, exact) or a timer register is
+    // accessed; applying them in one step gives the same counts as applying them one by one.
+    uint64_t m_eeTimerPendingCycles = 0;
+    uint64_t m_eeTimerBudget = 0;
+    bool m_gifFqcSet = false; // GIF_STAT.FQC was set by the last DMA batch; cleared on the next advance
+    uint32_t applyEeTimerCycles(uint64_t eeCycles) noexcept;
+    uint32_t flushEeTimers() noexcept;
+    [[nodiscard]] uint64_t computeCyclesUntilNextEeTimerInterrupt() const noexcept;
     bool tryProcessScratchpadDma(uint32_t channelBase, uint32_t chcr);
     void completeDmacChannel(uint32_t channelBase, uint32_t cause);
     void queueCompletedDmacCause(uint32_t cause);

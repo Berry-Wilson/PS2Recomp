@@ -43,11 +43,15 @@ namespace vu1n
             t.valid = true;
         }
 
-        Ctx &context()
+        Ctx &context(Unit unit)
         {
-            static Ctx *c = new Ctx();
-            return *c;
+            static Ctx *c[2] = {new Ctx(), new Ctx()};
+            return *c[static_cast<int>(unit)];
         }
+
+        // VU1 registers held by context(VU1) are exactly what the last run copied out to this
+        // state, so the next run can skip copying them back in (see invalidateRegisters).
+        const VU1State *g_registersOf[2] = {nullptr, nullptr};
 
         void flush(Ctx &c)
         {
@@ -174,16 +178,22 @@ namespace vu1n
         if (fn == nullptr || (startPc & 7u) != 0u)
             return RunResult::NotTranslated;
 
-        Ctx &c = context();
-        std::memcpy(c.vf, state.vf, sizeof(c.vf));
-        c.vf[0][0] = c.vf[0][1] = c.vf[0][2] = 0.0f;
-        c.vf[0][3] = 1.0f;
-        std::memcpy(c.acc, state.acc, sizeof(c.acc));
-        std::memcpy(c.vi, state.vi, sizeof(c.vi));
-        c.vi[0] = 0;
-        c.q = state.q;
-        c.p = state.p;
-        c.i = state.i;
+        Ctx &c = context(unit);
+        const int u = static_cast<int>(unit);
+        // VU0's state is rebuilt from the EE context on every call, so only VU1 can reuse registers.
+        if (unit == Unit::VU0 || g_registersOf[u] != &state)
+        {
+            std::memcpy(c.vf, state.vf, sizeof(c.vf));
+            c.vf[0][0] = c.vf[0][1] = c.vf[0][2] = 0.0f;
+            c.vf[0][3] = 1.0f;
+            std::memcpy(c.acc, state.acc, sizeof(c.acc));
+            std::memcpy(c.vi, state.vi, sizeof(c.vi));
+            c.vi[0] = 0;
+            c.q = state.q;
+            c.p = state.p;
+            c.i = state.i;
+        }
+        g_registersOf[u] = nullptr; // until this run's results are copied out below
         c.mem = data;
         c.top = top;
         // Every run used to start at cycle 0 with all registers ready. Starting each run past the
@@ -279,6 +289,12 @@ namespace vu1n
         state.stoppedByT = false;
         state.branchPending = false;
         state.cycles += cycles;
+        g_registersOf[u] = &state;
         return result;
+    }
+
+    void invalidateRegisters(Unit unit)
+    {
+        g_registersOf[static_cast<int>(unit)] = nullptr;
     }
 }
