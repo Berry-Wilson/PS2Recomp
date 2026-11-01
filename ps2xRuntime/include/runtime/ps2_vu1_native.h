@@ -435,6 +435,16 @@ namespace vu1n
         pushClip(c, c.workingClip);
     }
 
+    // FCSET replaces a CLIP issued in the same cycle, as in VU1Interpreter::queueFcset.
+    VU1N_INLINE void fcset(Ctx &c, uint32_t value)
+    {
+        c.workingClip = value & 0xFFFFFFu;
+        if (c.clipCount != 0u && c.clipCyc[c.clipHead] == c.cyc)
+            c.clipVal[c.clipHead] = c.workingClip;
+        else
+            pushClip(c, c.workingClip);
+    }
+
     // --- Q / P ---------------------------------------------------------------
 
     VU1N_INLINE float readQ(Ctx &c)
