@@ -118,8 +118,8 @@ namespace vu1n
                 return;
             }
             const uint32_t qwordOffset = copied;
-            for (uint32_t i = 0; i < 16u; ++i)
-                c.kickBuf[copied + i] = c.mem[(src + copied + i) % kDataSize];
+            // src and copied are qword aligned and kDataSize is a multiple of 16, so a qword never wraps.
+            std::memcpy(c.kickBuf + copied, c.mem + (src + copied) % kDataSize, 16u);
             copied += 16u;
 
             if (tagEnd == 0u)
@@ -186,10 +186,17 @@ namespace vu1n
         c.i = state.i;
         c.mem = data;
         c.top = top;
-        c.cyc = 0u;
+        // Every run used to start at cycle 0 with all registers ready. Starting each run past the
+        // previous one's last ready time is equivalent and avoids clearing vfReady/viReady per call.
+        uint32_t start = c.cycBase;
+        if (start > 0xF0000000u)
+        {
+            start = 0u;
+            std::memset(c.vfReady, 0, sizeof(c.vfReady));
+            std::memset(c.viReady, 0, sizeof(c.viReady));
+        }
+        c.cyc = start;
         c.endPc = 0u;
-        std::memset(c.vfReady, 0, sizeof(c.vfReady));
-        std::memset(c.viReady, 0, sizeof(c.viReady));
         c.macHead = c.macCount = 0u;
         c.macBase = state.mac;
         c.clipHead = c.clipCount = 0u;
@@ -234,7 +241,7 @@ namespace vu1n
                 result = RunResult::Bailed;
                 break;
             }
-            if (c.cyc >= maxCycles)
+            if (c.cyc - start >= maxCycles)
             {
                 static bool warned[2] = {};
                 if (!warned[static_cast<int>(unit)])
@@ -248,7 +255,9 @@ namespace vu1n
             }
         }
 
-        const uint32_t cycles = c.cyc;
+        const uint32_t cycles = c.cyc - start;
+        // Latencies are at most a few dozen cycles, so nothing issued in this run is pending past this.
+        c.cycBase = c.cyc + 256u;
         if (ended)
             flush(c);
         _mm_setcsr(savedCsr);

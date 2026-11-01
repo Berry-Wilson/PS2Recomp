@@ -52,7 +52,8 @@ namespace vu1n
 
         uint8_t *mem;
         uint32_t top;
-        uint32_t cyc;
+        uint32_t cyc;     // keeps counting across runs so vfReady/viReady never need clearing (see run())
+        uint32_t cycBase; // where the next run's cyc starts
         uint32_t endPc;
 
         uint32_t vfReady[32][4];

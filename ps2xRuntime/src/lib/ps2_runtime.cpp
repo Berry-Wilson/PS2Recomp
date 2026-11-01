@@ -2238,7 +2238,8 @@ void PS2Runtime::executeVU0Microprogram(uint8_t *rdram, R5900Context *ctx, uint3
     const auto t0 = std::chrono::steady_clock::now();
     constexpr uint32_t kVu0Budget = 4096;
     const uint64_t generation = m_memory.getVU0CodeGeneration();
-    m_vu0.reset();
+    // No m_vu0.reset(): copyVu0ContextToState rebuilds the whole state, and the interpreter paths
+    // reset their own pipelines (execute() / resetPipelines()), so the translated path skips that work.
     copyVu0ContextToState(ctx, m_vu0.state());
     auto interpret = [&]
     {
