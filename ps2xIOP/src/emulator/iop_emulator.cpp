@@ -131,6 +131,7 @@ namespace ps2x::iop::detail
             totalCycles = 0;
             totalInstructions = 0;
             eeCycleCarry = 0;
+            idleEpoch = ~0ull;
             activeCpu = nullptr;
             lastError.clear();
             servicingDmaInterrupts = false;
@@ -558,6 +559,11 @@ namespace ps2x::iop::detail
             try
             {
                 const uint64_t target = totalCycles + cycles;
+                if (idleEpoch == stateEpoch && target < idleUntil)
+                {
+                    totalCycles = target;
+                    return;
+                }
                 while (totalCycles < target)
                 {
                     servicePendingDmaInterrupts();
@@ -566,12 +572,14 @@ namespace ps2x::iop::detail
                     IopThread *next = kernel.beginNextReady(totalCycles);
                     if (!next)
                     {
-                        uint64_t nextWake = kernel.nextWakeCycle(target);
+                        uint64_t nextWake = kernel.nextWakeCycle(~0ull);
                         for (const auto &[irq, completionCycle] : pendingDmaInterrupts)
                             nextWake = std::min(nextWake, completionCycle);
                         if (!pendingGuestCallbacks.empty())
                             nextWake = std::min(nextWake, pendingGuestCallbacks.begin()->first);
                         nextWake = timrman.nextEventCycle(nextWake);
+                        idleUntil = nextWake;
+                        idleEpoch = stateEpoch;
                         totalCycles = std::max(totalCycles + 1u, std::min(target, nextWake));
                         continue;
                     }
@@ -702,6 +710,12 @@ namespace ps2x::iop::detail
         uint64_t totalCycles = 0;
         uint64_t totalInstructions = 0;
         uint64_t eeCycleCarry = 0;
+        // runCycles is called for every few EE cycles. When a pass finds no ready thread it records
+        // the cycle of the next scheduled event; until then nothing can change unless the EE side
+        // calls in (which bumps stateEpoch), so later calls just advance the clock.
+        uint64_t stateEpoch = 0;
+        uint64_t idleEpoch = ~0ull;
+        uint64_t idleUntil = 0;
         CpuState *activeCpu = nullptr;
         std::string lastError;
         bool servicingDmaInterrupts = false;
@@ -721,21 +735,25 @@ namespace ps2x::iop::detail
 
     void IopEmulator::reset()
     {
+        ++m_impl->stateEpoch;
         m_impl->reset();
     }
 
     ModuleLoadResult IopEmulator::loadModule(std::string_view path, const void *arguments, uint32_t argumentSize)
     {
+        ++m_impl->stateEpoch;
         return m_impl->loadModule(path, arguments, argumentSize);
     }
 
     ModuleLoadResult IopEmulator::loadModuleBuffer(uint32_t guestAddress, const void *arguments, uint32_t argumentSize)
     {
+        ++m_impl->stateEpoch;
         return m_impl->loadModuleBuffer(guestAddress, arguments, argumentSize);
     }
 
     bool IopEmulator::stopModule(int32_t moduleId, int32_t *result)
     {
+        ++m_impl->stateEpoch;
         return m_impl->stopModule(moduleId, result);
     }
 
@@ -750,6 +768,7 @@ namespace ps2x::iop::detail
 
     RpcResult IopEmulator::handleRpc(const RpcRequest &request)
     {
+        ++m_impl->stateEpoch;
         return m_impl->rpc.handleRpc(request, *m_impl);
     }
 
@@ -760,16 +779,19 @@ namespace ps2x::iop::detail
 
     void IopEmulator::onSifTransfer(const SifTransfer &transfer)
     {
+        ++m_impl->stateEpoch;
         m_impl->rpc.onSifTransfer(transfer);
     }
 
     uint32_t IopEmulator::allocateMemory(uint32_t size, uint32_t alignment)
     {
+        ++m_impl->stateEpoch;
         return m_impl->memory.allocate(size, alignment);
     }
 
     bool IopEmulator::freeMemory(uint32_t address)
     {
+        ++m_impl->stateEpoch;
         return m_impl->memory.freeAllocation(address);
     }
 
@@ -781,12 +803,14 @@ namespace ps2x::iop::detail
 
     bool IopEmulator::writeMemory(uint32_t address, const void *source, size_t size)
     {
+        ++m_impl->stateEpoch;
         return isMemoryRange(address, size) &&
                m_impl->memory.writeRam(address, source, size);
     }
 
     bool IopEmulator::zeroMemory(uint32_t address, size_t size)
     {
+        ++m_impl->stateEpoch;
         return isMemoryRange(address, size) &&
                m_impl->memory.zeroRam(address, size);
     }
