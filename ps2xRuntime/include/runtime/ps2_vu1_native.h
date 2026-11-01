@@ -248,6 +248,49 @@ namespace vu1n
     template <int Op, int Dest>
     VU1N_INLINE __m128 fmac(Ctx &c, __m128 a, __m128 b, __m128 acc)
     {
+        constexpr int DSFast = kRev4[Dest];
+        if constexpr (Dest == 0)
+        {
+            // No lanes written and no flags pushed; only the computation's side effects matter (none).
+            (void)c;
+            (void)acc;
+            return a;
+        }
+        else
+        {
+            // Fast path, bit-identical to the double-precision path below. With round-toward-zero,
+            // a float result whose exponent is within [3, 252] in every written lane means the exact
+            // result is non-zero, has the same sign and neither overflows nor underflows, so the
+            // slow path would apply no fix-ups and report sign flags only. For MADD/MSUB the float
+            // result must also not come from heavy cancellation (|r| >= 2^-16 |a*b|), which bounds
+            // the exact result to within 1% of r.
+            __m128 r, prod;
+            if constexpr (Op == kAdd)
+                r = _mm_add_ps(a, b);
+            else if constexpr (Op == kSub)
+                r = _mm_sub_ps(a, b);
+            else if constexpr (Op == kMul)
+                r = _mm_mul_ps(a, b);
+            else
+            {
+                prod = _mm_mul_ps(a, b);
+                r = Op == kMadd ? _mm_add_ps(acc, prod) : _mm_sub_ps(acc, prod);
+            }
+            const __m128i ex = _mm_srli_epi32(_mm_and_si128(_mm_castps_si128(r), _mm_set1_epi32(0x7F800000)), 23);
+            __m128i ok = _mm_and_si128(_mm_cmpgt_epi32(ex, _mm_set1_epi32(2)), _mm_cmplt_epi32(ex, _mm_set1_epi32(253)));
+            if constexpr (Op == kMadd || Op == kMsub)
+            {
+                const __m128 absMask = _mm_castsi128_ps(_mm_set1_epi32(0x7FFFFFFF));
+                const __m128 bound = _mm_mul_ps(_mm_and_ps(prod, absMask), _mm_set1_ps(1.0f / 65536.0f));
+                ok = _mm_and_si128(ok, _mm_castps_si128(_mm_cmpge_ps(_mm_and_ps(r, absMask), bound)));
+            }
+            if ((_mm_movemask_ps(_mm_castsi128_ps(ok)) & DSFast) == DSFast)
+            {
+                const int negM = _mm_movemask_ps(r) & DSFast;
+                pushMac(c, static_cast<uint32_t>(kRev4[negM]) << 4);
+                return r;
+            }
+        }
         const __m128d alo = _mm_cvtps_pd(a), ahi = _mm_cvtps_pd(_mm_movehl_ps(a, a));
         const __m128d blo = _mm_cvtps_pd(b), bhi = _mm_cvtps_pd(_mm_movehl_ps(b, b));
         __m128 r;
@@ -322,6 +365,27 @@ namespace vu1n
             pushMac(c, mac);
         }
         return r;
+    }
+
+    // MAX/MINI compare the raw bit patterns in sign-magnitude order and return one operand's
+    // original bits (no denormal flush or clamping), so they also clamp integer data such as
+    // vertex colours kept as raw ints in VF registers.
+    VU1N_INLINE __m128i minMaxKey(__m128 v)
+    {
+        const __m128i b = _mm_castps_si128(v);
+        return _mm_xor_si128(b, _mm_and_si128(_mm_srai_epi32(b, 31), _mm_set1_epi32(0x7FFFFFFF)));
+    }
+
+    VU1N_INLINE __m128 vmax(__m128 a, __m128 b)
+    {
+        const __m128 aWins = _mm_castsi128_ps(_mm_cmpgt_epi32(minMaxKey(a), minMaxKey(b)));
+        return _mm_or_ps(_mm_and_ps(aWins, a), _mm_andnot_ps(aWins, b));
+    }
+
+    VU1N_INLINE __m128 vmini(__m128 a, __m128 b)
+    {
+        const __m128 aWins = _mm_castsi128_ps(_mm_cmplt_epi32(minMaxKey(a), minMaxKey(b)));
+        return _mm_or_ps(_mm_and_ps(aWins, a), _mm_andnot_ps(aWins, b));
     }
 
     template <int Scale>
