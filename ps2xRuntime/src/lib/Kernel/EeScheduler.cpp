@@ -132,6 +132,8 @@ void EeScheduler::reset(uint8_t *rdram, const R5900Context &mainContext)
     m_gsVSyncCallbackSp = 0;
     m_runtime.memory().gs().vsyncTick.store(0u, std::memory_order_release);
     m_runtime.memory().resetEeTimers();
+    std::memcpy(m_vu0Shared.data(), reinterpret_cast<const uint8_t *>(&mainContext) + kVu0Begin, kVu0Bytes);
+    m_vu0Owner = {};
 
     GuestThread main{};
     main.id = kMainThreadId;
@@ -232,6 +234,11 @@ void EeScheduler::run()
         {
             if (!running->invocations.empty())
             {
+                if (m_vu0Owner.valid && m_vu0Owner.threadId == running->id &&
+                    m_vu0Owner.depth == running->invocations.size())
+                {
+                    releaseVu0();
+                }
                 GuestInvocation completed = std::move(running->invocations.back());
                 running->invocations.pop_back();
                 if (completed.onComplete)
@@ -291,6 +298,8 @@ void EeScheduler::run()
         {
             continue;
         }
+
+        bindVu0(*running, context);
 
         try
         {
@@ -1638,8 +1647,58 @@ void EeScheduler::makeRunning(GuestThread &item)
     renewTimeSlice();
 }
 
+R5900Context *EeScheduler::vu0OwnerContext()
+{
+    if (!m_vu0Owner.valid)
+    {
+        return nullptr;
+    }
+    GuestThread *owner = thread(m_vu0Owner.threadId);
+    if (!owner)
+    {
+        return nullptr;
+    }
+    if (m_vu0Owner.depth == 0u)
+    {
+        return &owner->context;
+    }
+    if (owner->invocations.size() < m_vu0Owner.depth)
+    {
+        return nullptr;
+    }
+    GuestInvocation &invocation = owner->invocations[m_vu0Owner.depth - 1u];
+    return invocation.sequence == m_vu0Owner.sequence ? &invocation.context : nullptr;
+}
+
+void EeScheduler::releaseVu0()
+{
+    if (const R5900Context *owner = vu0OwnerContext())
+    {
+        std::memcpy(m_vu0Shared.data(), reinterpret_cast<const uint8_t *>(owner) + kVu0Begin, kVu0Bytes);
+    }
+    m_vu0Owner = {};
+}
+
+void EeScheduler::bindVu0(GuestThread &running, R5900Context &context)
+{
+    const size_t depth = running.invocations.size();
+    const uint64_t sequence = depth != 0u ? running.invocations.back().sequence : 0u;
+    if (m_vu0Owner.valid && m_vu0Owner.threadId == running.id && m_vu0Owner.depth == depth &&
+        m_vu0Owner.sequence == sequence)
+    {
+        return;
+    }
+    releaseVu0();
+    std::memcpy(reinterpret_cast<uint8_t *>(&context) + kVu0Begin, m_vu0Shared.data(), kVu0Bytes);
+    m_vu0Owner = {true, running.id, depth, sequence};
+}
+
 void EeScheduler::makeDormant(GuestThread &item)
 {
+    if (m_vu0Owner.valid && m_vu0Owner.threadId == item.id)
+    {
+        releaseVu0();
+    }
     removeReady(item);
     removeFromWaitObject(item);
     item.status = EeThreadStatus::Dormant;

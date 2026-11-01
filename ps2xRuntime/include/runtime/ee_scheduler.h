@@ -6,6 +6,7 @@
 #include <atomic>
 #include <chrono>
 #include <condition_variable>
+#include <cstddef>
 #include <cstdint>
 #include <deque>
 #include <functional>
@@ -398,7 +399,25 @@ private:
     void publishDebugContext(const R5900Context &context);
     void publishIdleDebugContext();
 
+    // VU0 is one coprocessor shared by every EE thread and interrupt handler, but each
+    // R5900Context carries its own copy of the VU0 registers. m_vu0Owner names the context that
+    // holds the live copy; bindVu0 hands it to another context just before that one runs.
+    struct Vu0Owner
+    {
+        bool valid = false;
+        int threadId = 0;
+        size_t depth = 0;      // invocations.size() of the owning thread when it was bound
+        uint64_t sequence = 0; // sequence of the owning invocation (0 for the thread context)
+    };
+    static constexpr size_t kVu0Begin = offsetof(R5900Context, vu0_vf);
+    static constexpr size_t kVu0Bytes = offsetof(R5900Context, cop0_index) - kVu0Begin;
+    [[nodiscard]] R5900Context *vu0OwnerContext();
+    void releaseVu0();
+    void bindVu0(GuestThread &running, R5900Context &context);
+
     PS2Runtime &m_runtime;
+    Vu0Owner m_vu0Owner{};
+    alignas(16) std::array<uint8_t, kVu0Bytes> m_vu0Shared{};
     uint8_t *m_rdram = nullptr;
     std::array<std::deque<int>, kPriorityCount> m_readyQueues{};
     std::unordered_map<int, GuestThread> m_threads;
