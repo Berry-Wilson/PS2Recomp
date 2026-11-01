@@ -109,6 +109,7 @@ namespace ps2_stubs
 
         void applyGsClearPacket(PS2Runtime *runtime, const GsClearMem &clear)
         {
+            runtime->memory().waitVif1Idle("gs-stub-clear"); // GS writes keep their order behind queued VIF1 output
             if (!runtime->syncCoreSubsystems() || !hasSeededGsClearPacket(clear))
             {
                 return;
@@ -669,6 +670,8 @@ namespace ps2_stubs
 
     void sceGsExecStoreImage(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
     {
+        if (runtime)
+            runtime->memory().waitVif1Idle("gs-stub");
         uint32_t imgAddr = getRegU32(ctx, 4);
         uint32_t dstAddr = getRegU32(ctx, 5);
 
@@ -1151,6 +1154,8 @@ namespace ps2_stubs
 
     void sceGsSwapDBuffDc(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
     {
+        if (runtime)
+            runtime->memory().waitVif1Idle("gs-stub");
         const uint32_t envAddr = getRegU32(ctx, 4);
         const uint32_t which = getRegU32(ctx, 5) & 1u;
 

@@ -807,6 +807,33 @@ void ps2xSetGifCaptureRam(const uint8_t *ram, uint32_t size)
     g_captureRamSize = size;
 }
 
+namespace
+{
+    thread_local uint32_t t_privilegedEffectsAppliedPaths = 0u;
+}
+
+void GS::setPrivilegedEffectsAppliedPaths(uint32_t pathMask)
+{
+    t_privilegedEffectsAppliedPaths = pathMask;
+}
+
+bool GS::handlesRawGif() const
+{
+    std::lock_guard<std::recursive_mutex> lock(m_stateMutex);
+    return m_backend && m_backend->HandlesRawGif();
+}
+
+void GS::applyGifPrivilegedEffects(const uint8_t *data, uint32_t sizeBytes)
+{
+    std::lock_guard<std::recursive_mutex> lock(m_stateMutex);
+    if (data && sizeBytes >= 16u)
+        applyPrivilegedSideEffects(data, sizeBytes);
+}
+
+std::atomic<uint64_t> g_gsFinishByPath[4] = {};
+std::atomic<uint64_t> g_gsSignalByPath[4] = {};
+std::atomic<uint64_t> g_path3MaskCount{0};
+
 void GS::processGIFPacket(const uint8_t *data, uint32_t sizeBytes, uint32_t path)
 {
     std::lock_guard<std::recursive_mutex> lock(m_stateMutex);
@@ -818,7 +845,17 @@ void GS::processGIFPacket(const uint8_t *data, uint32_t sizeBytes, uint32_t path
 
     if (m_backend->HandlesRawGif())
     {
-        applyPrivilegedSideEffects(data, sizeBytes);
+        const uint64_t csrBefore = m_privRegs ? m_privRegs->csr.load() : 0u;
+        if (((t_privilegedEffectsAppliedPaths >> (path & 3u)) & 1u) == 0u)
+            applyPrivilegedSideEffects(data, sizeBytes);
+        if (m_privRegs)
+        {
+            const uint64_t raised = m_privRegs->csr.load() & ~csrBefore;
+            if (raised & 0x2u)
+                g_gsFinishByPath[path & 3u].fetch_add(1u, std::memory_order_relaxed);
+            if (raised & 0x1u)
+                g_gsSignalByPath[path & 3u].fetch_add(1u, std::memory_order_relaxed);
+        }
         m_backend->ProcessGif(path, data, sizeBytes);
         return;
     }

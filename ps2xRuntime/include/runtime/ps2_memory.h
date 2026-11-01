@@ -8,8 +8,11 @@
 #include <vector>
 #include <unordered_map>
 #include <atomic>
+#include <condition_variable>
+#include <deque>
 #include <iostream>
 #include <mutex>
+#include <thread>
 
 #include "gs/ps2_gif_arbiter.h"
 #if defined(_MSC_VER)
@@ -319,6 +322,23 @@ public:
 
     using Vu1MscalCallback = std::function<void(uint32_t startPC, uint32_t top, uint32_t itop)>;
     void setVu1MscalCallback(Vu1MscalCallback cb) { m_vu1MscalCallback = std::move(cb); }
+
+    // VIF1 DMA transfers (VIF commands, the VU1 programs they start and their PATH1/PATH2 output)
+    // run on a worker thread while the EE goes on (PS2X_VIF1_THREAD=0 keeps them on the EE thread).
+    // Transfers are copied when they start and complete immediately as before; every EE-side access
+    // to state the worker owns (VU1 memory, VIF1 and GIF registers/FIFOs, the GIF DMA channel, GS
+    // privileged registers other than CSR, GS helpers) calls waitVif1Idle() first.
+    void waitVif1Idle(const char *why = "other") const;
+    static bool onVif1Worker();
+    // Called on the EE thread when a transfer could go to the worker; returning false keeps it on
+    // the EE thread (the runtime does so while VU1 D/T breaks are enabled).
+    void setVif1AsyncGate(std::function<bool()> gate) { m_vif1AsyncGate = std::move(gate); }
+    // Called on the worker when a job set GS FINISH, so the EE thread can raise INTC_GS.
+    void setGsFinishNotify(std::function<void()> notify) { m_gsFinishNotify = std::move(notify); }
+    // Applies a GIF packet's SIGNAL/FINISH/LABEL on the EE thread; called with nullptr it reports
+    // whether that is possible (raw-GIF GS backend). Required for any work to go to the worker.
+    void setGifPrivilegedEffects(std::function<bool(const uint8_t *, uint32_t)> fn) { m_gifPrivilegedEffects = std::move(fn); }
+    void stopVif1Worker();
     using Vu1MscntCallback = std::function<void(uint32_t top, uint32_t itop)>;
     void setVu1MscntCallback(Vu1MscntCallback cb) { m_vu1MscntCallback = std::move(cb); }
     // VIF0 MSCAL/MSCALF (resume=false, startPC from the VIFcode) and MSCNT (resume=true).
@@ -428,6 +448,35 @@ public:
     // Chain-mode DMA gathers each transfer into a buffer; reusing them avoids regrowing a fresh
     // vector (and copying what it already holds) on every chain DMA.
     std::vector<std::vector<uint8_t>> m_chainBufPool;
+
+    mutable std::mutex m_vif1Mutex;
+    mutable std::condition_variable m_vif1Cv;
+    // A job is one VIF1 transfer, or a GIF-only DMA batch (PATH3 packets whose sizes are in
+    // gifPackets) that must stay in order behind the VIF1 work queued before it.
+    struct Vif1Job
+    {
+        std::vector<uint8_t> data;
+        std::vector<uint32_t> gifPackets;
+        bool gif = false;
+    };
+    std::deque<Vif1Job> m_vif1Jobs;                       // guarded by m_vif1Mutex
+    std::vector<std::vector<uint8_t>> m_vif1FreeBufs;     // guarded by m_vif1Mutex
+    std::atomic<uint32_t> m_vif1Outstanding{0};           // queued or running jobs
+    bool m_vif1Stop = false;
+    std::thread m_vif1Thread;
+    std::function<bool()> m_vif1AsyncGate;
+    std::function<void()> m_gsFinishNotify;
+    std::function<bool(const uint8_t *, uint32_t)> m_gifPrivilegedEffects;
+    // EE-side copy of the VIF1 state the pre-scan needs, advanced in queue order; refreshed from
+    // vif1_regs / m_vif1PendingPath2ImageQwc whenever the worker is idle.
+    uint32_t m_vif1ScanCycle = 0u;
+    uint32_t m_vif1ScanPendingImageQwc = 0u;
+    std::atomic<bool> m_path3MaskEverUsed{false};
+    void prescanVif1PrivilegedEffects(const uint8_t *data, uint32_t sizeBytes);
+    bool vif1AsyncEnabled() const;
+    void enqueueVif1(std::vector<uint8_t> data);
+    void enqueueVif1Job(Vif1Job job);
+    void vif1WorkerLoop();
     std::vector<uint8_t> takeChainBuf();
     void recycleChainBufs(std::vector<PendingTransfer> &transfers);
     std::mutex m_completedDmacMutex;

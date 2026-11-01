@@ -1133,6 +1133,7 @@ PS2Runtime::~PS2Runtime()
     try
     {
         requestStop();
+        m_memory.stopVif1Worker(); // it runs VU1 programs on m_vu1 and feeds m_gs
         m_iopSubsystem.reset();
         m_iopHost.reset();
 #if defined(PLATFORM_VITA)
@@ -1300,17 +1301,42 @@ bool PS2Runtime::syncCoreSubsystems()
     m_gifArbiter.setProcessPacketFn([this](const uint8_t *data, uint32_t size, uint32_t path)
                                     { m_gs.processGIFPacket(data, size, path); });
     m_memory.setGifArbiter(&m_gifArbiter);
+    // On the VIF1 worker the EE context is off limits: the async gate below only lets transfers
+    // through while D/T breaks are disabled, and has already cleared the VPU_STAT stop bits.
+    m_memory.setVif1AsyncGate([this]()
+                              {
+                                  R5900Context *cpuContext = m_eeScheduler ? m_eeScheduler->currentContext() : nullptr;
+                                  if (!cpuContext)
+                                      cpuContext = &m_cpuContext;
+                                  if ((cpuContext->vu0_fbrst & ((1u << 10) | (1u << 11))) != 0u)
+                                      return false;
+                                  cpuContext->vu0_vpu_stat &= ~0x0600u;
+                                  return true; });
+    m_memory.setGifPrivilegedEffects([this](const uint8_t *data, uint32_t size)
+                                     {
+                                         if (!m_gs.handlesRawGif())
+                                             return false;
+                                         if (data)
+                                             m_gs.applyGifPrivilegedEffects(data, size);
+                                         return true; });
+    m_memory.setGsFinishNotify([this]()
+                               {
+                                   if (m_eeScheduler)
+                                       m_eeScheduler->postEvent(EeEvent{EeEventType::GsInterrupt}); });
     m_memory.setVu1MscalCallback([this](uint32_t startPC, uint32_t top, uint32_t itop)
                                  {
-                                     R5900Context *cpuContext = m_eeScheduler ? m_eeScheduler->currentContext() : nullptr;
-                                     if (!cpuContext)
+                                     const bool onWorker = PS2Memory::onVif1Worker();
+                                     R5900Context *cpuContext = nullptr;
+                                     if (!onWorker)
                                      {
-                                         cpuContext = &m_cpuContext;
+                                         cpuContext = m_eeScheduler ? m_eeScheduler->currentContext() : nullptr;
+                                         if (!cpuContext)
+                                             cpuContext = &m_cpuContext;
                                      }
                                      m_vu1.state().dBitEnabled =
-                                         (cpuContext->vu0_fbrst & (1u << 10)) != 0u;
+                                         cpuContext && (cpuContext->vu0_fbrst & (1u << 10)) != 0u;
                                      m_vu1.state().tBitEnabled =
-                                         (cpuContext->vu0_fbrst & (1u << 11)) != 0u;
+                                         cpuContext && (cpuContext->vu0_fbrst & (1u << 11)) != 0u;
                                      VuProfiler &prof = VuProfiler::vu1();
                                      const auto t0 = std::chrono::steady_clock::now();
                                      const uint64_t cycles0 = m_vu1.state().cycles;
@@ -1323,10 +1349,11 @@ bool PS2Runtime::syncCoreSubsystems()
                                          prof.record(m_memory.getVU1Code(), m_memory.getVU1CodeGeneration(),
                                                      startPC, m_vu1.state().cycles - cycles0, static_cast<uint64_t>(ns));
                                      }
-                                     cpuContext->vu0_vpu_stat =
-                                         (cpuContext->vu0_vpu_stat & ~0x0600u) |
-                                         (m_vu1.state().stoppedByD ? 0x0200u : 0u) |
-                                         (m_vu1.state().stoppedByT ? 0x0400u : 0u); });
+                                     if (cpuContext)
+                                         cpuContext->vu0_vpu_stat =
+                                             (cpuContext->vu0_vpu_stat & ~0x0600u) |
+                                             (m_vu1.state().stoppedByD ? 0x0200u : 0u) |
+                                             (m_vu1.state().stoppedByT ? 0x0400u : 0u); });
     ps2xSetGifCaptureRam(m_memory.getRDRAM(), PS2_RAM_SIZE);
     ps2xInstallWriteWatch(m_memory.getRDRAM(), PS2_RAM_SIZE, m_memory.getScratchpad(), PS2_SCRATCHPAD_SIZE, [this]() -> uint32_t
                           {
@@ -1360,20 +1387,23 @@ bool PS2Runtime::syncCoreSubsystems()
                                      t_vu0FromVif0 = false; });
     m_memory.setVu1MscntCallback([this](uint32_t top, uint32_t itop)
                                  {
-                                     R5900Context *cpuContext = m_eeScheduler ? m_eeScheduler->currentContext() : nullptr;
-                                     if (!cpuContext)
+                                     R5900Context *cpuContext = nullptr;
+                                     if (!PS2Memory::onVif1Worker())
                                      {
-                                         cpuContext = &m_cpuContext;
+                                         cpuContext = m_eeScheduler ? m_eeScheduler->currentContext() : nullptr;
+                                         if (!cpuContext)
+                                             cpuContext = &m_cpuContext;
                                      }
                                      m_vu1.state().dBitEnabled =
-                                         (cpuContext->vu0_fbrst & (1u << 10)) != 0u;
+                                         cpuContext && (cpuContext->vu0_fbrst & (1u << 10)) != 0u;
                                      m_vu1.state().tBitEnabled =
-                                         (cpuContext->vu0_fbrst & (1u << 11)) != 0u;
+                                         cpuContext && (cpuContext->vu0_fbrst & (1u << 11)) != 0u;
                                      runVu1Program(m_vu1, m_memory, m_gs, true, 0u, top, itop);
-                                     cpuContext->vu0_vpu_stat =
-                                         (cpuContext->vu0_vpu_stat & ~0x0600u) |
-                                         (m_vu1.state().stoppedByD ? 0x0200u : 0u) |
-                                         (m_vu1.state().stoppedByT ? 0x0400u : 0u); });
+                                     if (cpuContext)
+                                         cpuContext->vu0_vpu_stat =
+                                             (cpuContext->vu0_vpu_stat & ~0x0600u) |
+                                             (m_vu1.state().stoppedByD ? 0x0200u : 0u) |
+                                             (m_vu1.state().stoppedByT ? 0x0400u : 0u); });
     resetIop();
     m_vu0.reset();
     m_vu1.reset();

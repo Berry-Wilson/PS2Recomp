@@ -237,6 +237,7 @@ enum class EeEventType : uint8_t
     Dmac,
     ExternalWake,
     Alarm,
+    GsInterrupt, // GS FINISH was set off the EE thread (VIF1 worker): raise INTC_GS if due
 };
 
 struct EeEvent

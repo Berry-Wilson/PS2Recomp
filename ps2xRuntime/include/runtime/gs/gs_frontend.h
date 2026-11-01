@@ -2,6 +2,7 @@
 #define PS2_GS_FRONTEND_H
 
 #include <array>
+#include <atomic>
 #include <cstddef>
 #include <cstdint>
 #include <memory>
@@ -9,6 +10,12 @@
 #include <vector>
 
 #include "runtime/gs/gs_backend.h"
+
+// PS2X_VIF1_STATS bookkeeping: GIF packets that newly set CSR.FINISH / SIGNAL, by GIF path (1-3),
+// and VIF MSKPATH3 commands that masked PATH3.
+extern std::atomic<uint64_t> g_gsFinishByPath[4];
+extern std::atomic<uint64_t> g_gsSignalByPath[4];
+extern std::atomic<uint64_t> g_path3MaskCount;
 
 struct GSDebugSnapshot
 {
@@ -107,6 +114,14 @@ public:
     void setRasterBackend(std::unique_ptr<GSRasterBackend> backend);
 
     void processGIFPacket(const uint8_t *data, uint32_t sizeBytes, uint32_t path = 3);
+    // The VIF1 worker processes GIF packets after the EE has moved on. So that SIGNAL/FINISH/LABEL
+    // still land when the EE starts the DMA (as on the single-threaded path, where the INTC_GS
+    // check follows right after), the EE applies them up front with applyGifPrivilegedEffects and
+    // the worker skips them for the paths it marks with setPrivilegedEffectsAppliedPaths (bit n =
+    // PATHn, per thread). Only raw-GIF backends take this route.
+    void applyGifPrivilegedEffects(const uint8_t *data, uint32_t sizeBytes);
+    static void setPrivilegedEffectsAppliedPaths(uint32_t pathMask);
+    bool handlesRawGif() const;
     bool processNativePackedGIFPacket(const uint8_t *data, uint32_t sizeBytes);
     void uploadImageNative(uint64_t bitbltbuf,
                            uint64_t trxpos,

@@ -1,5 +1,6 @@
 // Based on Blackline Interactive implementation
 #include "runtime/ps2_memory.h"
+#include "runtime/gs/gs_frontend.h"
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -83,6 +84,41 @@ namespace
         return 0u;
     }
 
+    // Source bytes an UNPACK consumes for the given CYCLE register (shared by vifUnpack and the
+    // VIF1 pre-scan, which must agree on where every later VIFcode starts).
+    uint32_t vifUnpackSourceBytes(uint32_t cycle, uint8_t opcode, uint8_t num)
+    {
+        const uint8_t vn = (opcode >> 2) & 0x3;
+        const uint8_t vl = opcode & 0x3;
+        const int components = vn + 1;
+        int bitsPerComponent = 32;
+        if (vl == 1)
+            bitsPerComponent = 16;
+        else if (vl == 2)
+            bitsPerComponent = 8;
+        else if (vl == 3)
+            bitsPerComponent = (vn == 3) ? 4 : 16;
+        const int bitsPerVector = (vl == 3 && vn == 3) ? 16 : (components * bitsPerComponent);
+        const uint32_t bytesPerVector = (bitsPerVector + 7) / 8;
+        const uint32_t writeVectorCount = (num == 0u) ? 256u : static_cast<uint32_t>(num);
+        uint32_t cl = cycle & 0xFFu;
+        uint32_t wl = (cycle >> 8) & 0xFFu;
+        if (cl == 0u)
+            cl = 1u;
+        if (wl == 0u)
+            wl = 1u;
+        uint32_t sourceVectorCount = writeVectorCount;
+        if (cl < wl)
+        {
+            const uint32_t fullBlocks = writeVectorCount / wl;
+            uint32_t remainder = writeVectorCount % wl;
+            if (remainder > cl)
+                remainder = cl;
+            sourceVectorCount = fullBlocks * cl + remainder;
+        }
+        return (sourceVectorCount * bytesPerVector + 3) & ~3u;
+    }
+
     // UNPACK into VU data memory, shared by VIF0 and VIF1. Addresses wrap at the VU's data size.
     // Returns the number of source bytes the command consumes.
     uint32_t vifUnpack(VIFRegisters &regs, uint8_t *vuData, uint32_t vuDataSize, uint8_t opcode, uint16_t imm,
@@ -98,8 +134,8 @@ namespace
                 Guard() { s_inVerify = true; }
                 ~Guard() { s_inVerify = false; }
             } guard;
-            static std::vector<uint8_t> s_ref;
-            static uint64_t s_checked = 0, s_mismatches = 0;
+            static thread_local std::vector<uint8_t> s_ref; // VIF0 (EE thread) and VIF1 (worker) check concurrently
+            static thread_local uint64_t s_checked = 0, s_mismatches = 0;
             s_ref.assign(vuData, vuData + vuDataSize);
             VIFRegisters refRegs = regs;
             const uint32_t refBytes = vifUnpack(refRegs, s_ref.data(), vuDataSize, opcode, imm, num, src, available, false);
@@ -164,8 +200,8 @@ namespace
             sourceVectorCount = fullBlocks * cl + remainder;
         }
 
-        uint32_t totalBytes = sourceVectorCount * bytesPerVector;
-        totalBytes = (totalBytes + 3) & ~3u;
+        const uint32_t totalBytes = vifUnpackSourceBytes(regs.cycle, opcode, num);
+        (void)sourceVectorCount; // the generic loop below re-derives its source index per write
 
         uint32_t vuAddr = (uint32_t)imm & qwMask;
         if ((imm & 0x8000u) != 0u)
@@ -561,6 +597,82 @@ void PS2Memory::processVIF0Data(const uint8_t *data, uint32_t sizeBytes)
     }
 }
 
+// Walks a VIF1 transfer the way processVIF1Data does, but only to find its DIRECT/DIRECTHL GIF
+// packets (PATH2) and apply their privileged effects now. Lengths come from the same rules, and
+// the CYCLE register and pending PATH2 IMAGE count it depends on are tracked in queue order.
+void PS2Memory::prescanVif1PrivilegedEffects(const uint8_t *data, uint32_t sizeBytes)
+{
+    uint32_t pos = 0;
+    while (pos + 4 <= sizeBytes)
+    {
+        if (m_vif1ScanPendingImageQwc != 0u)
+        {
+            // IMAGE continuation: data only, no privileged writes.
+            const uint32_t availableQw = (sizeBytes - pos) / 16u;
+            if (availableQw == 0u)
+                break;
+            const uint32_t chunkQw = std::min<uint32_t>(m_vif1ScanPendingImageQwc, availableQw);
+            pos += chunkQw * 16u;
+            m_vif1ScanPendingImageQwc -= chunkQw;
+            continue;
+        }
+
+        uint32_t cmd;
+        std::memcpy(&cmd, data + pos, 4);
+        pos += 4;
+        const uint8_t opcode = (cmd >> 24) & 0x7F;
+        const uint16_t imm = cmd & 0xFFFF;
+        const uint8_t num = (cmd >> 16) & 0xFF;
+
+        if (opcode == VIF_STCYCL)
+        {
+            m_vif1ScanCycle = imm;
+        }
+        else if (opcode == VIF_STMASK)
+        {
+            if (pos + 4 > sizeBytes)
+                break;
+            pos += 4;
+        }
+        else if (opcode == VIF_STROW || opcode == VIF_STCOL)
+        {
+            if (pos + 16 > sizeBytes)
+                break;
+            pos += 16;
+        }
+        else if (opcode == VIF_MPG)
+        {
+            pos += ((num == 0u) ? 256u : static_cast<uint32_t>(num)) * 8u;
+            if (pos > sizeBytes)
+                break;
+        }
+        else if (opcode == VIF_DIRECT || opcode == VIF_DIRECTHL)
+        {
+            uint32_t qwCount = imm ? imm : 65536u;
+            const uint32_t availableQw = (sizeBytes - pos) / 16u;
+            const bool truncated = qwCount > availableQw;
+            if (truncated)
+                qwCount = availableQw;
+            if (qwCount > 0)
+            {
+                m_gifPrivilegedEffects(data + pos, qwCount * 16u);
+                const uint32_t pendingImageQw = pendingGifImageQwc(data + pos, qwCount * 16u);
+                if (pendingImageQw != 0u)
+                    m_vif1ScanPendingImageQwc = pendingImageQw;
+            }
+            pos += qwCount * 16;
+            if (truncated)
+                break;
+        }
+        else if ((opcode & 0x60) == 0x60)
+        {
+            pos += vifUnpackSourceBytes(m_vif1ScanCycle, opcode, num);
+            if (pos > sizeBytes)
+                break;
+        }
+    }
+}
+
 void PS2Memory::processVIF1Data(uint32_t srcPhys, uint32_t sizeBytes)
 {
     if (sizeBytes == 0u || srcPhys >= PS2_RAM_SIZE)
@@ -664,6 +776,11 @@ void PS2Memory::processVIF1Data(const uint8_t *data, uint32_t sizeBytes)
             // VIF command docs: MSKPATH3 uses IMMEDIATE bit 15.
             const bool wasMasked = m_path3Masked;
             m_path3Masked = (imm & 0x8000u) != 0u;
+            if (m_path3Masked)
+            {
+                g_path3MaskCount.fetch_add(1u, std::memory_order_relaxed);
+                m_path3MaskEverUsed.store(true, std::memory_order_relaxed);
+            }
             if (wasMasked && !m_path3Masked)
                 flushMaskedPath3Packets();
             continue;
