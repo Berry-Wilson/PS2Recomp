@@ -7,8 +7,10 @@
 
 #include <iostream>
 #include <mutex>
+#include <condition_variable>
 #include <cstring>
 #include <algorithm>
+#include <thread>
 
 struct GSParallelBackend::Impl
 {
@@ -26,9 +28,50 @@ struct GSParallelBackend::Impl
     // Host-visible copy of the scanout image, reused across presents.
     Vulkan::BufferHandle readback;
 
+    // GIF parsing (GSInterface::gif_transfer) is the expensive part of the GS, and nothing the
+    // guest can observe depends on it finishing early: privileged-register side effects
+    // (SIGNAL/FINISH/LABEL) are applied by GS::processGIFPacket on the EE thread, and readback
+    // is not implemented by this backend. So the EE thread only queues GIF packets, register
+    // writes, image uploads and flushes; a worker thread replays them in order, and present()
+    // and Reset() first wait until everything queued so far has been replayed.
+    enum class CmdKind : uint8_t
+    {
+        Gif,
+        Register,
+        Hwreg,
+        Flush,
+        TexFlush
+    };
+    struct Cmd
+    {
+        CmdKind kind;
+        uint8_t reg = 0;
+        uint32_t path = 0;
+        uint64_t value = 0;
+        size_t offset = 0;
+        size_t bytes = 0;
+    };
+    struct Batch
+    {
+        std::vector<Cmd> cmds;
+        std::vector<uint8_t> data;
+    };
+    std::mutex queueMutex;
+    std::condition_variable queueCv;
+    Batch pending;
+    Batch working;
+    uint64_t submitted = 0; // commands queued (guarded by queueMutex)
+    uint64_t completed = 0; // commands replayed (guarded by queueMutex)
+    bool stopWorker = false;
+    std::thread worker;
+    static constexpr size_t kMaxPendingBytes = 32u * 1024u * 1024u;
+
     bool init();
-    void processGif(uint32_t path, const uint8_t *data, uint32_t sizeBytes);
-    void writeRegister(uint8_t regAddr, uint64_t value);
+    void enqueue(Cmd cmd, const uint8_t *data = nullptr, size_t bytes = 0);
+    void drain();
+    void workerLoop();
+    void replay(const Batch &batch);
+    void stop();
     PresentationFrame present(const GSPresentationRequest &request);
 };
 
@@ -73,33 +116,109 @@ bool GSParallelBackend::Impl::init()
     iface.set_hacks(hacks);
 
     initialized = true;
+    worker = std::thread([this] { workerLoop(); });
     std::cout << "[GSParallelBackend] Vulkan parallel-gs backend initialized successfully!\n";
     return true;
 }
 
-void GSParallelBackend::Impl::processGif(uint32_t path, const uint8_t *data, uint32_t sizeBytes)
+void GSParallelBackend::Impl::enqueue(Cmd cmd, const uint8_t *data, size_t bytes)
 {
-    if (!initialized || !data || sizeBytes < 16)
-        return;
-
-    Util::register_thread_index(0);
-    std::lock_guard<std::mutex> lock(mutex);
-    const size_t alignedBytes = sizeBytes & ~15ull;
-    if (alignedBytes > 0)
+    std::unique_lock<std::mutex> lock(queueMutex);
+    // Bound memory if the EE runs far ahead of the worker.
+    queueCv.wait(lock, [&] { return pending.data.size() + bytes <= kMaxPendingBytes || pending.cmds.empty(); });
+    if (data && bytes)
     {
-        const uint32_t clampedPath = std::min<uint32_t>(path, 3u);
-        iface.gif_transfer(clampedPath, data, alignedBytes);
+        cmd.offset = pending.data.size();
+        cmd.bytes = bytes;
+        pending.data.insert(pending.data.end(), data, data + bytes);
+    }
+    pending.cmds.push_back(cmd);
+    ++submitted;
+    lock.unlock();
+    queueCv.notify_all();
+}
+
+void GSParallelBackend::Impl::drain()
+{
+    std::unique_lock<std::mutex> lock(queueMutex);
+    const uint64_t target = submitted;
+    queueCv.wait(lock, [&] { return completed >= target || !worker.joinable(); });
+}
+
+void GSParallelBackend::Impl::workerLoop()
+{
+    Util::register_thread_index(0);
+    for (;;)
+    {
+        size_t count = 0;
+        {
+            std::unique_lock<std::mutex> lock(queueMutex);
+            queueCv.wait(lock, [&] { return stopWorker || !pending.cmds.empty(); });
+            if (pending.cmds.empty())
+                return;
+            std::swap(pending, working);
+            count = working.cmds.size();
+        }
+        queueCv.notify_all(); // pending has room again
+        replay(working);
+        working.cmds.clear();
+        working.data.clear();
+        {
+            std::lock_guard<std::mutex> lock(queueMutex);
+            completed += count;
+        }
+        queueCv.notify_all();
     }
 }
 
-void GSParallelBackend::Impl::writeRegister(uint8_t regAddr, uint64_t value)
+void GSParallelBackend::Impl::replay(const Batch &batch)
 {
-    if (!initialized)
-        return;
-
-    Util::register_thread_index(0);
     std::lock_guard<std::mutex> lock(mutex);
-    iface.write_register(static_cast<ParallelGS::RegisterAddr>(regAddr), value);
+    for (const Cmd &cmd : batch.cmds)
+    {
+        const uint8_t *data = batch.data.data() + cmd.offset;
+        switch (cmd.kind)
+        {
+        case CmdKind::Gif:
+            iface.gif_transfer(cmd.path, data, cmd.bytes);
+            break;
+        case CmdKind::Register:
+            iface.write_register(static_cast<ParallelGS::RegisterAddr>(cmd.reg), cmd.value);
+            break;
+        case CmdKind::Hwreg:
+        {
+            const size_t qwords = cmd.bytes / 8;
+            if (qwords > 0)
+                iface.a_d_HWREG_multi(reinterpret_cast<const uint64_t *>(data), qwords);
+            const size_t rem = cmd.bytes % 8;
+            if (rem > 0)
+            {
+                uint64_t last = 0;
+                std::memcpy(&last, data + qwords * 8, rem);
+                iface.write_register(ParallelGS::RegisterAddr::HWREG, last);
+            }
+            break;
+        }
+        case CmdKind::Flush:
+            iface.flush();
+            break;
+        case CmdKind::TexFlush:
+            iface.write_register(ParallelGS::RegisterAddr::TEXFLUSH, static_cast<uint64_t>(0));
+            break;
+        }
+    }
+}
+
+void GSParallelBackend::Impl::stop()
+{
+    if (!worker.joinable())
+        return;
+    {
+        std::lock_guard<std::mutex> lock(queueMutex);
+        stopWorker = true;
+    }
+    queueCv.notify_all();
+    worker.join();
 }
 
 PresentationFrame GSParallelBackend::Impl::present(const GSPresentationRequest &request)
@@ -108,6 +227,7 @@ PresentationFrame GSParallelBackend::Impl::present(const GSPresentationRequest &
     if (!initialized)
         return result;
 
+    drain();
     Util::register_thread_index(0);
     std::lock_guard<std::mutex> lock(mutex);
 
@@ -259,18 +379,29 @@ GSParallelBackend::GSParallelBackend()
 {
 }
 
-GSParallelBackend::~GSParallelBackend() = default;
+GSParallelBackend::~GSParallelBackend()
+{
+    if (m_impl)
+        m_impl->stop();
+}
 
 void GSParallelBackend::ProcessGif(uint32_t path, const uint8_t *data, uint32_t sizeBytes)
 {
-    if (m_impl)
-        m_impl->processGif(path, data, sizeBytes);
+    if (!m_impl || !m_impl->initialized || !data || sizeBytes < 16)
+        return;
+    Impl::Cmd cmd{Impl::CmdKind::Gif};
+    cmd.path = std::min<uint32_t>(path, 3u);
+    m_impl->enqueue(cmd, data, sizeBytes & ~15u);
 }
 
 void GSParallelBackend::WriteRegister(uint8_t regAddr, uint64_t value)
 {
-    if (m_impl)
-        m_impl->writeRegister(regAddr, value);
+    if (!m_impl || !m_impl->initialized)
+        return;
+    Impl::Cmd cmd{Impl::CmdKind::Register};
+    cmd.reg = regAddr;
+    cmd.value = value;
+    m_impl->enqueue(cmd);
 }
 
 void GSParallelBackend::Initialize(uint8_t *vram, uint32_t vramSize)
@@ -287,6 +418,7 @@ void GSParallelBackend::Reset()
 {
     if (m_impl && m_impl->initialized)
     {
+        m_impl->drain();
         Util::register_thread_index(0);
         std::lock_guard<std::mutex> lock(m_impl->mutex);
         m_impl->iface.reset_context_state();
@@ -308,52 +440,25 @@ void GSParallelBackend::BeginTransfer(const GSTransferCommand &)
 void GSParallelBackend::UploadImage(const uint8_t *data, uint32_t sizeBytes)
 {
     if (m_impl && m_impl->initialized && data && sizeBytes > 0)
-    {
-        Util::register_thread_index(0);
-        std::lock_guard<std::mutex> lock(m_impl->mutex);
-        const size_t qwords = sizeBytes / 8;
-        if (qwords > 0)
-        {
-            m_impl->iface.a_d_HWREG_multi(reinterpret_cast<const uint64_t *>(data), qwords);
-        }
-        const size_t rem = sizeBytes % 8;
-        if (rem > 0)
-        {
-            uint64_t last = 0;
-            std::memcpy(&last, data + qwords * 8, rem);
-            m_impl->iface.write_register(ParallelGS::RegisterAddr::HWREG, last);
-        }
-    }
+        m_impl->enqueue(Impl::Cmd{Impl::CmdKind::Hwreg}, data, sizeBytes);
 }
 
 void GSParallelBackend::Flush()
 {
     if (m_impl && m_impl->initialized)
-    {
-        Util::register_thread_index(0);
-        std::lock_guard<std::mutex> lock(m_impl->mutex);
-        m_impl->iface.flush();
-    }
+        m_impl->enqueue(Impl::Cmd{Impl::CmdKind::Flush});
 }
 
 void GSParallelBackend::TextureFlush()
 {
     if (m_impl && m_impl->initialized)
-    {
-        Util::register_thread_index(0);
-        std::lock_guard<std::mutex> lock(m_impl->mutex);
-        m_impl->iface.write_register(ParallelGS::RegisterAddr::TEXFLUSH, static_cast<uint64_t>(0));
-    }
+        m_impl->enqueue(Impl::Cmd{Impl::CmdKind::TexFlush});
 }
 
 void GSParallelBackend::Sync(GSSyncReason)
 {
     if (m_impl && m_impl->initialized)
-    {
-        Util::register_thread_index(0);
-        std::lock_guard<std::mutex> lock(m_impl->mutex);
-        m_impl->iface.flush();
-    }
+        m_impl->enqueue(Impl::Cmd{Impl::CmdKind::Flush});
 }
 
 PresentationFrame GSParallelBackend::Present(const GSPresentationRequest &request)
