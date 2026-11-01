@@ -538,6 +538,15 @@ namespace vu1n
         return value * polynomial;
     }
 
+    // Matches the interpreter's ERSQRT: negative inputs pass through, 0 stays 0.
+    VU1N_INLINE float ersqrt(float value)
+    {
+        if (value < 0.0f)
+            return value;
+        const float root = std::sqrt(value);
+        return root != 0.0f ? 1.0f / root : root;
+    }
+
     // --- memory -------------------------------------------------------------
 
     template <uint32_t Size = kDataSize>

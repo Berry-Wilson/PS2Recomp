@@ -723,7 +723,16 @@ void VU1Interpreter::execLower(uint32_t instr, uint8_t *vuData, uint32_t dataSiz
                 queueP(sum, 12u);
                 return;
             }
-            case 0x77: // ERSQRT
+            // funct2 = (bits 10..6 << 2) | bits 1..0: 0x78-0x7B are ESQRT/ERSQRT/ERCPR/WAITP and
+            // 0x7C-0x7E are ESIN/EATAN/EEXP (0x77 and 0x7F are unused).
+            case 0x78: // ESQRT
+            {
+                const uint32_t component = (instr >> 21) & 3u;
+                const float value = normalizeOperand(m_state.vf[vfS][component]);
+                queueP(value >= 0.0f ? std::sqrt(value) : value, 12u);
+                return;
+            }
+            case 0x79: // ERSQRT
             {
                 const uint32_t component = (instr >> 21) & 3u;
                 const float value = normalizeOperand(m_state.vf[vfS][component]);
@@ -737,20 +746,6 @@ void VU1Interpreter::execLower(uint32_t instr, uint8_t *vuData, uint32_t dataSiz
                 queueP(result, 18u);
                 return;
             }
-            case 0x78: // ESQRT
-            {
-                const uint32_t component = (instr >> 21) & 3u;
-                const float value = normalizeOperand(m_state.vf[vfS][component]);
-                queueP(value >= 0.0f ? std::sqrt(value) : value, 12u);
-                return;
-            }
-            case 0x79: // ESIN
-            {
-                const uint32_t component = (instr >> 21) & 3u;
-                const float value = normalizeOperand(m_state.vf[vfS][component]);
-                queueP(vuEsin(value), 29u);
-                return;
-            }
             case 0x7A: // ERCPR
             {
                 const uint32_t component = (instr >> 21) & 3u;
@@ -760,13 +755,20 @@ void VU1Interpreter::execLower(uint32_t instr, uint8_t *vuData, uint32_t dataSiz
             }
             case 0x7B: // WAITP
                 return;
-            case 0x7C: // EATAN
+            case 0x7C: // ESIN
+            {
+                const uint32_t component = (instr >> 21) & 3u;
+                const float value = normalizeOperand(m_state.vf[vfS][component]);
+                queueP(vuEsin(value), 29u);
+                return;
+            }
+            case 0x7D: // EATAN
             {
                 const uint32_t component = (instr >> 21) & 3u;
                 queueP(vuEatan(normalizeOperand(m_state.vf[vfS][component])), 54u);
                 return;
             }
-            case 0x7D: // EEXP
+            case 0x7E: // EEXP
             {
                 const uint32_t component = (instr >> 21) & 3u;
                 queueP(vuEexp(normalizeOperand(m_state.vf[vfS][component])), 44u);
