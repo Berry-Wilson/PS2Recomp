@@ -849,10 +849,37 @@ namespace ps2_stubs
 
     void sceMcGetEntSpace(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
     {
+        const int32_t port = static_cast<int32_t>(getRegU32(ctx, 4));
+        const int32_t slot = static_cast<int32_t>(getRegU32(ctx, 5));
+        const std::string rawPath = readPs2CStringBounded(rdram, getRegU32(ctx, 6), kMcMaxPathLen);
+
+        int32_t result = kMcResultNoEntry;
         {
             std::lock_guard<std::mutex> lock(g_mcStateMutex);
-            setMcCommandResultLocked(kMcCmdGetEntSpace, 1024);
+            if (isValidMcPortSlot(port, slot))
+            {
+                McPortState &state = g_mcPorts[static_cast<size_t>(port)];
+                if (!state.formatted)
+                {
+                    result = kMcResultNoFormat;
+                }
+                else
+                {
+                    // Games tell a card without their save folder from a damaged one by this result.
+                    ensureMcRootExists(port);
+                    const std::filesystem::path hostDir =
+                        guestMcPathToHostPath(port, normalizeGuestMcPathLocked(port, rawPath.empty() ? "." : rawPath));
+                    std::error_code ec;
+                    if (std::filesystem::is_directory(hostDir, ec) && !ec)
+                    {
+                        result = 1024;
+                    }
+                }
+            }
+
+            setMcCommandResultLocked(kMcCmdGetEntSpace, result);
         }
+        RUNTIME_LOG("[MC] GetEntSpace port=" << port << " '" << rawPath << "' -> result=" << result);
         setReturnS32(ctx, 0);
     }
 
