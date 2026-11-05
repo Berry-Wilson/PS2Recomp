@@ -157,7 +157,7 @@ namespace
                 if (!haveLast || s.buttons != last.buttons || std::memcmp(s.sticks, last.sticks, 4) != 0)
                 {
                     std::fprintf(record, "%llu %04x %u %u %u %u %.3f\n", static_cast<unsigned long long>(s.read), s.buttons,
-                                 s.sticks[0], s.sticks[1], s.sticks[2], s.sticks[3], GetTime());
+                                 s.sticks[0], s.sticks[1], s.sticks[2], s.sticks[3], hostinput::GetTime());
                     std::fflush(record);
                     last = s;
                     haveLast = true;
@@ -178,8 +178,8 @@ namespace
         const auto &events = autoPadEvents();
         if (events.empty())
             return 0u;
-        static const double s_t0 = GetTime();
-        const double t = GetTime() - s_t0;
+        static const double s_t0 = hostinput::GetTime();
+        const double t = hostinput::GetTime() - s_t0;
         uint16_t mask = 0u;
         for (const auto &e : events)
         {
@@ -220,12 +220,12 @@ bool PSPadBackend::readState(int port, int /*slot*/, uint8_t *data, size_t size)
     static bool s_padConnected[kMaxGamepads] = {};
     for (int pad = 0; pad < kMaxGamepads; ++pad)
     {
-        const bool available = IsGamepadAvailable(pad);
+        const bool available = hostinput::IsGamepadAvailable(pad);
         if (available != s_padConnected[pad])
         {
             s_padConnected[pad] = available;
             if (available)
-                std::fprintf(stderr, "[pad] gamepad %d connected: %s\n", pad, GetGamepadName(pad));
+                std::fprintf(stderr, "[pad] gamepad %d connected: %s\n", pad, hostinput::GetGamepadName(pad));
             else
                 std::fprintf(stderr, "[pad] gamepad %d disconnected\n", pad);
         }
@@ -255,31 +255,31 @@ bool PSPadBackend::readState(int port, int /*slot*/, uint8_t *data, size_t size)
         };
         for (const auto &entry : kButtonMap)
         {
-            if (IsGamepadButtonDown(pad, entry.button))
+            if (hostinput::IsGamepadButtonDown(pad, entry.button))
                 clearBit(entry.mask);
         }
-        mergeAxis(0, GetGamepadAxisMovement(pad, GAMEPAD_AXIS_LEFT_X));
-        mergeAxis(1, GetGamepadAxisMovement(pad, GAMEPAD_AXIS_LEFT_Y));
-        mergeAxis(2, GetGamepadAxisMovement(pad, GAMEPAD_AXIS_RIGHT_X));
-        mergeAxis(3, GetGamepadAxisMovement(pad, GAMEPAD_AXIS_RIGHT_Y));
+        mergeAxis(0, hostinput::GetGamepadAxisMovement(pad, GAMEPAD_AXIS_LEFT_X));
+        mergeAxis(1, hostinput::GetGamepadAxisMovement(pad, GAMEPAD_AXIS_LEFT_Y));
+        mergeAxis(2, hostinput::GetGamepadAxisMovement(pad, GAMEPAD_AXIS_RIGHT_X));
+        mergeAxis(3, hostinput::GetGamepadAxisMovement(pad, GAMEPAD_AXIS_RIGHT_Y));
     }
 
     // Keyboard. D-pad: arrow keys. Left stick: WASD. Right stick: IJKL.
-    if (IsKeyDown(KEY_UP))
+    if (hostinput::IsKeyDown(KEY_UP))
         clearBit(PAD_UP);
-    if (IsKeyDown(KEY_DOWN))
+    if (hostinput::IsKeyDown(KEY_DOWN))
         clearBit(PAD_DOWN);
-    if (IsKeyDown(KEY_LEFT))
+    if (hostinput::IsKeyDown(KEY_LEFT))
         clearBit(PAD_LEFT);
-    if (IsKeyDown(KEY_RIGHT))
+    if (hostinput::IsKeyDown(KEY_RIGHT))
         clearBit(PAD_RIGHT);
 
     auto keyAxis = [](int negativeKey, int positiveKey) -> float
     {
         float value = 0.0f;
-        if (IsKeyDown(negativeKey))
+        if (hostinput::IsKeyDown(negativeKey))
             value -= 1.0f;
-        if (IsKeyDown(positiveKey))
+        if (hostinput::IsKeyDown(positiveKey))
             value += 1.0f;
         return value;
     };
@@ -288,25 +288,25 @@ bool PSPadBackend::readState(int port, int /*slot*/, uint8_t *data, size_t size)
     mergeAxis(2, keyAxis(KEY_J, KEY_L));
     mergeAxis(3, keyAxis(KEY_I, KEY_K));
 
-    if (IsKeyDown(KEY_X) || IsKeyDown(KEY_SPACE))
+    if (hostinput::IsKeyDown(KEY_X) || hostinput::IsKeyDown(KEY_SPACE))
         clearBit(PAD_CROSS);
-    if (IsKeyDown(KEY_C) || IsKeyDown(KEY_ESCAPE))
+    if (hostinput::IsKeyDown(KEY_C) || hostinput::IsKeyDown(KEY_ESCAPE))
         clearBit(PAD_CIRCLE);
-    if (IsKeyDown(KEY_Z) || IsKeyDown(KEY_KP_0))
+    if (hostinput::IsKeyDown(KEY_Z) || hostinput::IsKeyDown(KEY_KP_0))
         clearBit(PAD_SQUARE);
-    if (IsKeyDown(KEY_V) || IsKeyDown(KEY_KP_1))
+    if (hostinput::IsKeyDown(KEY_V) || hostinput::IsKeyDown(KEY_KP_1))
         clearBit(PAD_TRIANGLE);
-    if (IsKeyDown(KEY_Q))
+    if (hostinput::IsKeyDown(KEY_Q))
         clearBit(PAD_L1);
-    if (IsKeyDown(KEY_E))
+    if (hostinput::IsKeyDown(KEY_E))
         clearBit(PAD_R1);
-    if (IsKeyDown(KEY_LEFT_SHIFT))
+    if (hostinput::IsKeyDown(KEY_LEFT_SHIFT))
         clearBit(PAD_L2);
-    if (IsKeyDown(KEY_RIGHT_SHIFT))
+    if (hostinput::IsKeyDown(KEY_RIGHT_SHIFT))
         clearBit(PAD_R2);
-    if (IsKeyDown(KEY_ENTER))
+    if (hostinput::IsKeyDown(KEY_ENTER))
         clearBit(PAD_START);
-    if (IsKeyDown(KEY_TAB))
+    if (hostinput::IsKeyDown(KEY_TAB))
         clearBit(PAD_SELECT);
 
     auto stickByte = [](float value) -> uint8_t

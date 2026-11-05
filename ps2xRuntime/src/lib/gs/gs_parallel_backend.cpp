@@ -1,4 +1,5 @@
 #include "runtime/gs/gs_parallel_backend.h"
+#include "runtime/host_display.h"
 
 #include "gs_interface.hpp"
 #include "context.hpp"
@@ -8,24 +9,25 @@
 #include <iostream>
 #include <mutex>
 #include <condition_variable>
+#include <cstdlib>
 #include <cstring>
 #include <algorithm>
 #include <thread>
 
 struct GSParallelBackend::Impl
 {
-    Vulkan::Context context;
-    Vulkan::Device device;
+    // The device belongs to the game window's swapchain; the mutex serializes it with present.
+    Vulkan::Device &device = HostDisplay::get()->device();
     ParallelGS::GSInterface iface;
     bool initialized = false;
-    std::mutex mutex;
+    std::mutex &mutex = HostDisplay::get()->deviceMutex();
     uint8_t *vram = nullptr;
     uint32_t vramSize = 0;
     GSTransferSnapshot transferSnapshot{};
     // Field parity for interlaced scanout. parallel-gs deinterlaces from a history of
     // fields and expects consecutive vsyncs to alternate between phase 0 and 1.
     uint32_t fieldPhase = 0;
-    // Host-visible copy of the scanout image, reused across presents.
+    // Host-visible copy of the scanout image, reused across presents; only for frame dumps.
     Vulkan::BufferHandle readback;
 
     // GIF parsing (GSInterface::gif_transfer) is the expensive part of the GS, and nothing the
@@ -82,25 +84,6 @@ bool GSParallelBackend::Impl::init()
 
     Util::register_thread_index(0);
 
-    if (!Vulkan::Context::init_loader(nullptr))
-    {
-        std::cerr << "[GSParallelBackend] Failed to initialize Vulkan loader\n";
-        return false;
-    }
-
-    context.set_num_thread_indices(1);
-    if (!context.init_instance_and_device(nullptr, 0, nullptr, 0,
-                                         Vulkan::CONTEXT_CREATION_ENABLE_PUSH_DESCRIPTOR_BIT |
-                                         Vulkan::CONTEXT_CREATION_ENABLE_DESCRIPTOR_HEAP_BIT |
-                                         Vulkan::CONTEXT_CREATION_ENABLE_DESCRIPTOR_BUFFER_BIT))
-    {
-        std::cerr << "[GSParallelBackend] Failed to initialize Vulkan instance and device\n";
-        return false;
-    }
-
-    device.set_context(context);
-    device.init_frame_contexts(4);
-
     ParallelGS::GSOptions opts = {};
     opts.vram_size = 4 * 1024 * 1024;
     opts.super_sampling = ParallelGS::SuperSampling::X1;
@@ -114,6 +97,8 @@ bool GSParallelBackend::Impl::init()
     ParallelGS::Hacks hacks;
     hacks.backbuffer_promotion = true;
     iface.set_hacks(hacks);
+
+    HostDisplay::get()->setBeforeFrame([this] { iface.flush(); });
 
     initialized = true;
     worker = std::thread([this] { workerLoop(); });
@@ -219,6 +204,7 @@ void GSParallelBackend::Impl::stop()
     }
     queueCv.notify_all();
     worker.join();
+    HostDisplay::get()->setBeforeFrame(nullptr);
 }
 
 PresentationFrame GSParallelBackend::Impl::present(const GSPresentationRequest &request)
@@ -307,8 +293,8 @@ PresentationFrame GSParallelBackend::Impl::present(const GSPresentationRequest &
     ParallelGS::VSyncInfo vsync{};
     vsync.phase = fieldPhase;
     fieldPhase ^= 1u;
-    vsync.dst_layout = VK_IMAGE_LAYOUT_READ_ONLY_OPTIMAL;
-    vsync.dst_stage = VK_PIPELINE_STAGE_2_COPY_BIT;
+    vsync.dst_layout = VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL;
+    vsync.dst_stage = VK_PIPELINE_STAGE_2_ALL_TRANSFER_BIT;
     vsync.dst_access = VK_ACCESS_2_TRANSFER_READ_BIT;
     vsync.force_progressive = true;
     vsync.anti_blur = true;
@@ -327,12 +313,16 @@ PresentationFrame GSParallelBackend::Impl::present(const GSPresentationRequest &
 
         if (width > 0 && height > 0)
         {
-            auto cmd = device.request_command_buffer();
-            cmd->image_barrier(*scanout.image, VK_IMAGE_LAYOUT_READ_ONLY_OPTIMAL,
-                               VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
-                               VK_PIPELINE_STAGE_2_FRAGMENT_SHADER_BIT, 0,
-                               VK_PIPELINE_STAGE_2_COPY_BIT, VK_ACCESS_2_TRANSFER_READ_BIT);
+            HostDisplay::get()->setScanout(scanout.image.get());
+            result.width = width;
+            result.height = height;
+            result.presentedToDisplay = true;
+        }
 
+        static const bool s_wantPixels = std::getenv("PS2X_DUMP_FRAMES_DIR") != nullptr;
+        if (s_wantPixels && width > 0 && height > 0)
+        {
+            auto cmd = device.request_command_buffer();
             const VkDeviceSize bytes = static_cast<VkDeviceSize>(width) * height * sizeof(uint32_t);
             if (!readback || readback->get_create_info().size < bytes)
             {
@@ -357,8 +347,6 @@ PresentationFrame GSParallelBackend::Impl::present(const GSPresentationRequest &
             const auto *mapped = static_cast<const uint8_t *>(device.map_host_buffer(*readback, Vulkan::MEMORY_ACCESS_READ_BIT));
             if (mapped)
             {
-                result.width = width;
-                result.height = height;
                 result.pixels.resize(bytes);
                 std::memcpy(result.pixels.data(), mapped, bytes);
 

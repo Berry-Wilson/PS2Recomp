@@ -12,7 +12,10 @@
 
 #if defined(PS2X_ENABLE_DEBUG_UI) && !defined(PLATFORM_VITA)
 #include "imgui.h"
+#include "ps2_host_backend.h"
+#if !defined(PS2X_HAS_PARALLEL_GS)
 #include "rlImGui.h"
+#endif
 #include "raylib.h"
 #endif
 
@@ -2181,7 +2184,9 @@ void PS2DebugPanel::initialize()
 #if defined(PS2X_ENABLE_DEBUG_UI) && !defined(PLATFORM_VITA)
     if (!m_initialized)
     {
+#if !defined(PS2X_HAS_PARALLEL_GS) // otherwise HostDisplay owns ImGui and draws it in its swapchain
         rlImGuiSetup(true);
+#endif
         m_initialized = true;
     }
 #endif
@@ -2192,7 +2197,9 @@ void PS2DebugPanel::shutdown()
 #if defined(PS2X_ENABLE_DEBUG_UI) && !defined(PLATFORM_VITA)
     if (m_initialized)
     {
+#if !defined(PS2X_HAS_PARALLEL_GS)
         rlImGuiShutdown();
+#endif
         m_initialized = false;
     }
 #endif
@@ -2206,7 +2213,7 @@ void PS2DebugPanel::draw(PS2Runtime &runtime)
         return;
     }
 
-    if (IsKeyPressed(KEY_F1))
+    if (hostinput::IsKeyPressed(KEY_F1))
     {
         toggleVisible();
     }
@@ -2216,7 +2223,9 @@ void PS2DebugPanel::draw(PS2Runtime &runtime)
         return;
     }
 
+#if !defined(PS2X_HAS_PARALLEL_GS)
     rlImGuiBegin();
+#endif
 
     ImGui::SetNextWindowSize(ImVec2(780.0f, 620.0f), ImGuiCond_FirstUseEver);
     if (ImGui::Begin("Runtime Debugger", &m_visible, ImGuiWindowFlags_MenuBar))
@@ -2303,7 +2312,9 @@ void PS2DebugPanel::draw(PS2Runtime &runtime)
     }
     ImGui::End();
 
+#if !defined(PS2X_HAS_PARALLEL_GS)
     rlImGuiEnd();
+#endif
 #else
     (void)runtime;
 #endif

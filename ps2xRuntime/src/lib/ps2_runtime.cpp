@@ -9,6 +9,8 @@
 #if defined(PS2X_HAS_PARALLEL_GS)
 
 #include "runtime/gs/gs_parallel_backend.h"
+#include "runtime/host_display.h"
+#include "imgui.h"
 
 #endif
 #include "runtime/ee_scheduler.h"
@@ -901,7 +903,13 @@ namespace
     }
 }
 
-static void UploadFrame(Texture2D &tex, PS2Runtime *rt, uint32_t &outWidth, uint32_t &outHeight)
+#if defined(PS2X_HAS_PARALLEL_GS)
+using HostFrameTarget = HostDisplay;
+#else
+using HostFrameTarget = Texture2D;
+#endif
+
+static void UploadFrame(HostFrameTarget &tex, PS2Runtime *rt, uint32_t &outWidth, uint32_t &outHeight)
 {
     static uint64_t s_lastPresentationTick = std::numeric_limits<uint64_t>::max();
     static bool s_hasLatchedInitialFrame = false;
@@ -912,7 +920,9 @@ static void UploadFrame(Texture2D &tex, PS2Runtime *rt, uint32_t &outWidth, uint
     static uint32_t s_lastHeight = 0u;
     static bool s_hasUploadedFrame = false;
     static std::vector<uint8_t> s_scratch;
+#if !defined(PS2X_HAS_PARALLEL_GS)
     static std::vector<uint8_t> s_uploadBuffer(DEFAULT_FB_SIZE, 0u);
+#endif
 
     const uint64_t currentTick = rt->eeScheduler().currentVSyncTick();
     const bool needsLatch = !s_hasLatchedInitialFrame || currentTick != s_lastPresentationTick;
@@ -929,6 +939,21 @@ static void UploadFrame(Texture2D &tex, PS2Runtime *rt, uint32_t &outWidth, uint
         return;
     }
 
+    static uint64_t s_hostFrameCounter = 0;
+    const uint64_t frameIndex = (currentTick > 0) ? currentTick : s_hostFrameCounter++;
+    {
+        static const uint64_t s_maxTicks = []()
+        {
+            const char *m = std::getenv("PS2X_MAX_TICKS");
+            return m ? static_cast<uint64_t>(std::atoll(m)) : 0ull;
+        }();
+        if (s_maxTicks > 0 && frameIndex >= s_maxTicks)
+        {
+            std::cerr << "[ps2xRuntime] Reached max ticks (" << frameIndex << "), requesting stop." << std::endl;
+            rt->requestStop();
+        }
+    }
+
     s_scratch.clear();
     uint32_t width = 0u;
     uint32_t height = 0u;
@@ -942,9 +967,13 @@ static void UploadFrame(Texture2D &tex, PS2Runtime *rt, uint32_t &outWidth, uint
                                                    &sourceFbp,
                                                    &usedPreferredDisplaySource))
     {
+#if !defined(PS2X_HAS_PARALLEL_GS)
         Image blank = GenImageColor(FB_WIDTH, FB_HEIGHT, MAGENTA);
         UpdateTexture(tex, blank.data);
         UnloadImage(blank);
+#endif
+        // With parallel-gs this is the normal path: the frame went straight to the swapchain and
+        // pixels exist only while dumping frames.
         outWidth = FB_WIDTH;
         outHeight = DEFAULT_DISPLAY_HEIGHT;
         s_lastWidth = outWidth;
@@ -978,21 +1007,9 @@ static void UploadFrame(Texture2D &tex, PS2Runtime *rt, uint32_t &outWidth, uint
     s_lastWidth = width;
     s_lastHeight = height;
 
+#if !defined(PS2X_HAS_PARALLEL_GS)
     std::fill(s_uploadBuffer.begin(), s_uploadBuffer.end(), 0u);
-    static uint64_t s_hostFrameCounter = 0;
-    const uint64_t frameIndex = (currentTick > 0) ? currentTick : s_hostFrameCounter++;
-    {
-        static const uint64_t s_maxTicks = []()
-        {
-            const char *m = std::getenv("PS2X_MAX_TICKS");
-            return m ? static_cast<uint64_t>(std::atoll(m)) : 0ull;
-        }();
-        if (s_maxTicks > 0 && frameIndex >= s_maxTicks)
-        {
-            std::cerr << "[ps2xRuntime] Reached max ticks (" << frameIndex << "), requesting stop." << std::endl;
-            rt->requestStop();
-        }
-    }
+#endif
     // Optional headless frame capture: PS2X_DUMP_FRAMES_DIR=<dir>, PS2X_DUMP_FRAMES_EVERY=<vsync ticks, default 60>
     {
         static const char *s_dumpDir = std::getenv("PS2X_DUMP_FRAMES_DIR");
@@ -1055,6 +1072,13 @@ static void UploadFrame(Texture2D &tex, PS2Runtime *rt, uint32_t &outWidth, uint
             }
         }
     }
+#if defined(PS2X_HAS_PARALLEL_GS)
+    if (!tex.hasScanout() && !s_scratch.empty() && width != 0u && height != 0u &&
+        s_scratch.size() >= static_cast<size_t>(width) * height * 4u)
+    {
+        tex.setCpuFrame(s_scratch.data(), width, height); // PS2X_GS_BACKEND=cpu
+    }
+#else
     if (!s_scratch.empty() && width != 0u && height != 0u)
     {
         const uint32_t copyWidth = std::min<uint32_t>(width, FB_WIDTH);
@@ -1076,6 +1100,7 @@ static void UploadFrame(Texture2D &tex, PS2Runtime *rt, uint32_t &outWidth, uint
     }
 
     UpdateTexture(tex, s_uploadBuffer.data());
+#endif
     outWidth = width;
     outHeight = height;
     s_hasUploadedFrame = true;
@@ -1152,10 +1177,16 @@ PS2Runtime::~PS2Runtime()
             m_debugUiInitialized = false;
         }
 
+#if defined(PS2X_HAS_PARALLEL_GS)
+        // parallel-gs renders with the window's device, so it has to go first.
+        m_gs.setRasterBackend(nullptr);
+        HostDisplay::destroy();
+#else
         if (IsWindowReady())
         {
             CloseWindow();
         }
+#endif
 
         m_loadedModules.clear();
     }
@@ -1287,7 +1318,7 @@ bool PS2Runtime::syncCoreSubsystems()
 
         }
 
-        if (useParallel)
+        if (useParallel && HostDisplay::get())
 
         {
 
@@ -1424,6 +1455,14 @@ bool PS2Runtime::initialize(const char *title)
             return false;
         }
 
+#if defined(PS2X_HAS_PARALLEL_GS)
+        // Before the core subsystems: parallel-gs renders with this window's Vulkan device.
+        if (!HostDisplay::create(title, HOST_WINDOW_WIDTH, HOST_WINDOW_HEIGHT))
+        {
+            std::cerr << "Failed to create the Vulkan game window" << std::endl;
+            return false;
+        }
+#endif
         if (!syncCoreSubsystems())
         {
             std::cerr << "Failed to bind runtime core subsystems" << std::endl;
@@ -1431,13 +1470,18 @@ bool PS2Runtime::initialize(const char *title)
         }
 #if defined(PLATFORM_VITA)
         InitWindow(HOST_WINDOW_WIDTH, HOST_WINDOW_HEIGHT, title); // raylib vita does not support audio
+#elif defined(PS2X_HAS_PARALLEL_GS)
+        InitAudioDevice(); // raylib is only the audio backend here; it never opens a window
+        m_audioBackend.setAudioReady(IsAudioDeviceReady());
 #else
         SetConfigFlags(FLAG_WINDOW_RESIZABLE);
         InitWindow(HOST_WINDOW_WIDTH, HOST_WINDOW_HEIGHT, title);
         InitAudioDevice();
         m_audioBackend.setAudioReady(IsAudioDeviceReady());
 #endif
+#if !defined(PS2X_HAS_PARALLEL_GS)
         SetTargetFPS(60);
+#endif
         if (m_debugUiInitCallback)
         {
             m_debugUiInitCallback(*this, m_debugUiUserData);
@@ -3290,10 +3334,15 @@ void PS2Runtime::run()
 
     RUNTIME_LOG("Starting execution at address 0x" << std::hex << m_cpuContext.pc << std::dec);
 
+#if defined(PS2X_HAS_PARALLEL_GS)
+    HostDisplay &display = *HostDisplay::get();
+    uint64_t lastPresentedTick = std::numeric_limits<uint64_t>::max();
+#else
     // A blank image to use as a framebuffer
     Image blank = GenImageColor(FB_WIDTH, FB_HEIGHT, BLANK);
     Texture2D frameTex = LoadTextureFromImage(blank);
     UnloadImage(blank);
+#endif
 
     std::atomic<bool> gameThreadFinished{false};
 
@@ -3353,6 +3402,59 @@ void PS2Runtime::run()
 
             }
         });
+#if defined(PS2X_HAS_PARALLEL_GS)
+        // Each guest VSync is one frame. The timeout keeps the window and debug panel alive if
+        // the game stops producing them.
+        {
+            const auto deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds(16);
+            while (eeScheduler().currentVSyncTick() == lastPresentedTick &&
+                   std::chrono::steady_clock::now() < deadline &&
+                   !isStopRequested() && !gameThreadFinished.load(std::memory_order_acquire))
+            {
+                std::this_thread::sleep_for(std::chrono::milliseconds(1));
+            }
+            lastPresentedTick = eeScheduler().currentVSyncTick();
+        }
+
+        display.pollEvents();
+        uint32_t presentWidth = FB_WIDTH;
+        uint32_t presentHeight = DEFAULT_DISPLAY_HEIGHT;
+        UploadFrame(display, this, presentWidth, presentHeight);
+
+        display.beginUi();
+        {
+            // Guest VSyncs per second (60 = full speed NTSC), averaged over half-second windows.
+            static double s_rateStart = hostinput::GetTime();
+            static uint64_t s_rateStartTick = m_memory.gs().vsyncTick.load(std::memory_order_acquire);
+            static double s_vsyncsPerSecond = 0.0;
+            const double now = hostinput::GetTime();
+            const uint64_t tickNow = m_memory.gs().vsyncTick.load(std::memory_order_acquire);
+            if (now - s_rateStart >= 0.5)
+            {
+                s_vsyncsPerSecond = static_cast<double>(tickNow - s_rateStartTick) / (now - s_rateStart);
+                s_rateStart = now;
+                s_rateStartTick = tickNow;
+            }
+            char text[32];
+            std::snprintf(text, sizeof(text), "VSync/s: %.1f", s_vsyncsPerSecond);
+            ImDrawList *overlay = ImGui::GetForegroundDrawList();
+            overlay->AddText(ImGui::GetFont(), 20.0f, ImVec2(9.0f, 9.0f), IM_COL32(0, 0, 0, 255), text);
+            overlay->AddText(ImGui::GetFont(), 20.0f, ImVec2(8.0f, 8.0f),
+                             s_vsyncsPerSecond >= 59.0 ? IM_COL32(0, 228, 48, 255) : IM_COL32(253, 249, 0, 255), text);
+        }
+        if (m_debugUiInitialized && m_debugUiDrawCallback)
+        {
+            m_debugUiDrawCallback(*this, m_debugUiUserData);
+        }
+        display.present();
+
+        if (display.shouldClose())
+        {
+            RUNTIME_LOG("[run] window close requested, breaking out of loop");
+            requestStop();
+            break;
+        }
+#else
         uint32_t presentWidth = FB_WIDTH;
         uint32_t presentHeight = DEFAULT_DISPLAY_HEIGHT;
         UploadFrame(frameTex, this, presentWidth, presentHeight);
@@ -3402,6 +3504,7 @@ void PS2Runtime::run()
             requestStop();
             break;
         }
+#endif
     }
 
     requestStop();
@@ -3415,8 +3518,12 @@ void PS2Runtime::run()
         m_debugUiShutdownCallback(*this, m_debugUiUserData);
         m_debugUiInitialized = false;
     }
+#if defined(PS2X_HAS_PARALLEL_GS)
+    display.hide(); // closed by ~PS2Runtime, after the GS backend that renders with its device
+#else
     UnloadTexture(frameTex);
     CloseWindow();
+#endif
 
     RUNTIME_LOG("[run] exiting loop");
 }

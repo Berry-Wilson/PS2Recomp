@@ -298,10 +298,12 @@ struct PresentationFrame
     uint32_t displayFbp = 0;
     uint32_t sourceFbp = 0;
     bool usedPreferred = false;
+    // The backend handed the frame straight to the display; pixels may be empty.
+    bool presentedToDisplay = false;
 
     explicit operator bool() const
     {
-        return !pixels.empty() && width != 0u && height != 0u;
+        return (presentedToDisplay || !pixels.empty()) && width != 0u && height != 0u;
     }
 };
 

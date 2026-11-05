@@ -83,7 +83,9 @@ else()
     )
     FetchContent_MakeAvailable(raylib)
 
-    if(PS2X_ENABLE_DEBUG_UI AND NOT PS2X_IS_ANDROID)
+    # parallel-gs draws the game window through Vulkan, including the VSync/s overlay: ImGui is
+    # needed even without the debug panel, and rlImGui (raylib's OpenGL renderer) not at all.
+    if((PS2X_ENABLE_DEBUG_UI OR TARGET parallel-gs) AND NOT PS2X_IS_ANDROID)
         FetchContent_Declare(
             imgui
             GIT_REPOSITORY https://github.com/ocornut/imgui.git
@@ -107,6 +109,7 @@ else()
         )
         target_include_directories(imgui PUBLIC "${PS2X_IMGUI_SOURCE_DIR}")
 
+        if(NOT TARGET parallel-gs)
         FetchContent_Declare(
             rlImGui
             GIT_REPOSITORY https://github.com/raylib-extras/rlImGui.git
@@ -126,6 +129,7 @@ else()
         )
         target_include_directories(rlImGui PUBLIC "${PS2X_RLIMGUI_SOURCE_DIR}")
         target_link_libraries(rlImGui PUBLIC raylib imgui)
+        endif()
     endif()
 endif()
 
@@ -533,7 +537,24 @@ if(TARGET parallel-gs)
         "${PS2X_PARALLEL_GS_DIR}/Granite/third_party/volk"
         "${PS2X_PARALLEL_GS_DIR}/Granite/third_party/vulkan-headers/include"
     )
-    target_compile_definitions(ps2_runtime PUBLIC PS2X_HAS_PARALLEL_GS=1)
+    target_compile_definitions(ps2_runtime PUBLIC PS2X_HAS_PARALLEL_GS=1)
+
+    # The game window: GLFW (raylib's copy) with no client API, presented by Granite's swapchain.
+    target_sources(ps2_runtime PRIVATE
+        src/lib/host_display.cpp
+        src/lib/host_input.cpp
+    )
+    target_sources(imgui PRIVATE
+        "${PS2X_IMGUI_SOURCE_DIR}/backends/imgui_impl_glfw.cpp"
+        "${PS2X_IMGUI_SOURCE_DIR}/backends/imgui_impl_vulkan.cpp"
+    )
+    target_include_directories(imgui PUBLIC
+        "${PS2X_IMGUI_SOURCE_DIR}/backends"
+        "${PS2X_PARALLEL_GS_DIR}/Granite/third_party/khronos/vulkan-headers/include"
+    )
+    target_compile_definitions(imgui PUBLIC IMGUI_IMPL_VULKAN_NO_PROTOTYPES VK_NO_PROTOTYPES)
+    target_link_libraries(imgui PUBLIC glfw)
+    target_link_libraries(ps2_runtime PUBLIC imgui glfw)
 endif()
 target_link_libraries(ps2EntryRunner
     PRIVATE
@@ -544,7 +565,11 @@ if(PS2X_ENABLE_DEBUG_UI AND NOT PS2X_IS_VITA AND NOT PS2X_IS_ANDROID)
     target_sources(ps2EntryRunner PRIVATE
         src/lib/ps2_debug_panel.cpp
     )
-    target_link_libraries(ps2EntryRunner PRIVATE rlImGui imgui)
+    if(TARGET parallel-gs)
+        target_link_libraries(ps2EntryRunner PRIVATE imgui)
+    else()
+        target_link_libraries(ps2EntryRunner PRIVATE rlImGui imgui)
+    endif()
     target_compile_definitions(ps2EntryRunner PRIVATE PS2X_ENABLE_DEBUG_UI=1)
 endif()
 
