@@ -1392,6 +1392,24 @@ void EeScheduler::completeExternalWait(uint32_t type, uint64_t token, int result
     publishSnapshot();
 }
 
+[[noreturn]] void EeScheduler::waitBriefly(uint64_t microseconds, std::function<void(R5900Context &)> completion)
+{
+    assertExecutor();
+    constexpr uint32_t kBriefWaitType = 0x42574149u;
+    static uint64_t s_nextToken = 0u;
+    const uint64_t token = ++s_nextToken;
+    EeEvent wake{};
+    wake.type = EeEventType::ExternalWake;
+    wake.id = kBriefWaitType;
+    wake.value = token;
+    // Due at once on the host clock: guest time moves on, and the next VBlank's deadline still holds
+    // it back to real time.
+    scheduleEvent(m_eeCycle + microsecondsToEeCycles(microseconds),
+                  std::chrono::steady_clock::now(),
+                  wake);
+    waitExternal(EeWaitReason::External, kBriefWaitType, token, std::move(completion));
+}
+
 [[noreturn]] void EeScheduler::waitExternal(EeWaitReason reason,
                                             uint32_t type,
                                             uint64_t token,
@@ -2104,7 +2122,11 @@ void EeScheduler::waitForEvent()
         const auto timerHostDeadline = std::chrono::steady_clock::now() + eeCyclesToHostDuration(timerCycles);
         if (timerHostDeadline < hostDeadline)
         {
-            deadlineCycle = m_eeCycle + timerCycles;
+            // Guest time often runs ahead of real time, so a timer can be due sooner on the host clock
+            // but later on the guest clock than the next deadline. Waking early is harmless, but guest
+            // time must not jump past that deadline: a thread waiting on it would lose the difference.
+            const uint64_t timerCycle = m_eeCycle + timerCycles;
+            deadlineCycle = m_deadlines.empty() ? timerCycle : std::min(deadlineCycle, timerCycle);
             hostDeadline = timerHostDeadline;
         }
     }

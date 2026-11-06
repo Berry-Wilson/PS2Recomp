@@ -341,6 +341,9 @@ public:
     [[noreturn]] void waitVSync(uint64_t afterTick, int fixedResult = -1, std::function<void(R5900Context &)> completion = {});
     void completeVSync(uint64_t tick);
     void completeExternalWait(uint32_t type, uint64_t token, int result);
+    // Blocks the current thread for a short guest time, with no host sleep, so events are delivered
+    // and guest time moves on. For a guest polling something that only changes as guest time passes.
+    [[noreturn]] void waitBriefly(uint64_t microseconds, std::function<void(R5900Context &)> completion = {});
     [[noreturn]] void waitExternal(EeWaitReason reason, uint32_t type, uint64_t token, std::function<void(R5900Context &)> completion = {});
 
     [[nodiscard]] GuestThread *thread(int id);

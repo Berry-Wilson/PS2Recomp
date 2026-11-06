@@ -1,6 +1,10 @@
 #include "runtime/ps2_audio.h"
 #include "runtime/ps2_memory.h"
 #include "ps2_host_backend.h"
+#include <algorithm>
+#include <atomic>
+#include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <vector>
 
@@ -77,7 +81,150 @@ struct PS2AudioBackend::Impl
         uint32_t sampleKey;
     };
     std::vector<TrackedSound> activeSounds;
+
+    // The sound chip's output on its way to the audio device: one thread pushes as the guest runs, the
+    // device's thread pulls. Guest time and the device's clock drift apart, so playback speed follows
+    // the buffer's fill level by up to 2%, keeping it near kTargetFrames without an audible glitch.
+    static constexpr uint64_t kRingFrames = 1u << 15u;
+    static constexpr uint64_t kTargetFrames = 3072u;
+    static constexpr int kDeviceBufferFrames = 1024;
+
+    std::vector<int16_t> ring = std::vector<int16_t>(kRingFrames * 2u);
+    std::atomic<uint64_t> writePos{0};
+    std::atomic<uint64_t> readPos{0};
+    double fraction = 0.0;
+    bool playing = false;
+    std::atomic<uint64_t> underruns{0};
+    std::atomic<uint64_t> droppedFrames{0};
+    uint64_t pushedFrames = 0;
+    std::FILE *dump = nullptr;
+#if !defined(PLATFORM_VITA)
+    AudioStream stream{};
+#endif
+    std::atomic<bool> streamOpen{false};
+
+    static std::atomic<Impl *> s_streamOwner;
+    void pull(int16_t *out, unsigned int frames);
+    static void streamCallback(void *buffer, unsigned int frames);
 };
+
+std::atomic<PS2AudioBackend::Impl *> PS2AudioBackend::Impl::s_streamOwner{nullptr};
+
+void PS2AudioBackend::Impl::pull(int16_t *out, unsigned int frames)
+{
+    uint64_t read = readPos.load(std::memory_order_relaxed);
+    uint64_t available = writePos.load(std::memory_order_acquire) - read;
+    unsigned int produced = 0;
+
+    if (!playing && available >= kTargetFrames)
+    {
+        playing = true;
+        fraction = 0.0;
+    }
+    if (playing)
+    {
+        const double error = (static_cast<double>(available) - kTargetFrames) / kTargetFrames;
+        const double rate = 1.0 + std::clamp(error * 0.02, -0.02, 0.02);
+        for (; produced < frames; ++produced)
+        {
+            if (available < 2u)
+            {
+                playing = false;
+                underruns.fetch_add(1u, std::memory_order_relaxed);
+                break;
+            }
+            const size_t a = static_cast<size_t>(read % kRingFrames) * 2u;
+            const size_t b = static_cast<size_t>((read + 1u) % kRingFrames) * 2u;
+            const float f = static_cast<float>(fraction);
+            out[produced * 2u] = static_cast<int16_t>(ring[a] + (ring[b] - ring[a]) * f);
+            out[produced * 2u + 1u] = static_cast<int16_t>(ring[a + 1u] + (ring[b + 1u] - ring[a + 1u]) * f);
+            fraction += rate;
+            const uint64_t whole = static_cast<uint64_t>(fraction);
+            fraction -= static_cast<double>(whole);
+            read += whole;
+            available -= whole;
+        }
+        readPos.store(read, std::memory_order_release);
+    }
+    if (produced < frames)
+        std::memset(out + produced * 2u, 0, (frames - produced) * 2u * sizeof(int16_t));
+}
+
+void PS2AudioBackend::Impl::streamCallback(void *buffer, unsigned int frames)
+{
+    if (Impl *owner = s_streamOwner.load(std::memory_order_acquire))
+        owner->pull(static_cast<int16_t *>(buffer), frames);
+    else
+        std::memset(buffer, 0, frames * 2u * sizeof(int16_t));
+}
+
+void PS2AudioBackend::setAudioReady(bool ready)
+{
+    m_audioReady = ready;
+    Impl &impl = *m_impl;
+#if !defined(PLATFORM_VITA)
+    if (ready && !impl.streamOpen.load())
+    {
+        SetAudioStreamBufferSizeDefault(Impl::kDeviceBufferFrames);
+        impl.stream = LoadAudioStream(48000, 16, 2);
+        Impl::s_streamOwner.store(&impl, std::memory_order_release);
+        SetAudioStreamCallback(impl.stream, Impl::streamCallback);
+        PlayAudioStream(impl.stream);
+        impl.streamOpen.store(true, std::memory_order_release);
+    }
+    else if (!ready && impl.streamOpen.load())
+    {
+        impl.streamOpen.store(false, std::memory_order_release);
+        Impl::s_streamOwner.store(nullptr, std::memory_order_release);
+        StopAudioStream(impl.stream);
+        UnloadAudioStream(impl.stream);
+    }
+#endif
+    if (!ready && impl.pushedFrames != 0u)
+    {
+        std::fprintf(stderr, "[audio] %.1f s of sound chip output, %llu underruns, %llu frames dropped\n",
+                     static_cast<double>(impl.pushedFrames) / 48000.0,
+                     static_cast<unsigned long long>(impl.underruns.load()),
+                     static_cast<unsigned long long>(impl.droppedFrames.load()));
+    }
+    if (!ready && impl.dump)
+    {
+        std::fclose(impl.dump);
+        impl.dump = nullptr;
+    }
+}
+
+void PS2AudioBackend::pushOutput(const int16_t *stereo, size_t frames)
+{
+    Impl &impl = *m_impl;
+    impl.pushedFrames += frames;
+
+    // PS2X_AUDIO_DUMP=<file>: raw 48 kHz 16-bit stereo, as the sound chip made it.
+    static const char *const dumpPath = std::getenv("PS2X_AUDIO_DUMP");
+    if (dumpPath)
+    {
+        if (!impl.dump)
+            impl.dump = std::fopen(dumpPath, "wb");
+        if (impl.dump)
+            std::fwrite(stereo, sizeof(int16_t) * 2u, frames, impl.dump);
+    }
+
+    if (!impl.streamOpen.load(std::memory_order_acquire))
+        return;
+    const uint64_t write = impl.writePos.load(std::memory_order_relaxed);
+    const uint64_t used = write - impl.readPos.load(std::memory_order_acquire);
+    const size_t space = static_cast<size_t>(Impl::kRingFrames - std::min(used, Impl::kRingFrames));
+    const size_t count = std::min(frames, space);
+    if (count < frames)
+        impl.droppedFrames.fetch_add(frames - count, std::memory_order_relaxed);
+    for (size_t i = 0; i < count; ++i)
+    {
+        const size_t slot = static_cast<size_t>((write + i) % Impl::kRingFrames) * 2u;
+        impl.ring[slot] = stereo[i * 2u];
+        impl.ring[slot + 1u] = stereo[i * 2u + 1u];
+    }
+    impl.writePos.store(write + count, std::memory_order_release);
+}
 
 PS2AudioBackend::PS2AudioBackend() : m_impl(std::make_unique<Impl>())
 {

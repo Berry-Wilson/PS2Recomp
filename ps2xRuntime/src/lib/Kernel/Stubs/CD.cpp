@@ -910,19 +910,15 @@ namespace ps2_stubs
                 return;
             }
 
-            // Games poll the non-blocking read in a tight loop (e.g. Drakengard's movie
-            // streamer). Stream production is driven by EE vsync time, which never advances
-            // while the guest spins on an instant 0, so yield until the next bank could have
-            // been produced and then report whatever is readable.
+            // Games poll the non-blocking read in a tight loop. Drakengard's movie streamer does so
+            // against a timer, with about 1.6 ms to spare before its next picture is due. Stream
+            // production is driven by EE vsync time, which never advances while the guest spins on an
+            // instant 0, so yield, but only for a moment of guest time: sleeping until the next vsync
+            // makes it miss that slot, and the movie then plays at half speed.
             if (runtime != nullptr && g_cdStreamTiming.active && !g_cdStreamTiming.paused && remaining != 0u)
             {
-                const uint32_t bank = std::max(1u, g_cdStreamTiming.sectorsPerBank);
-                const uint32_t buffered = bufferedCdStreamSectors(runtime);
-                const uint32_t needed = bank > buffered ? bank - buffered : 1u;
-                const uint64_t wakeTick = cdStreamWakeTickForSectors(runtime, needed);
-                runtime->eeScheduler().waitVSync(
-                    wakeTick - 1u,
-                    -1,
+                runtime->eeScheduler().waitBriefly(
+                    100u,
                     [rdram, runtime, state, remaining](R5900Context &resumeContext)
                     {
                         if (static_cast<int32_t>(getRegU32(&resumeContext, 2)) < 0)

@@ -519,6 +519,7 @@ namespace ps2_stubs
 
         struct MpegStreamCallbackEvent
         {
+            std::vector<uint8_t> payload; // audio packets only
             uint32_t mpegAddr = 0u;
             uint32_t streamType = 0u;
             uint32_t dataAddr = 0u;
@@ -547,9 +548,40 @@ namespace ps2_stubs
             std::unordered_map<uint32_t, MpegPlaybackState> playbackByMpeg;
         };
 
+        // Movie audio on its way to the game's PCM callback. Real libmpeg calls it from inside the demux
+        // call, so its data is valid and a full audio ring stops the demux until there is room. Guest
+        // calls from here run later, so each packet is kept on the host and handed over in order, one
+        // at a time, through one reusable guest buffer. A callback returning 0 means its ring is full:
+        // the packet stays at the front and is offered again on the next demux call.
+        struct MpegAudioPacket
+        {
+            MpegStreamCallbackEvent event;
+            MpegRegisteredCallback callback;
+        };
+
+        struct MpegAudioQueue
+        {
+            std::deque<MpegAudioPacket> packets;
+            bool inFlight = false;
+            uint64_t generation = 0u;
+            uint32_t buffer = 0u;
+            uint32_t bufferSize = 0u;
+            uint32_t callbackData = 0u;
+        };
+
+        constexpr size_t kMaxQueuedAudioPackets = 16u;
+
         std::mutex g_mpeg_stub_mutex;
         constexpr uint32_t kMpegPictureWaitType = 1u;
         MpegStubState g_mpeg_stub_state;
+        MpegAudioQueue g_mpeg_audio_queue;
+
+        void clearMpegAudioQueueUnlocked()
+        {
+            g_mpeg_audio_queue.packets.clear();
+            g_mpeg_audio_queue.inFlight = false;
+            ++g_mpeg_audio_queue.generation;
+        }
 
         // TODO this resolution should follow runtime resolution
         constexpr uint32_t kStubMovieWidth = 320u;
@@ -1157,6 +1189,7 @@ namespace ps2_stubs
         void queueStreamCallbackEvent(uint32_t mpegAddr,
                                       uint32_t streamType,
                                       uint32_t dataAddr,
+                                      const uint8_t *bytes,
                                       uint32_t len,
                                       std::vector<MpegStreamCallbackEvent> &callbackEvents,
                                       int64_t pts90k = -1,
@@ -1172,6 +1205,10 @@ namespace ps2_stubs
             event.callbacks = matchingStreamCallbacks(mpegAddr, streamType);
             if (!event.callbacks.empty())
             {
+                if (streamType != kMpegStrM2V)
+                {
+                    event.payload.assign(bytes, bytes + len);
+                }
                 callbackEvents.push_back(std::move(event));
             }
         }
@@ -1330,6 +1367,7 @@ namespace ps2_stubs
                                 mpegAddr,
                                 kMpegStrM2V,
                                 playback.pssGuestAddrs[payloadStart],
+                                buffer.data() + payloadStart,
                                 static_cast<uint32_t>(packetEnd - payloadStart),
                                 callbackEvents,
                                 pes.pts90k,
@@ -1353,6 +1391,7 @@ namespace ps2_stubs
                             mpegAddr,
                             kMpegStrPCM,
                             playback.pssGuestAddrs[payloadStart],
+                            buffer.data() + payloadStart,
                             static_cast<uint32_t>(packetEnd - payloadStart),
                             callbackEvents,
                             pes.pts90k,
@@ -1361,6 +1400,7 @@ namespace ps2_stubs
                             mpegAddr,
                             kMpegStrADPCM,
                             playback.pssGuestAddrs[payloadStart],
+                            buffer.data() + payloadStart,
                             static_cast<uint32_t>(packetEnd - payloadStart),
                             callbackEvents,
                             pes.pts90k,
@@ -1414,7 +1454,8 @@ namespace ps2_stubs
             // still propagates naturally to sceCdStRead because the ring does not
             // advance while this is true.
             return !g_mpeg_stub_state.currentCdStreamEofSeen &&
-                   playback.decodedFrames.size() >= kMaxDecodedPicturesAhead;
+                   (playback.decodedFrames.size() >= kMaxDecodedPicturesAhead ||
+                    g_mpeg_audio_queue.packets.size() >= kMaxQueuedAudioPackets);
         }
 
         void recordCdStreamBytesDemuxedUnlocked(
@@ -1624,6 +1665,81 @@ namespace ps2_stubs
             runtime->eeScheduler().queueInvocation(std::move(invocation));
         }
 
+        void pumpMpegAudio(uint8_t *rdram, const R5900Context &base, PS2Runtime *runtime)
+        {
+            std::lock_guard<std::mutex> lock(g_mpeg_stub_mutex);
+            MpegAudioQueue &queue = g_mpeg_audio_queue;
+            while (!queue.inFlight && !queue.packets.empty())
+            {
+                const MpegAudioPacket &packet = queue.packets.front();
+                const uint32_t size = static_cast<uint32_t>(packet.event.payload.size());
+                if (queue.bufferSize < size)
+                {
+                    if (queue.buffer != 0u)
+                    {
+                        runtime->guestFree(queue.buffer);
+                    }
+                    queue.bufferSize = std::max<uint32_t>(size, 0x2000u);
+                    queue.buffer = runtime->guestMalloc(queue.bufferSize, 64u);
+                    if (queue.buffer == 0u)
+                    {
+                        queue.bufferSize = 0u;
+                    }
+                }
+                if (queue.callbackData == 0u)
+                {
+                    queue.callbackData = runtime->guestMalloc(kMpegCallbackDataSize, 16u);
+                }
+                uint8_t *payload = queue.buffer != 0u ? getMemPtr(rdram, queue.buffer) : nullptr;
+                if (!payload || queue.callbackData == 0u ||
+                    !writeMpegCallbackData(rdram, queue.callbackData, packet.event) ||
+                    !runtime->hasFunction(packet.callback.func))
+                {
+                    std::cerr << "[MPEG] dropped an audio packet: no guest memory for it" << std::endl;
+                    queue.packets.pop_front();
+                    continue;
+                }
+                std::memcpy(payload, packet.event.payload.data(), size);
+                *reinterpret_cast<uint32_t *>(getMemPtr(rdram, queue.callbackData) + 0x08u) = queue.buffer;
+
+                R5900Context callbackCtx = base;
+                SET_GPR_U32(&callbackCtx, 4, packet.event.mpegAddr);
+                SET_GPR_U32(&callbackCtx, 5, queue.callbackData);
+                SET_GPR_U32(&callbackCtx, 6, packet.callback.data);
+                SET_GPR_U32(&callbackCtx, 7, 0u);
+                SET_GPR_U32(&callbackCtx, 29, 0u);
+                SET_GPR_U32(&callbackCtx, 31, 0u);
+                callbackCtx.pc = packet.callback.func;
+
+                GuestInvocation invocation{};
+                invocation.kind = GuestInvocationKind::RpcCallback;
+                invocation.context = callbackCtx;
+                invocation.onComplete = [rdram, runtime, generation = queue.generation](const R5900Context &done, R5900Context &)
+                {
+                    bool accepted = false;
+                    {
+                        std::lock_guard<std::mutex> doneLock(g_mpeg_stub_mutex);
+                        if (generation != g_mpeg_audio_queue.generation)
+                        {
+                            return;
+                        }
+                        g_mpeg_audio_queue.inFlight = false;
+                        accepted = getRegU32(&done, 2) != 0u;
+                        if (accepted)
+                        {
+                            g_mpeg_audio_queue.packets.pop_front();
+                        }
+                    }
+                    if (accepted)
+                    {
+                        pumpMpegAudio(rdram, done, runtime);
+                    }
+                };
+                queue.inFlight = true;
+                runtime->eeScheduler().queueInvocation(std::move(invocation));
+            }
+        }
+
         void dispatchStreamCallbacks(uint8_t *rdram,
                                      R5900Context *ctx,
                                      PS2Runtime *runtime,
@@ -1638,8 +1754,20 @@ namespace ps2_stubs
             {
                 for (const MpegRegisteredCallback &callback : event.callbacks)
                 {
-                    dispatchGuestStreamCallback(rdram, ctx, runtime, event, callback);
+                    if (event.streamType == kMpegStrM2V)
+                    {
+                        dispatchGuestStreamCallback(rdram, ctx, runtime, event, callback);
+                    }
+                    else
+                    {
+                        std::lock_guard<std::mutex> lock(g_mpeg_stub_mutex);
+                        g_mpeg_audio_queue.packets.push_back(MpegAudioPacket{event, callback});
+                    }
                 }
+            }
+            if (rdram && ctx && runtime)
+            {
+                pumpMpegAudio(rdram, *ctx, runtime);
             }
         }
 
@@ -1762,6 +1890,7 @@ namespace ps2_stubs
             g_mpeg_stub_state.pictureTraceCount = 0u;
             g_mpeg_stub_state.isEndTraceCount = 0u;
             g_mpeg_stub_state.callbacksByMpeg.clear();
+            clearMpegAudioQueueUnlocked();
             g_mpeg_stub_state.playbackByMpeg.clear();
         }
     }
@@ -1770,6 +1899,9 @@ namespace ps2_stubs
     {
         std::lock_guard<std::mutex> lock(g_mpeg_stub_mutex);
         resetMpegStubStateUnlocked();
+        g_mpeg_audio_queue.buffer = 0u; // the guest heap this came from is being reset too
+        g_mpeg_audio_queue.bufferSize = 0u;
+        g_mpeg_audio_queue.callbackData = 0u;
     }
 
     void enqueueMpegDecodedFrameForTesting(uint32_t mpegAddr)
@@ -2074,6 +2206,7 @@ namespace ps2_stubs
         {
             std::lock_guard<std::mutex> lock(g_mpeg_stub_mutex);
             g_mpeg_stub_state.callbacksByMpeg.erase(mpegAddr);
+            clearMpegAudioQueueUnlocked();
             g_mpeg_stub_state.playbackByMpeg.erase(mpegAddr);
         }
         runtime->eeScheduler().completeExternalWait(kMpegPictureWaitType, mpegAddr, KE_WAIT_DELETE);
@@ -2085,6 +2218,8 @@ namespace ps2_stubs
         const uint32_t mpegAddr = getRegU32(ctx, 4);
         const uint32_t dataAddr = getRegU32(ctx, 5);
         const uint32_t byteCount = getRegU32(ctx, 6);
+
+        pumpMpegAudio(rdram, *ctx, runtime);
 
         std::vector<MpegStreamCallbackEvent> callbackEvents;
         std::vector<uint32_t> completedMpegIds;
@@ -2151,6 +2286,7 @@ namespace ps2_stubs
 
     void sceMpegDemuxPssRing(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
     {
+        pumpMpegAudio(rdram, *ctx, runtime);
         static std::atomic<uint32_t> s_demuxRingEntryCount{0u};
         const uint32_t entryIdx = s_demuxRingEntryCount.fetch_add(1u, std::memory_order_relaxed);
         if (entryIdx < 4u)
@@ -2211,13 +2347,14 @@ namespace ps2_stubs
             }
             setReturnS32(ctx, 0);
             // Games call demux in a tight loop until it consumes data. The queue only drains as
-            // pictures become presentable, which needs EE vsync time to pass, and a spinning guest
-            // barely advances it. Yield until the next vsync, then report nothing consumed.
+            // pictures become presentable, which needs EE time to pass, and a spinning guest barely
+            // advances it. Yield, then report nothing consumed, but only for a moment of guest time:
+            // Drakengard's movie loop runs this against a timer, and sleeping until the next vsync
+            // makes it miss its picture slot, so the movie plays at half speed.
             if (runtime != nullptr)
             {
-                runtime->eeScheduler().waitVSync(
-                    runtime->eeScheduler().currentVSyncTick(),
-                    -1,
+                runtime->eeScheduler().waitBriefly(
+                    100u,
                     [](R5900Context &resumeContext)
                     {
                         if (static_cast<int32_t>(getRegU32(&resumeContext, 2)) < 0)
@@ -2484,7 +2621,7 @@ namespace ps2_stubs
 
     void sceMpegIsEnd(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
     {
-        (void)rdram;
+        pumpMpegAudio(rdram, *ctx, runtime);
         const uint32_t mpegAddr = getRegU32(ctx, 4);
 
         std::lock_guard<std::mutex> lock(g_mpeg_stub_mutex);

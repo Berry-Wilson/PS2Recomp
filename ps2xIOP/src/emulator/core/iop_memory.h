@@ -1,5 +1,7 @@
 #pragma once
 
+#include "iop_spu2.h"
+
 #include <cstddef>
 #include <cstdint>
 #include <optional>
@@ -68,7 +70,14 @@ namespace ps2x::iop::detail
         void setInterruptControl(uint32_t value) noexcept { m_interruptControl = value & 1u; }
 
         [[nodiscard]] std::optional<DmaStart> takeDmaStart() noexcept;
+
+        // Publishes AutoDMA progress to the DMA registers, and returns the interrupts of any
+        // transfers that finished (bit 0 for core 0, bit 1 for core 1).
+        [[nodiscard]] uint32_t syncSpu2AutoDma();
+        static constexpr int kDmaSpu0Irq = 0x24;
+        static constexpr int kDmaSpu1Irq = 0x28;
         [[nodiscard]] std::span<const uint8_t> ram() const noexcept { return m_ram; }
+        [[nodiscard]] IopSpu2 &spu2() noexcept { return m_spu2; }
 
         [[nodiscard]] static uint32_t physicalAddress(uint32_t address) noexcept;
 
@@ -76,6 +85,7 @@ namespace ps2x::iop::detail
         [[nodiscard]] uint32_t readHardware32(uint32_t address) const;
         void writeHardware32(uint32_t address, uint32_t value);
         void markOwned(uint32_t address, size_t size);
+        [[nodiscard]] static bool isSpu2Address(uint32_t phys) noexcept { return phys >= Spu2Base && phys < Spu2End; }
 
         std::vector<uint8_t> m_ram;
         std::vector<uint8_t> m_owned;
@@ -87,5 +97,6 @@ namespace ps2x::iop::detail
         uint32_t m_interruptMask = 0;
         uint32_t m_interruptControl = 1;
         std::optional<DmaStart> m_dmaStart;
+        mutable IopSpu2 m_spu2; // reading its data port moves the transfer address
     };
 }

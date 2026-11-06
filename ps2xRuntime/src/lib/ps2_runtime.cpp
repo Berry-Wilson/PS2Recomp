@@ -1167,8 +1167,8 @@ PS2Runtime::~PS2Runtime()
 #else
         if (IsAudioDeviceReady())
         {
-            CloseAudioDevice();
             m_audioBackend.setAudioReady(false);
+            CloseAudioDevice();
         }
 #endif
         if (m_debugUiInitialized && m_debugUiShutdownCallback)
@@ -3524,6 +3524,8 @@ void PS2Runtime::run()
     UnloadTexture(frameTex);
     CloseWindow();
 #endif
+
+    m_audioBackend.setAudioReady(false); // main leaves through _Exit, so ~PS2Runtime may not run
 
     RUNTIME_LOG("[run] exiting loop");
 }

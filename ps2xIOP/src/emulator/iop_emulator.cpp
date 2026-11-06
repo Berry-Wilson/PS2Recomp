@@ -110,6 +110,8 @@ namespace ps2x::iop::detail
               imports(memory),
               loadcore(memory, imports)
         {
+            memory.spu2().setSink([this](const int16_t *stereo, size_t frames)
+                                  { host.audioOutput(stereo, frames); });
             reset();
         }
 
@@ -129,6 +131,7 @@ namespace ps2x::iop::detail
             nextModuleId = 1;
             moduleCursor = kModuleLoadBase;
             totalCycles = 0;
+            spuCycle = 0;
             totalInstructions = 0;
             eeCycleCarry = 0;
             idleEpoch = ~0ull;
@@ -173,6 +176,31 @@ namespace ps2x::iop::detail
         {
             memory.write32(address, value);
             schedulePendingDma();
+        }
+
+        void advanceSpu()
+        {
+            if (totalCycles - spuCycle < IopSpu2::kCyclesPerSample)
+                return;
+            IopSpu2 &spu = memory.spu2();
+            while (totalCycles - spuCycle >= IopSpu2::kCyclesPerSample)
+            {
+                spu.tick();
+                spuCycle += IopSpu2::kCyclesPerSample;
+            }
+            if (spu.takeInterrupt())
+            {
+                pendingDmaInterrupts[kSpuInterrupt] = totalCycles;
+                idleEpoch = ~0ull;
+            }
+            if (const uint32_t finished = memory.syncSpu2AutoDma())
+            {
+                if (finished & 1u)
+                    pendingDmaInterrupts[IopMemory::kDmaSpu0Irq] = totalCycles;
+                if (finished & 2u)
+                    pendingDmaInterrupts[IopMemory::kDmaSpu1Irq] = totalCycles;
+                idleEpoch = ~0ull;
+            }
         }
 
         void schedulePendingDma()
@@ -562,10 +590,12 @@ namespace ps2x::iop::detail
                 if (idleEpoch == stateEpoch && target < idleUntil)
                 {
                     totalCycles = target;
+                    advanceSpu();
                     return;
                 }
                 while (totalCycles < target)
                 {
+                    advanceSpu();
                     servicePendingDmaInterrupts();
                     servicePendingGuestCallbacks();
                     timrman.serviceDue(totalCycles, *this);
@@ -589,6 +619,7 @@ namespace ps2x::iop::detail
                     if (totalCycles == before)
                         ++totalCycles;
                 }
+                advanceSpu();
             }
             catch (...)
             {
@@ -703,6 +734,8 @@ namespace ps2x::iop::detail
         IopImportRegistry imports;
         IopLoadcore loadcore;
         std::map<int, Module> modules;
+        static constexpr int kSpuInterrupt = 9;
+        uint64_t spuCycle = 0;
         std::map<int, uint64_t> pendingDmaInterrupts;
         std::multimap<uint64_t, ScheduledGuestCallback> pendingGuestCallbacks;
         uint32_t nextModuleId = 1;

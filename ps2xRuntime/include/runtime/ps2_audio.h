@@ -1,6 +1,7 @@
 #ifndef PS2_AUDIO_H
 #define PS2_AUDIO_H
 
+#include <cstddef>
 #include <cstdint>
 #include <memory>
 #include <mutex>
@@ -23,7 +24,10 @@ public:
               uint32_t voiceIndex = 0xFFFFFFFFu);
     void stop(uint32_t voiceId);
     void stopAll();
-    void setAudioReady(bool ready) { m_audioReady = ready; }
+    void setAudioReady(bool ready);
+
+    // The sound chip's output, interleaved stereo at 48 kHz.
+    void pushOutput(const int16_t *stereo, size_t frames);
 
 private:
     struct DecodedSample

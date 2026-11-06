@@ -96,6 +96,13 @@ namespace ps2x::iop
 
         virtual void audioCommand(uint32_t sid, uint32_t function, GuestBuffer send, GuestBuffer receive) = 0;
 
+        // Sound chip output: interleaved stereo at 48 kHz, on the thread running the IOP.
+        virtual void audioOutput(const int16_t *stereo, size_t frames)
+        {
+            (void)stereo;
+            (void)frames;
+        }
+
         virtual std::string hostPath(HostPathKind kind) const = 0;
         virtual std::string translateGuestPath(std::string_view path) const = 0;
         virtual uint64_t openHostFile(std::string_view path) = 0;
