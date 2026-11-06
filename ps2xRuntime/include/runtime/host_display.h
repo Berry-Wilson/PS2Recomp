@@ -21,6 +21,9 @@ public:
     static bool create(const char *title, int width, int height);
     static HostDisplay *get();
     static void destroy(); // only after everything using device() is gone
+    // The width / height to show the image at, from PS2X_ASPECT (only "16:9" so far). 0 keeps the
+    // image's own shape.
+    static float outputAspect();
 
     // Granite's device is single threaded here: hold deviceMutex() around any use of device().
     Vulkan::Device &device();

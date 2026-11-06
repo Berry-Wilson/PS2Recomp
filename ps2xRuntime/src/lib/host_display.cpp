@@ -14,6 +14,9 @@
 #include "imgui_impl_vulkan.h"
 
 #include <algorithm>
+#include <cmath>
+#include <cstdlib>
+#include <cstring>
 #include <iostream>
 #include <vector>
 
@@ -262,9 +265,11 @@ void HostDisplay::Impl::present()
     if (frame)
     {
         // Aspect-preserving fit, centred; the clear above is the letterbox. Nearest filtering,
-        // the same as the OpenGL texture this replaces.
-        const float srcWidth = static_cast<float>(frame->get_width());
+        // the same as the OpenGL texture this replaces, except that it would make a stretched
+        // image's pixels uneven.
+        const float outputAspect = HostDisplay::outputAspect();
         const float srcHeight = static_cast<float>(frame->get_height());
+        const float srcWidth = outputAspect > 0.0f ? srcHeight * outputAspect : static_cast<float>(frame->get_width());
         const float dstWidth = static_cast<float>(target.get_width());
         const float dstHeight = static_cast<float>(target.get_height());
         const float scale = std::min(dstWidth / srcWidth, dstHeight / srcHeight);
@@ -278,7 +283,7 @@ void HostDisplay::Impl::present()
         cmd->blit_image(target, *frame,
                         {x, y, 0}, {w, h, 1},
                         {0, 0, 0}, {static_cast<int32_t>(frame->get_width()), static_cast<int32_t>(frame->get_height()), 1},
-                        0, 0, 0, 0, 1, VK_FILTER_NEAREST);
+                        0, 0, 0, 0, 1, outputAspect > 0.0f ? VK_FILTER_LINEAR : VK_FILTER_NEAREST);
     }
 
     // The render pass below loads from the swapchain's own layout and returns the image to it.
@@ -340,8 +345,20 @@ HostDisplay::~HostDisplay()
 #endif
 }
 
+float HostDisplay::outputAspect()
+{
+    static const float aspect = []()
+    {
+        const char *value = std::getenv("PS2X_ASPECT");
+        return value && std::strcmp(value, "16:9") == 0 ? 16.0f / 9.0f : 0.0f;
+    }();
+    return aspect;
+}
+
 bool HostDisplay::create(const char *title, int width, int height)
 {
+    if (outputAspect() > 0.0f)
+        width = static_cast<int>(std::lround(height * outputAspect()));
     if (s_display)
         return true;
     std::unique_ptr<HostDisplay> display(new HostDisplay());

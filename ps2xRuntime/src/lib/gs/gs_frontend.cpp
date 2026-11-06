@@ -1,5 +1,6 @@
 #include "runtime/gs/gs_frontend.h"
 #include "runtime/gs/gs_cpu_backend.h"
+#include "runtime/gs/gif_rewriter.h"
 #include "ps2_log.h"
 #include "runtime/ps2_memory.h"
 #include <atomic>
@@ -12,6 +13,11 @@
 #include <cstring>
 #include <iostream>
 #include <sstream>
+
+namespace
+{
+    std::atomic<GifRewriter *> g_gifRewriter{nullptr};
+}
 
 namespace
 {
@@ -550,6 +556,8 @@ void GS::latchHostPresentationFrame()
         {
             m_backend->Flush();
             m_backend->Sync(GSSyncReason::Presentation);
+            if (GifRewriter *rewriter = g_gifRewriter.load(std::memory_order_acquire))
+                rewriter->endFrame();
             frame = m_backend->Present(request);
         }
     }
@@ -801,6 +809,11 @@ namespace
     };
 }
 
+void ps2xSetGifRewriter(GifRewriter *rewriter)
+{
+    g_gifRewriter.store(rewriter, std::memory_order_release);
+}
+
 void ps2xSetGifCaptureRam(const uint8_t *ram, uint32_t size)
 {
     g_captureRam = ram;
@@ -842,6 +855,15 @@ void GS::processGIFPacket(const uint8_t *data, uint32_t sizeBytes, uint32_t path
 
     if (GifCapture *capture = GifCapture::instance())
         capture->record(data, sizeBytes, path, m_privRegs ? m_privRegs->vsyncTick.load(std::memory_order_acquire) : 0u);
+
+    GifRewriter *rewriter = g_gifRewriter.load(std::memory_order_acquire);
+    if (rewriter && rewriter->wantsPacket(path))
+    {
+        thread_local std::vector<uint8_t> rewritten;
+        rewritten.assign(data, data + sizeBytes);
+        rewriter->rewrite(path, rewritten.data(), sizeBytes);
+        data = rewritten.data();
+    }
 
     if (m_backend->HandlesRawGif())
     {
