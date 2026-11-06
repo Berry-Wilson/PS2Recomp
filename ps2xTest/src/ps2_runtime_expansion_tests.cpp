@@ -19,6 +19,7 @@
 
 #include <atomic>
 #include <cstdint>
+#include <algorithm>
 #include <cstring>
 #include <exception>
 #include <string>
@@ -652,6 +653,8 @@ void register_ps2_runtime_expansion_tests()
             setRegU32(audioDemuxCtx, 7, kAudioPacketAddr);
             setRegU32(audioDemuxCtx, 8, audioPacketSize);
             ps2_stubs::sceMpegDemuxPssRing(rdram.data(), &audioDemuxCtx, &runtime);
+            // The callback runs later, by when the ring may have moved on, so it must not depend on the packet.
+            std::memset(rdram.data() + kAudioPacketAddr, 0, audioPacketSize);
             runtime.eeScheduler().run();
 
             t.Equals(getRegS32(audioDemuxCtx, 2), static_cast<int32_t>(audioPacketSize),
@@ -660,8 +663,10 @@ void register_ps2_runtime_expansion_tests()
                      "registered audio stream callback should be invoked");
             t.Equals(gMpegStreamCallbackType.load(std::memory_order_acquire), 2u,
                      "audio callback data should report PCM stream type");
-            t.Equals(gMpegStreamCallbackDataAddr.load(std::memory_order_acquire), kAudioPacketAddr + 9u,
-                     "audio callback data should point at PES payload");
+            const uint32_t audioDataAddr = gMpegStreamCallbackDataAddr.load(std::memory_order_acquire);
+            t.IsTrue(audioDataAddr + audioPayload.size() <= rdram.size() &&
+                         std::equal(audioPayload.begin(), audioPayload.end(), rdram.data() + audioDataAddr),
+                     "audio callback data should hold a copy of the PES payload");
             t.Equals(gMpegStreamCallbackLen.load(std::memory_order_acquire),
                      static_cast<uint32_t>(audioPayload.size()),
                      "audio callback data should report PES payload length");
