@@ -69,6 +69,7 @@ struct GSParallelBackend::Impl
     static constexpr size_t kMaxPendingBytes = 32u * 1024u * 1024u;
 
     bool init();
+    bool highResolutionScanout = false;
     void enqueue(Cmd cmd, const uint8_t *data = nullptr, size_t bytes = 0);
     void drain();
     void workerLoop();
@@ -76,6 +77,15 @@ struct GSParallelBackend::Impl
     void stop();
     PresentationFrame present(const GSPresentationRequest &request);
 };
+
+namespace
+{
+    bool envEnabled(const char *name)
+    {
+        const char *value = std::getenv(name);
+        return value && value[0] && value[0] != '0';
+    }
+}
 
 bool GSParallelBackend::Impl::init()
 {
@@ -87,6 +97,26 @@ bool GSParallelBackend::Impl::init()
     ParallelGS::GSOptions opts = {};
     opts.vram_size = 4 * 1024 * 1024;
     opts.super_sampling = ParallelGS::SuperSampling::X1;
+    if (const char *ssaa = std::getenv("PS2X_SSAA"); ssaa && ssaa[0])
+    {
+        const int rate = std::atoi(ssaa);
+        if (rate == 1 || rate == 2 || rate == 4 || rate == 8 || rate == 16)
+            opts.super_sampling = static_cast<ParallelGS::SuperSampling>(rate);
+        else
+            std::cerr << "[GSParallelBackend] ignoring PS2X_SSAA=" << ssaa << ", it must be 1, 2, 4, 8 or 16" << std::endl;
+    }
+    opts.super_sampled_textures = envEnabled("PS2X_SSAA_TEXTURES");
+    highResolutionScanout = envEnabled("PS2X_HIRES_SCANOUT");
+
+    const int samples = static_cast<int>(opts.super_sampling);
+    if (samples > 1 || opts.super_sampled_textures || highResolutionScanout)
+        std::cerr << "[GSParallelBackend] super-sampling " << samples << "x, textures " << opts.super_sampled_textures
+                  << ", double-resolution output " << highResolutionScanout << std::endl;
+    // parallel-gs needs 4x for this. Games that blit their frame to the scanout buffer also need the
+    // textures to keep their samples, or the full-height image is lost.
+    if (highResolutionScanout && (samples < 4 || !opts.super_sampled_textures))
+        std::cerr << "[GSParallelBackend] PS2X_HIRES_SCANOUT needs PS2X_SSAA=4 or more and PS2X_SSAA_TEXTURES=1, "
+                  << "or the picture may be wrong" << std::endl;
 
     if (!iface.init(&device, opts))
     {
@@ -302,6 +332,7 @@ PresentationFrame GSParallelBackend::Impl::present(const GSPresentationRequest &
     vsync.overscan = false;
     vsync.crtc_offsets = false;
     vsync.raw_circuit_scanout = false;
+    vsync.high_resolution_scanout = highResolutionScanout;
 
     iface.flush();
     auto scanout = iface.vsync(vsync);
@@ -320,8 +351,10 @@ PresentationFrame GSParallelBackend::Impl::present(const GSPresentationRequest &
                 pictureHeight = std::max(pictureHeight, (priv.display1.DH + 1u) / (priv.display1.MAGV + 1u));
             if (priv.pmode.EN2)
                 pictureHeight = std::max(pictureHeight, (priv.display2.DH + 1u) / (priv.display2.MAGV + 1u));
-            if (pictureHeight * 2u <= height)
+            const uint32_t outputScale = scanout.high_resolution_scanout ? 2u : 1u;
+            if (pictureHeight * 2u <= height / outputScale)
                 pictureHeight *= 2u;
+            pictureHeight *= outputScale;
             if (pictureHeight == 0u || pictureHeight > height)
                 pictureHeight = height;
             static uint32_t s_loggedPicture = 0u;
