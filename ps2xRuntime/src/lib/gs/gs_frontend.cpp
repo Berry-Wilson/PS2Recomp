@@ -621,7 +621,9 @@ bool GS::copyLatchedHostPresentationFrame(std::vector<uint8_t> &outPixels,
     outPixels.resize(packedRowBytes * static_cast<size_t>(outHeight));
     if (outWidth != 0u && outHeight != 0u)
     {
-        const size_t sourceRowBytes = static_cast<size_t>(kHostFrameWidth) * 4u;
+        // The CPU backend's rows are always kHostFrameWidth wide. The Vulkan backend's are tightly packed.
+        const bool sourcePacked = m_hostPresentationFrame.size() == packedRowBytes * static_cast<size_t>(outHeight);
+        const size_t sourceRowBytes = sourcePacked ? packedRowBytes : static_cast<size_t>(kHostFrameWidth) * 4u;
         for (uint32_t y = 0; y < outHeight; ++y)
         {
             const size_t srcOffset = static_cast<size_t>(y) * sourceRowBytes;
