@@ -313,7 +313,28 @@ PresentationFrame GSParallelBackend::Impl::present(const GSPresentationRequest &
 
         if (width > 0 && height > 0)
         {
-            HostDisplay::get()->setScanout(scanout.image.get());
+            // The video mode can be taller than what the game scans out (448 rows in a 480-row image
+            // here). DISPLAY holds the game's own height; a field-rendered height covers two rows.
+            uint32_t pictureHeight = 0u;
+            if (priv.pmode.EN1)
+                pictureHeight = std::max(pictureHeight, (priv.display1.DH + 1u) / (priv.display1.MAGV + 1u));
+            if (priv.pmode.EN2)
+                pictureHeight = std::max(pictureHeight, (priv.display2.DH + 1u) / (priv.display2.MAGV + 1u));
+            if (pictureHeight * 2u <= height)
+                pictureHeight *= 2u;
+            if (pictureHeight == 0u || pictureHeight > height)
+                pictureHeight = height;
+            static uint32_t s_loggedPicture = 0u;
+            static uint32_t s_loggedHeight = 0u;
+            if (pictureHeight != s_loggedPicture || height != s_loggedHeight)
+            {
+                s_loggedPicture = pictureHeight;
+                s_loggedHeight = height;
+                std::cerr << "[GSParallelBackend] picture is " << pictureHeight << " rows of a " << width << "x" << height
+                          << " scanout, DH1=" << priv.display1.DH << " DH2=" << priv.display2.DH << " EN=" << priv.pmode.EN1
+                          << priv.pmode.EN2 << std::endl;
+            }
+            HostDisplay::get()->setScanout(scanout.image.get(), pictureHeight);
             result.width = width;
             result.height = height;
             result.presentedToDisplay = true;

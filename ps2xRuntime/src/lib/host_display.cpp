@@ -88,6 +88,7 @@ struct HostDisplay::Impl
     Vulkan::WSI wsi;
     std::mutex deviceMutex;
     Vulkan::ImageHandle frame;
+    uint32_t framePictureHeight = 0;
     VkRenderPass uiRenderPass = VK_NULL_HANDLE;
     bool uiReady = false;
     bool hasScanout = false;
@@ -273,8 +274,8 @@ void HostDisplay::Impl::present()
         const float dstWidth = static_cast<float>(target.get_width());
         const float dstHeight = static_cast<float>(target.get_height());
         const float scale = std::min(dstWidth / srcWidth, dstHeight / srcHeight);
-        const int32_t w = std::max(1, static_cast<int32_t>(srcWidth * scale));
-        const int32_t h = std::max(1, static_cast<int32_t>(srcHeight * scale));
+        const int32_t w = std::max(1, static_cast<int32_t>(std::lround(srcWidth * scale)));
+        const int32_t h = std::max(1, static_cast<int32_t>(std::lround(srcHeight * scale)));
         const int32_t x = (static_cast<int32_t>(target.get_width()) - w) / 2;
         const int32_t y = (static_cast<int32_t>(target.get_height()) - h) / 2;
 
@@ -282,7 +283,7 @@ void HostDisplay::Impl::present()
                      VK_PIPELINE_STAGE_2_ALL_TRANSFER_BIT, VK_ACCESS_2_TRANSFER_WRITE_BIT);
         cmd->blit_image(target, *frame,
                         {x, y, 0}, {w, h, 1},
-                        {0, 0, 0}, {static_cast<int32_t>(frame->get_width()), static_cast<int32_t>(frame->get_height()), 1},
+                        {0, 0, 0}, {static_cast<int32_t>(frame->get_width()), static_cast<int32_t>(framePictureHeight), 1},
                         0, 0, 0, 0, 1, outputAspect > 0.0f ? VK_FILTER_LINEAR : VK_FILTER_NEAREST);
     }
 
@@ -404,11 +405,12 @@ void HostDisplay::hide()
     glfwHideWindow(m_impl->window);
 }
 
-void HostDisplay::setScanout(Vulkan::Image *image)
+void HostDisplay::setScanout(Vulkan::Image *image, uint32_t pictureHeight)
 {
     if (image)
         image->add_reference(); // the handle below takes over one reference
     m_impl->frame = Vulkan::ImageHandle(image);
+    m_impl->framePictureHeight = image ? std::clamp<uint32_t>(pictureHeight, 1u, image->get_height()) : 0u;
     m_impl->hasScanout = image != nullptr;
 }
 
@@ -433,6 +435,7 @@ void HostDisplay::setCpuFrame(const uint8_t *rgba, uint32_t width, uint32_t heig
     Vulkan::ImageInitialData initial{};
     initial.data = rgba;
     m_impl->frame = device().create_image(info, &initial);
+    m_impl->framePictureHeight = height;
 }
 
 void HostDisplay::beginUi()

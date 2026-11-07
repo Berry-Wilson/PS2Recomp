@@ -34,7 +34,9 @@ public:
     void hide();
 
     // The image to show from now on, in TRANSFER_SRC_OPTIMAL. Call with deviceMutex() held.
-    void setScanout(Vulkan::Image *image);
+    // Only its top pictureHeight rows hold picture; those are stretched over its full height, as a
+    // game that scans out fewer lines than the video mode has still fills the screen's shape.
+    void setScanout(Vulkan::Image *image, uint32_t pictureHeight);
     bool hasScanout() const;
     // Runs with deviceMutex() held before each frame. Acquiring a swapchain image waits for every
     // open command buffer on the device, so a renderer that keeps one open between calls must
