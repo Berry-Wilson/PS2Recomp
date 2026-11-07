@@ -15,6 +15,7 @@
 
 #include <algorithm>
 #include <cmath>
+#include <cstdio>
 #include <cstdlib>
 #include <cstring>
 #include <iostream>
@@ -360,6 +361,20 @@ bool HostDisplay::create(const char *title, int width, int height)
 {
     if (outputAspect() > 0.0f)
         width = static_cast<int>(std::lround(height * outputAspect()));
+    if (const char *size = std::getenv("PS2X_WINDOW_SIZE"); size && size[0])
+    {
+        int w = 0, h = 0;
+        char extra = 0;
+        if (std::sscanf(size, "%dx%d%c", &w, &h, &extra) == 2 && w > 0 && h > 0)
+        {
+            width = w;
+            height = h;
+        }
+        else
+        {
+            std::cerr << "[HostDisplay] ignoring PS2X_WINDOW_SIZE=" << size << ", it must look like 1280x896" << std::endl;
+        }
+    }
     if (s_display)
         return true;
     std::unique_ptr<HostDisplay> display(new HostDisplay());
