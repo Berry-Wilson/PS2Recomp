@@ -13,6 +13,9 @@
 #include <cstring>
 #include <algorithm>
 #include <thread>
+#include <atomic>
+
+extern std::atomic<bool> g_ps2xScreenshotRequested; // ps2_runtime.cpp: F12 wants the next frame's pixels
 
 struct GSParallelBackend::Impl
 {
@@ -374,7 +377,7 @@ PresentationFrame GSParallelBackend::Impl::present(const GSPresentationRequest &
         }
 
         static const bool s_wantPixels = std::getenv("PS2X_DUMP_FRAMES_DIR") != nullptr;
-        if (s_wantPixels && width > 0 && height > 0)
+        if ((s_wantPixels || g_ps2xScreenshotRequested.load(std::memory_order_acquire)) && width > 0 && height > 0)
         {
             auto cmd = device.request_command_buffer();
             const VkDeviceSize bytes = static_cast<VkDeviceSize>(width) * height * sizeof(uint32_t);

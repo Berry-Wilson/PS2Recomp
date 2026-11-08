@@ -38,6 +38,9 @@
 #include <thread>
 #include <unordered_map>
 #include <sstream>
+#include <filesystem>
+#include <string>
+#include <system_error>
 
 namespace ps2_stubs
 {
@@ -909,8 +912,76 @@ using HostFrameTarget = HostDisplay;
 using HostFrameTarget = Texture2D;
 #endif
 
+// Set by F12 on the main thread. The parallel-gs backend reads the next scanout back to the CPU
+// while it is set, and UploadFrame saves that frame and clears it.
+std::atomic<bool> g_ps2xScreenshotRequested{false};
+
+// Writes tightly packed RGBA rows as a 24-bit bottom-up BMP.
+static bool WriteFrameBmp(const char *path, const uint8_t *rgba, uint32_t width, uint32_t height)
+{
+    std::FILE *f = std::fopen(path, "wb");
+    if (!f)
+        return false;
+    const uint32_t rowBytes = (width * 3u + 3u) & ~3u;
+    const uint32_t imgBytes = rowBytes * height;
+    uint8_t hdr[54] = {'B', 'M'};
+    auto put32 = [&hdr](size_t off, uint32_t v)
+    { hdr[off] = v & 0xFF; hdr[off + 1] = (v >> 8) & 0xFF; hdr[off + 2] = (v >> 16) & 0xFF; hdr[off + 3] = (v >> 24) & 0xFF; };
+    put32(2, 54u + imgBytes);
+    put32(10, 54u);
+    put32(14, 40u);
+    put32(18, width);
+    put32(22, height);
+    hdr[26] = 1;
+    hdr[28] = 24;
+    put32(34, imgBytes);
+    bool ok = std::fwrite(hdr, 1, sizeof(hdr), f) == sizeof(hdr);
+    std::vector<uint8_t> row(rowBytes, 0u);
+    for (uint32_t y = 0; ok && y < height; ++y)
+    {
+        const uint8_t *src = rgba + static_cast<size_t>(height - 1u - y) * width * 4u;
+        for (uint32_t x = 0; x < width; ++x)
+        {
+            row[x * 3u + 0u] = src[x * 4u + 2u];
+            row[x * 3u + 1u] = src[x * 4u + 1u];
+            row[x * 3u + 2u] = src[x * 4u + 0u];
+        }
+        ok = std::fwrite(row.data(), 1, rowBytes, f) == rowBytes;
+    }
+    return std::fclose(f) == 0 && ok;
+}
+
+// F12: saves the next frame the game shows as screenshots/screenshotNNN.png in the working
+// directory. Like raylib's own F12, numbering restarts at 000 each run, overwriting older shots.
+static void SaveScreenshot(const uint8_t *rgba, uint32_t width, uint32_t height)
+{
+    static int s_counter = 0;
+    std::error_code ec;
+    std::filesystem::create_directories("screenshots", ec);
+    char name[32];
+    std::snprintf(name, sizeof(name), "screenshot%03d.png", s_counter++);
+    const std::filesystem::path path = std::filesystem::path("screenshots") / name;
+    std::vector<uint8_t> opaque(rgba, rgba + static_cast<size_t>(width) * height * 4u);
+    for (size_t i = 3; i < opaque.size(); i += 4)
+        opaque[i] = 0xFF;
+    Image image{};
+    image.data = opaque.data();
+    image.width = static_cast<int>(width);
+    image.height = static_cast<int>(height);
+    image.mipmaps = 1;
+    image.format = PIXELFORMAT_UNCOMPRESSED_R8G8B8A8;
+    if (ExportImage(image, path.string().c_str()))
+        std::cerr << "[ps2xRuntime] saved screenshot " << std::filesystem::absolute(path, ec).string() << " ("
+                  << width << "x" << height << ")" << std::endl;
+    else
+        std::cerr << "[ps2xRuntime] could not write screenshot " << path.string() << std::endl;
+}
+
 static void UploadFrame(HostFrameTarget &tex, PS2Runtime *rt, uint32_t &outWidth, uint32_t &outHeight)
 {
+    if (hostinput::IsKeyPressed(KEY_F12))
+        g_ps2xScreenshotRequested.store(true, std::memory_order_release);
+
     static uint64_t s_lastPresentationTick = std::numeric_limits<uint64_t>::max();
     static bool s_hasLatchedInitialFrame = false;
     static uint32_t s_lastDisplayFbp = std::numeric_limits<uint32_t>::max();
@@ -1039,38 +1110,15 @@ static void UploadFrame(HostFrameTarget &tex, PS2Runtime *rt, uint32_t &outWidth
             char path[1024];
             std::snprintf(path, sizeof(path), "%s/frame_%06llu.bmp", s_dumpDir,
                           static_cast<unsigned long long>(frameIndex));
-            if (std::FILE *f = std::fopen(path, "wb"))
-            {
-                const uint32_t rowBytes = (width * 3u + 3u) & ~3u;
-                const uint32_t imgBytes = rowBytes * height;
-                uint8_t hdr[54] = {'B', 'M'};
-                auto put32 = [&hdr](size_t off, uint32_t v)
-                { hdr[off] = v & 0xFF; hdr[off + 1] = (v >> 8) & 0xFF; hdr[off + 2] = (v >> 16) & 0xFF; hdr[off + 3] = (v >> 24) & 0xFF; };
-                put32(2, 54u + imgBytes);
-                put32(10, 54u);
-                put32(14, 40u);
-                put32(18, width);
-                put32(22, height);
-                hdr[26] = 1;
-                hdr[28] = 24;
-                put32(34, imgBytes);
-                std::fwrite(hdr, 1, sizeof(hdr), f);
-                std::vector<uint8_t> row(rowBytes, 0u);
-                for (uint32_t y = 0; y < height; ++y)
-                {
-                    const uint8_t *src = s_scratch.data() + static_cast<size_t>(height - 1u - y) * width * 4u;
-                    for (uint32_t x = 0; x < width; ++x)
-                    {
-                        row[x * 3u + 0u] = src[x * 4u + 2u];
-                        row[x * 3u + 1u] = src[x * 4u + 1u];
-                        row[x * 3u + 2u] = src[x * 4u + 0u];
-                    }
-                    std::fwrite(row.data(), 1, rowBytes, f);
-                }
-                std::fclose(f);
+            if (WriteFrameBmp(path, s_scratch.data(), width, height))
                 --s_dumpLeft;
-            }
         }
+    }
+    if (g_ps2xScreenshotRequested.load(std::memory_order_acquire) && width != 0u && height != 0u &&
+        s_scratch.size() >= static_cast<size_t>(width) * height * 4u)
+    {
+        g_ps2xScreenshotRequested.store(false, std::memory_order_release);
+        SaveScreenshot(s_scratch.data(), width, height);
     }
 #if defined(PS2X_HAS_PARALLEL_GS)
     if (!tex.hasScanout() && !s_scratch.empty() && width != 0u && height != 0u &&
