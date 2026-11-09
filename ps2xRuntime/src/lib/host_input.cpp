@@ -9,7 +9,7 @@
 #include <string>
 
 // Same semantics as raylib's desktop GLFW platform (rcore_desktop_glfw.c), which is what the pad
-// code ran on before: key state from the key callback, Escape requests close, and gamepads polled
+// code ran on before, except that Escape does nothing: key state from the key callback, and gamepads polled
 // through glfwGetGamepadState with L2/R2 reported as buttons once their axis passes 0.1.
 namespace
 {
@@ -31,7 +31,7 @@ namespace
     std::array<std::atomic<bool>, kKeyCount> s_keyPressed{};
     std::array<GamepadState, kMaxGamepads> s_gamepads{};
 
-    void keyCallback(GLFWwindow *window, int key, int, int action, int)
+    void keyCallback(GLFWwindow *, int key, int, int action, int)
     {
         if (key < 0 || key >= kKeyCount)
             return;
@@ -43,8 +43,6 @@ namespace
         {
             s_keyDown[key].store(true, std::memory_order_relaxed);
             s_keyPressed[key].store(true, std::memory_order_relaxed);
-            if (key == KEY_ESCAPE)
-                glfwSetWindowShouldClose(window, GLFW_TRUE);
         }
     }
 

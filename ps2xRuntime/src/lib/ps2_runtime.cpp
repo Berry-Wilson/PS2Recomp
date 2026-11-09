@@ -1529,6 +1529,7 @@ bool PS2Runtime::initialize(const char *title)
 #endif
 #if !defined(PS2X_HAS_PARALLEL_GS)
         SetTargetFPS(60);
+        SetExitKey(KEY_NULL); // raylib closes the window on Escape by default; Escape does nothing here
 #endif
         if (m_debugUiInitCallback)
         {

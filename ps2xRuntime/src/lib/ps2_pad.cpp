@@ -290,7 +290,7 @@ bool PSPadBackend::readState(int port, int /*slot*/, uint8_t *data, size_t size)
 
     if (hostinput::IsKeyDown(KEY_X) || hostinput::IsKeyDown(KEY_SPACE))
         clearBit(PAD_CROSS);
-    if (hostinput::IsKeyDown(KEY_C) || hostinput::IsKeyDown(KEY_ESCAPE))
+    if (hostinput::IsKeyDown(KEY_C))
         clearBit(PAD_CIRCLE);
     if (hostinput::IsKeyDown(KEY_Z) || hostinput::IsKeyDown(KEY_KP_0))
         clearBit(PAD_SQUARE);
