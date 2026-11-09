@@ -129,6 +129,11 @@ bool GSParallelBackend::Impl::init()
 
     ParallelGS::Hacks hacks;
     hacks.backbuffer_promotion = true;
+    // PS2X_PGS_NO_MIPMAPS=1: always sample the full-size texture level. Keeps more texture detail,
+    // mostly useful with super-sampling, but breaks games whose level 0 is not the real texture.
+    hacks.disable_mipmaps = envEnabled("PS2X_PGS_NO_MIPMAPS");
+    if (hacks.disable_mipmaps)
+        std::cerr << "[GSParallelBackend] mipmaps disabled" << std::endl;
     iface.set_hacks(hacks);
 
     HostDisplay::get()->setBeforeFrame([this] { iface.flush(); });
