@@ -16,6 +16,8 @@
 #include <atomic>
 
 extern std::atomic<bool> g_ps2xScreenshotRequested; // ps2_runtime.cpp: F12 wants the next frame's pixels
+extern std::atomic<bool> g_ps2xSsaaCycleRequested;  // ps2_runtime.cpp: F5 wants the next super-sampling rate
+extern std::atomic<int> g_ps2xSsaaRate;             // ps2_runtime.cpp: current rate, shown on screen after F5
 
 struct GSParallelBackend::Impl
 {
@@ -73,6 +75,12 @@ struct GSParallelBackend::Impl
 
     bool init();
     bool highResolutionScanout = false;
+    ParallelGS::SuperSampling superSampling = ParallelGS::SuperSampling::X1;
+    bool orderedSuperSampling = true;
+    bool superSampledTextures = false;
+    bool dynamicSuperSampling = false;
+    ParallelGS::SuperSampling maxSuperSampling = ParallelGS::SuperSampling::X4;
+    void cycleSuperSampling();
     void enqueue(Cmd cmd, const uint8_t *data = nullptr, size_t bytes = 0);
     void drain();
     void workerLoop();
@@ -83,10 +91,12 @@ struct GSParallelBackend::Impl
 
 namespace
 {
-    bool envEnabled(const char *name)
+    bool envEnabled(const char *name, bool fallback = false)
     {
         const char *value = std::getenv(name);
-        return value && value[0] && value[0] != '0';
+        if (!value || !value[0])
+            return fallback;
+        return value[0] != '0';
     }
 }
 
@@ -110,14 +120,39 @@ bool GSParallelBackend::Impl::init()
     }
     opts.super_sampled_textures = envEnabled("PS2X_SSAA_TEXTURES");
     highResolutionScanout = envEnabled("PS2X_HIRES_SCANOUT");
+    // PS2X_SSAA_ORDERED=0 spreads the 4x and 16x samples in a sparse pattern instead of a grid.
+    opts.ordered_super_sampling = envEnabled("PS2X_SSAA_ORDERED", true);
+    // PS2X_SSAA_DYNAMIC=1 reserves memory for the highest rate, so F5 can change it while playing.
+    opts.dynamic_super_sampling = envEnabled("PS2X_SSAA_DYNAMIC");
+
+    // Same test as GSRenderer::get_max_supported_super_sampling(), which GSInterface clamps to.
+    maxSuperSampling = ParallelGS::SuperSampling::X4;
+    if (device.supports_subgroup_size_log2(true, 3, 6))
+        maxSuperSampling = ParallelGS::SuperSampling::X8;
+    if (device.supports_subgroup_size_log2(true, 4, 6))
+        maxSuperSampling = ParallelGS::SuperSampling::X16;
+    if (opts.super_sampling > maxSuperSampling)
+    {
+        std::cerr << "[GSParallelBackend] this GPU supports up to " << static_cast<int>(maxSuperSampling)
+                  << "x super-sampling" << std::endl;
+        opts.super_sampling = maxSuperSampling;
+    }
+    superSampling = opts.super_sampling;
+    orderedSuperSampling = opts.ordered_super_sampling;
+    superSampledTextures = opts.super_sampled_textures;
+    dynamicSuperSampling = opts.dynamic_super_sampling;
+    g_ps2xSsaaRate.store(static_cast<int>(superSampling), std::memory_order_relaxed);
 
     const int samples = static_cast<int>(opts.super_sampling);
-    if (samples > 1 || opts.super_sampled_textures || highResolutionScanout)
+    if (samples > 1 || opts.super_sampled_textures || highResolutionScanout || dynamicSuperSampling)
         std::cerr << "[GSParallelBackend] super-sampling " << samples << "x, textures " << opts.super_sampled_textures
-                  << ", double-resolution output " << highResolutionScanout << std::endl;
+                  << ", double-resolution output " << highResolutionScanout << ", ordered grid "
+                  << orderedSuperSampling << ", changeable with F5 " << dynamicSuperSampling << std::endl;
     // parallel-gs needs 4x for this. Games that blit their frame to the scanout buffer also need the
     // textures to keep their samples, or the full-height image is lost.
-    if (highResolutionScanout && (samples < 4 || !opts.super_sampled_textures))
+    // With F5 the rate can rise to 4x later, and double resolution switches on then.
+    if (highResolutionScanout && (samples < 4 || !opts.super_sampled_textures) &&
+        !(dynamicSuperSampling && opts.super_sampled_textures))
         std::cerr << "[GSParallelBackend] PS2X_HIRES_SCANOUT needs PS2X_SSAA=4 or more and PS2X_SSAA_TEXTURES=1, "
                   << "or the picture may be wrong" << std::endl;
 
@@ -134,6 +169,11 @@ bool GSParallelBackend::Impl::init()
     hacks.disable_mipmaps = envEnabled("PS2X_PGS_NO_MIPMAPS");
     if (hacks.disable_mipmaps)
         std::cerr << "[GSParallelBackend] mipmaps disabled" << std::endl;
+    // PS2X_PGS_BLEND_DEMOTE=1: render passes made of heavily overlapping blends, such as fog layers,
+    // skip super-sampling. Saves GPU time with PS2X_SSAA above 1.
+    hacks.allow_blend_demote = envEnabled("PS2X_PGS_BLEND_DEMOTE");
+    if (hacks.allow_blend_demote)
+        std::cerr << "[GSParallelBackend] blend demotion allowed" << std::endl;
     iface.set_hacks(hacks);
 
     HostDisplay::get()->setBeforeFrame([this] { iface.flush(); });
@@ -230,6 +270,23 @@ void GSParallelBackend::Impl::replay(const Batch &batch)
             break;
         }
     }
+}
+
+// Steps through 1x, 2x, 4x, 8x and 16x, up to what the GPU supports, then back to 1x.
+void GSParallelBackend::Impl::cycleSuperSampling()
+{
+    if (!dynamicSuperSampling)
+    {
+        std::cerr << "[GSParallelBackend] F5 changes super-sampling only with PS2X_SSAA_DYNAMIC=1" << std::endl;
+        return;
+    }
+    int next = static_cast<int>(superSampling) * 2;
+    if (next > static_cast<int>(maxSuperSampling))
+        next = 1;
+    superSampling = static_cast<ParallelGS::SuperSampling>(next);
+    iface.set_super_sampling_rate(superSampling, orderedSuperSampling, superSampledTextures);
+    g_ps2xSsaaRate.store(next, std::memory_order_relaxed);
+    std::cerr << "[GSParallelBackend] super-sampling " << next << "x" << std::endl;
 }
 
 void GSParallelBackend::Impl::stop()
@@ -340,10 +397,16 @@ PresentationFrame GSParallelBackend::Impl::present(const GSPresentationRequest &
     vsync.overscan = false;
     vsync.crtc_offsets = false;
     vsync.raw_circuit_scanout = false;
-    vsync.high_resolution_scanout = highResolutionScanout;
+    // Double resolution needs 4x or more with textures; F5 can drop below that.
+    vsync.high_resolution_scanout = highResolutionScanout && superSampling >= ParallelGS::SuperSampling::X4 &&
+                                    superSampledTextures;
 
     iface.flush();
     auto scanout = iface.vsync(vsync);
+
+    // F5: the next frame is drawn at the new rate.
+    if (g_ps2xSsaaCycleRequested.exchange(false, std::memory_order_acq_rel))
+        cycleSuperSampling();
 
     if (scanout.image)
     {

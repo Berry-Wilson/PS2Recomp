@@ -916,6 +916,11 @@ using HostFrameTarget = Texture2D;
 // while it is set, and UploadFrame saves that frame and clears it.
 std::atomic<bool> g_ps2xScreenshotRequested{false};
 
+// Set by F5 on the main thread; the parallel-gs backend switches to the next super-sampling rate
+// after its next vsync and stores the new rate, which is shown on screen for a moment.
+std::atomic<bool> g_ps2xSsaaCycleRequested{false};
+std::atomic<int> g_ps2xSsaaRate{1};
+
 // Writes tightly packed RGBA rows as a 24-bit bottom-up BMP.
 static bool WriteFrameBmp(const char *path, const uint8_t *rgba, uint32_t width, uint32_t height)
 {
@@ -981,6 +986,8 @@ static void UploadFrame(HostFrameTarget &tex, PS2Runtime *rt, uint32_t &outWidth
 {
     if (hostinput::IsKeyPressed(KEY_F12))
         g_ps2xScreenshotRequested.store(true, std::memory_order_release);
+    if (hostinput::IsKeyPressed(KEY_F5))
+        g_ps2xSsaaCycleRequested.store(true, std::memory_order_release);
 
     static uint64_t s_lastPresentationTick = std::numeric_limits<uint64_t>::max();
     static bool s_hasLatchedInitialFrame = false;
@@ -3490,6 +3497,23 @@ void PS2Runtime::run()
             overlay->AddText(ImGui::GetFont(), 20.0f, ImVec2(9.0f, 9.0f), IM_COL32(0, 0, 0, 255), text);
             overlay->AddText(ImGui::GetFont(), 20.0f, ImVec2(8.0f, 8.0f),
                              s_vsyncsPerSecond >= 59.0 ? IM_COL32(0, 228, 48, 255) : IM_COL32(253, 249, 0, 255), text);
+
+            // After F5 changes the super-sampling rate, show it for two seconds.
+            static int s_shownRate = g_ps2xSsaaRate.load(std::memory_order_relaxed);
+            static double s_rateShownUntil = 0.0;
+            const int rate = g_ps2xSsaaRate.load(std::memory_order_relaxed);
+            if (rate != s_shownRate)
+            {
+                s_shownRate = rate;
+                s_rateShownUntil = now + 2.0;
+            }
+            if (now < s_rateShownUntil)
+            {
+                char ssaa[32];
+                std::snprintf(ssaa, sizeof(ssaa), "Super-sampling: %dx", rate);
+                overlay->AddText(ImGui::GetFont(), 20.0f, ImVec2(9.0f, 33.0f), IM_COL32(0, 0, 0, 255), ssaa);
+                overlay->AddText(ImGui::GetFont(), 20.0f, ImVec2(8.0f, 32.0f), IM_COL32(255, 255, 255, 255), ssaa);
+            }
         }
         if (m_debugUiInitialized && m_debugUiDrawCallback)
         {
