@@ -1,4 +1,5 @@
 #include "runtime/ps2_pad.h"
+#include "runtime/input_bindings.h"
 #include "ps2_host_backend.h"
 #include <cmath>
 #include <cstring>
@@ -28,6 +29,53 @@ namespace
     constexpr uint16_t PAD_L1 = 0x0400u;
     constexpr uint16_t PAD_R2 = 0x0200u;
     constexpr uint16_t PAD_L2 = 0x0100u;
+
+    // Pad bit for each button Action, in ps2x::input::Action order.
+    constexpr uint16_t kActionMasks[ps2x::input::kButtonActionCount] = {
+        PAD_UP, PAD_DOWN, PAD_LEFT, PAD_RIGHT, PAD_CROSS, PAD_CIRCLE, PAD_SQUARE, PAD_TRIANGLE,
+        PAD_L1, PAD_R1, PAD_L2, PAD_R2, PAD_L3, PAD_R3, PAD_START, PAD_SELECT};
+
+    // PS2X_CONTROLS=<file> picks the controls file; otherwise controls.ini in the working directory
+    // is used if it exists, and the built-in defaults if not.
+    const ps2x::input::Bindings &controls()
+    {
+        static const ps2x::input::Bindings s_bindings = []()
+        {
+            ps2x::input::Bindings bindings = ps2x::input::Bindings::defaults();
+            const char *env = std::getenv("PS2X_CONTROLS");
+            const std::string path = env && env[0] ? env : "controls.ini";
+            std::vector<std::string> warnings;
+            if (ps2x::input::loadFile(path, bindings, &warnings))
+            {
+                std::fprintf(stderr, "[pad] controls from %s\n", path.c_str());
+                for (const std::string &w : warnings)
+                    std::fprintf(stderr, "[pad] %s: %s\n", path.c_str(), w.c_str());
+            }
+            else if (env && env[0])
+                std::fprintf(stderr, "[pad] cannot read %s, using the default controls\n", path.c_str());
+            return bindings;
+        }();
+        return s_bindings;
+    }
+
+    // hostinput numbers gamepad buttons the raylib way; ps2x::input uses GLFW's standard order.
+    constexpr int kRaylibButtonFor[ps2x::input::kGamepadButtonCount] = {
+        GAMEPAD_BUTTON_RIGHT_FACE_DOWN,  // South
+        GAMEPAD_BUTTON_RIGHT_FACE_RIGHT, // East
+        GAMEPAD_BUTTON_RIGHT_FACE_LEFT,  // West
+        GAMEPAD_BUTTON_RIGHT_FACE_UP,    // North
+        GAMEPAD_BUTTON_LEFT_TRIGGER_1,   // LeftShoulder
+        GAMEPAD_BUTTON_RIGHT_TRIGGER_1,  // RightShoulder
+        GAMEPAD_BUTTON_MIDDLE_LEFT,      // Back
+        GAMEPAD_BUTTON_MIDDLE_RIGHT,     // Start
+        GAMEPAD_BUTTON_MIDDLE,           // Guide
+        GAMEPAD_BUTTON_LEFT_THUMB,       // LeftStick
+        GAMEPAD_BUTTON_RIGHT_THUMB,      // RightStick
+        GAMEPAD_BUTTON_LEFT_FACE_UP,     // DpadUp
+        GAMEPAD_BUTTON_LEFT_FACE_RIGHT,  // DpadRight
+        GAMEPAD_BUTTON_LEFT_FACE_DOWN,   // DpadDown
+        GAMEPAD_BUTTON_LEFT_FACE_LEFT,   // DpadLeft
+    };
 
     // Scripted input for headless testing.
     // PS2X_AUTOPAD="startSec:durSec:hexMask[;startSec:durSec:hexMask...]"
@@ -202,22 +250,11 @@ bool PSPadBackend::readState(int port, int /*slot*/, uint8_t *data, size_t size)
     data[3] = 0xFF;
     data[4] = data[5] = data[6] = data[7] = kPadStickCenter;
 
-    uint16_t btns = 0xFFFFu;
-    auto clearBit = [&btns](uint16_t mask)
-    { btns &= ~mask; };
-
-    // Each stick axis takes whichever source is pushed furthest from centre, so the keyboard and
-    // every connected gamepad can be used together (an idle or wrongly mapped pad in slot 0 must
-    // not shut out the others).
-    float axes[4] = {0.0f, 0.0f, 0.0f, 0.0f}; // lx, ly, rx, ry in [-1, 1]
-    auto mergeAxis = [&axes](int index, float value)
-    {
-        if (std::fabs(value) > std::fabs(axes[index]))
-            axes[index] = value;
-    };
-
+    // Every connected gamepad and the keyboard count together, so an idle or wrongly mapped pad in
+    // slot 0 cannot shut out the others.
     constexpr int kMaxGamepads = 4;
     static bool s_padConnected[kMaxGamepads] = {};
+    std::vector<ps2x::input::GamepadState> gamepads;
     for (int pad = 0; pad < kMaxGamepads; ++pad)
     {
         const bool available = hostinput::IsGamepadAvailable(pad);
@@ -231,84 +268,24 @@ bool PSPadBackend::readState(int port, int /*slot*/, uint8_t *data, size_t size)
         }
         if (!available)
             continue;
-        static constexpr struct
-        {
-            int button;
-            uint16_t mask;
-        } kButtonMap[] = {
-            {GAMEPAD_BUTTON_LEFT_FACE_UP, PAD_UP},
-            {GAMEPAD_BUTTON_LEFT_FACE_DOWN, PAD_DOWN},
-            {GAMEPAD_BUTTON_LEFT_FACE_LEFT, PAD_LEFT},
-            {GAMEPAD_BUTTON_LEFT_FACE_RIGHT, PAD_RIGHT},
-            {GAMEPAD_BUTTON_RIGHT_FACE_DOWN, PAD_CROSS},
-            {GAMEPAD_BUTTON_RIGHT_FACE_RIGHT, PAD_CIRCLE},
-            {GAMEPAD_BUTTON_RIGHT_FACE_LEFT, PAD_SQUARE},
-            {GAMEPAD_BUTTON_RIGHT_FACE_UP, PAD_TRIANGLE},
-            {GAMEPAD_BUTTON_LEFT_TRIGGER_1, PAD_L1},
-            {GAMEPAD_BUTTON_RIGHT_TRIGGER_1, PAD_R1},
-            {GAMEPAD_BUTTON_LEFT_TRIGGER_2, PAD_L2},
-            {GAMEPAD_BUTTON_RIGHT_TRIGGER_2, PAD_R2},
-            {GAMEPAD_BUTTON_MIDDLE_RIGHT, PAD_START},
-            {GAMEPAD_BUTTON_MIDDLE_LEFT, PAD_SELECT},
-            {GAMEPAD_BUTTON_LEFT_THUMB, PAD_L3},
-            {GAMEPAD_BUTTON_RIGHT_THUMB, PAD_R3},
-        };
-        for (const auto &entry : kButtonMap)
-        {
-            if (hostinput::IsGamepadButtonDown(pad, entry.button))
-                clearBit(entry.mask);
-        }
-        mergeAxis(0, hostinput::GetGamepadAxisMovement(pad, GAMEPAD_AXIS_LEFT_X));
-        mergeAxis(1, hostinput::GetGamepadAxisMovement(pad, GAMEPAD_AXIS_LEFT_Y));
-        mergeAxis(2, hostinput::GetGamepadAxisMovement(pad, GAMEPAD_AXIS_RIGHT_X));
-        mergeAxis(3, hostinput::GetGamepadAxisMovement(pad, GAMEPAD_AXIS_RIGHT_Y));
+        ps2x::input::GamepadState state;
+        for (int b = 0; b < ps2x::input::kGamepadButtonCount; ++b)
+            state.buttons[b] = hostinput::IsGamepadButtonDown(pad, kRaylibButtonFor[b]);
+        for (int a = 0; a < ps2x::input::kGamepadAxisCount; ++a)
+            state.axes[a] = hostinput::GetGamepadAxisMovement(pad, a); // same order as GAMEPAD_AXIS_*
+        gamepads.push_back(state);
     }
 
-    // Keyboard. D-pad: arrow keys. Left stick: WASD. Right stick: IJKL.
-    if (hostinput::IsKeyDown(KEY_UP))
-        clearBit(PAD_UP);
-    if (hostinput::IsKeyDown(KEY_DOWN))
-        clearBit(PAD_DOWN);
-    if (hostinput::IsKeyDown(KEY_LEFT))
-        clearBit(PAD_LEFT);
-    if (hostinput::IsKeyDown(KEY_RIGHT))
-        clearBit(PAD_RIGHT);
+    const ps2x::input::PadState pad = ps2x::input::evaluate(
+        controls(), [](int key) { return hostinput::IsKeyDown(key); }, gamepads);
 
-    auto keyAxis = [](int negativeKey, int positiveKey) -> float
+    uint16_t btns = 0xFFFFu;
+    for (int i = 0; i < ps2x::input::kButtonActionCount; ++i)
     {
-        float value = 0.0f;
-        if (hostinput::IsKeyDown(negativeKey))
-            value -= 1.0f;
-        if (hostinput::IsKeyDown(positiveKey))
-            value += 1.0f;
-        return value;
-    };
-    mergeAxis(0, keyAxis(KEY_A, KEY_D));
-    mergeAxis(1, keyAxis(KEY_W, KEY_S));
-    mergeAxis(2, keyAxis(KEY_J, KEY_L));
-    mergeAxis(3, keyAxis(KEY_I, KEY_K));
-
-    if (hostinput::IsKeyDown(KEY_X) || hostinput::IsKeyDown(KEY_SPACE))
-        clearBit(PAD_CROSS);
-    if (hostinput::IsKeyDown(KEY_C))
-        clearBit(PAD_CIRCLE);
-    if (hostinput::IsKeyDown(KEY_Z) || hostinput::IsKeyDown(KEY_KP_0))
-        clearBit(PAD_SQUARE);
-    if (hostinput::IsKeyDown(KEY_V) || hostinput::IsKeyDown(KEY_KP_1))
-        clearBit(PAD_TRIANGLE);
-    if (hostinput::IsKeyDown(KEY_Q))
-        clearBit(PAD_L1);
-    if (hostinput::IsKeyDown(KEY_E))
-        clearBit(PAD_R1);
-    if (hostinput::IsKeyDown(KEY_LEFT_SHIFT))
-        clearBit(PAD_L2);
-    if (hostinput::IsKeyDown(KEY_RIGHT_SHIFT))
-        clearBit(PAD_R2);
-    if (hostinput::IsKeyDown(KEY_ENTER))
-        clearBit(PAD_START);
-    if (hostinput::IsKeyDown(KEY_TAB))
-        clearBit(PAD_SELECT);
-
+        if (pad.isPressed(static_cast<ps2x::input::Action>(i)))
+            btns &= static_cast<uint16_t>(~kActionMasks[i]);
+    }
+    const float *axes = pad.sticks.data(); // lx, ly, rx, ry in [-1, 1]
     auto stickByte = [](float value) -> uint8_t
     {
         value = std::fmax(-1.0f, std::fmin(1.0f, value));

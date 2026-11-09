@@ -386,11 +386,12 @@ add_library(ps2_runtime STATIC
     src/lib/ps2_audio_vag.cpp
     src/lib/gs/ps2_gs_memory.cpp
     src/lib/gs/gs_frontend.cpp
-    src/lib/gs/gs_cpu_backend.cpp
+    src/lib/gs/gs_cpu_backend.cpp
     src/lib/gs/gs_parallel_backend.cpp
     src/lib/ps2_iop_host.cpp
     src/lib/ps2_memory.cpp
     src/lib/ps2_pad.cpp
+    src/lib/input_bindings.cpp
     src/lib/ps2_rom_device.cpp
     src/lib/ps2_vfs.cpp
     src/lib/ps2_runtime.cpp
@@ -523,20 +524,20 @@ target_include_directories(ps2_runtime PUBLIC
     ${CMAKE_CURRENT_SOURCE_DIR}/src/lib/Kernel
 )
 
-target_link_libraries(ps2_runtime PUBLIC ps2_host_backend ffmpeg ps2_iop)
-
-if(TARGET parallel-gs)
-    target_link_libraries(ps2_runtime PUBLIC parallel-gs)
-    target_include_directories(ps2_runtime PUBLIC
-        "${PS2X_PARALLEL_GS_DIR}/gs"
-        "${PS2X_PARALLEL_GS_DIR}/Granite/vulkan"
-        "${PS2X_PARALLEL_GS_DIR}/Granite/math"
-        "${PS2X_PARALLEL_GS_DIR}/Granite/util"
-        "${PS2X_PARALLEL_GS_DIR}/Granite/threading"
-        "${PS2X_PARALLEL_GS_DIR}/Granite/filesystem"
-        "${PS2X_PARALLEL_GS_DIR}/Granite/third_party/volk"
-        "${PS2X_PARALLEL_GS_DIR}/Granite/third_party/vulkan-headers/include"
-    )
+target_link_libraries(ps2_runtime PUBLIC ps2_host_backend ffmpeg ps2_iop)
+
+if(TARGET parallel-gs)
+    target_link_libraries(ps2_runtime PUBLIC parallel-gs)
+    target_include_directories(ps2_runtime PUBLIC
+        "${PS2X_PARALLEL_GS_DIR}/gs"
+        "${PS2X_PARALLEL_GS_DIR}/Granite/vulkan"
+        "${PS2X_PARALLEL_GS_DIR}/Granite/math"
+        "${PS2X_PARALLEL_GS_DIR}/Granite/util"
+        "${PS2X_PARALLEL_GS_DIR}/Granite/threading"
+        "${PS2X_PARALLEL_GS_DIR}/Granite/filesystem"
+        "${PS2X_PARALLEL_GS_DIR}/Granite/third_party/volk"
+        "${PS2X_PARALLEL_GS_DIR}/Granite/third_party/vulkan-headers/include"
+    )
     target_compile_definitions(ps2_runtime PUBLIC PS2X_HAS_PARALLEL_GS=1)
 
     # The game window: GLFW (raylib's copy) with no client API, presented by Granite's swapchain.
@@ -554,7 +555,7 @@ if(TARGET parallel-gs)
     )
     target_compile_definitions(imgui PUBLIC IMGUI_IMPL_VULKAN_NO_PROTOTYPES VK_NO_PROTOTYPES)
     target_link_libraries(imgui PUBLIC glfw)
-    target_link_libraries(ps2_runtime PUBLIC imgui glfw)
+    target_link_libraries(ps2_runtime PUBLIC imgui glfw)
 endif()
 target_link_libraries(ps2EntryRunner
     PRIVATE
