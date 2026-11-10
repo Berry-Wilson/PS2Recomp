@@ -83,9 +83,15 @@ else()
     )
     FetchContent_MakeAvailable(raylib)
 
-    # parallel-gs draws the game window through Vulkan, including the VSync/s overlay: ImGui is
-    # needed even without the debug panel, and rlImGui (raylib's OpenGL renderer) not at all.
-    if((PS2X_ENABLE_DEBUG_UI OR TARGET parallel-gs) AND NOT PS2X_IS_ANDROID)
+    # On Windows the game window is a plain GLFW window that PCSX2's GS (ps2x-gs.dll) draws into
+    # (HostDisplay). The runtime keeps an ImGui context there even without the debug panel, and
+    # rlImGui (raylib's OpenGL renderer) is not used.
+    if(WIN32 AND NOT PS2X_IS_VITA AND NOT PS2X_IS_ANDROID)
+        set(PS2X_USE_HOST_DISPLAY ON)
+    else()
+        set(PS2X_USE_HOST_DISPLAY OFF)
+    endif()
+    if((PS2X_ENABLE_DEBUG_UI OR PS2X_USE_HOST_DISPLAY) AND NOT PS2X_IS_ANDROID)
         FetchContent_Declare(
             imgui
             GIT_REPOSITORY https://github.com/ocornut/imgui.git
@@ -109,7 +115,7 @@ else()
         )
         target_include_directories(imgui PUBLIC "${PS2X_IMGUI_SOURCE_DIR}")
 
-        if(NOT TARGET parallel-gs)
+        if(NOT PS2X_USE_HOST_DISPLAY)
         FetchContent_Declare(
             rlImGui
             GIT_REPOSITORY https://github.com/raylib-extras/rlImGui.git
@@ -387,7 +393,6 @@ add_library(ps2_runtime STATIC
     src/lib/gs/ps2_gs_memory.cpp
     src/lib/gs/gs_frontend.cpp
     src/lib/gs/gs_cpu_backend.cpp
-    src/lib/gs/gs_parallel_backend.cpp
     src/lib/gs/gs_pcsx2_backend.cpp
     src/lib/ps2_iop_host.cpp
     src/lib/ps2_memory.cpp
@@ -527,35 +532,13 @@ target_include_directories(ps2_runtime PUBLIC
 
 target_link_libraries(ps2_runtime PUBLIC ps2_host_backend ffmpeg ps2_iop)
 
-if(TARGET parallel-gs)
-    target_link_libraries(ps2_runtime PUBLIC parallel-gs)
-    target_include_directories(ps2_runtime PUBLIC
-        "${PS2X_PARALLEL_GS_DIR}/gs"
-        "${PS2X_PARALLEL_GS_DIR}/Granite/vulkan"
-        "${PS2X_PARALLEL_GS_DIR}/Granite/math"
-        "${PS2X_PARALLEL_GS_DIR}/Granite/util"
-        "${PS2X_PARALLEL_GS_DIR}/Granite/threading"
-        "${PS2X_PARALLEL_GS_DIR}/Granite/filesystem"
-        "${PS2X_PARALLEL_GS_DIR}/Granite/third_party/volk"
-        "${PS2X_PARALLEL_GS_DIR}/Granite/third_party/vulkan-headers/include"
-    )
-    target_compile_definitions(ps2_runtime PUBLIC PS2X_HAS_PARALLEL_GS=1)
-
-    # The game window: GLFW (raylib's copy) with no client API, presented by Granite's swapchain.
+if(PS2X_USE_HOST_DISPLAY)
+    target_compile_definitions(ps2_runtime PUBLIC PS2X_HAS_HOST_DISPLAY=1)
+    # The game window: GLFW (raylib's copy) with no client API; PCSX2's GS draws into it.
     target_sources(ps2_runtime PRIVATE
         src/lib/host_display.cpp
         src/lib/host_input.cpp
     )
-    target_sources(imgui PRIVATE
-        "${PS2X_IMGUI_SOURCE_DIR}/backends/imgui_impl_glfw.cpp"
-        "${PS2X_IMGUI_SOURCE_DIR}/backends/imgui_impl_vulkan.cpp"
-    )
-    target_include_directories(imgui PUBLIC
-        "${PS2X_IMGUI_SOURCE_DIR}/backends"
-        "${PS2X_PARALLEL_GS_DIR}/Granite/third_party/khronos/vulkan-headers/include"
-    )
-    target_compile_definitions(imgui PUBLIC IMGUI_IMPL_VULKAN_NO_PROTOTYPES VK_NO_PROTOTYPES)
-    target_link_libraries(imgui PUBLIC glfw)
     target_link_libraries(ps2_runtime PUBLIC imgui glfw)
 endif()
 target_link_libraries(ps2EntryRunner
@@ -567,7 +550,7 @@ if(PS2X_ENABLE_DEBUG_UI AND NOT PS2X_IS_VITA AND NOT PS2X_IS_ANDROID)
     target_sources(ps2EntryRunner PRIVATE
         src/lib/ps2_debug_panel.cpp
     )
-    if(TARGET parallel-gs)
+    if(PS2X_USE_HOST_DISPLAY)
         target_link_libraries(ps2EntryRunner PRIVATE imgui)
     else()
         target_link_libraries(ps2EntryRunner PRIVATE rlImGui imgui)

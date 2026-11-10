@@ -6,9 +6,8 @@
 #include "ps2_runtime_macros.h"
 #include "runtime/gs/gs_frontend.h"
 
-#if defined(PS2X_HAS_PARALLEL_GS)
+#if defined(PS2X_HAS_HOST_DISPLAY)
 
-#include "runtime/gs/gs_parallel_backend.h"
 #include "runtime/gs/gs_pcsx2_backend.h"
 #include "runtime/host_display.h"
 #include "imgui.h"
@@ -907,20 +906,20 @@ namespace
     }
 }
 
-#if defined(PS2X_HAS_PARALLEL_GS)
+#if defined(PS2X_HAS_HOST_DISPLAY)
 using HostFrameTarget = HostDisplay;
 #else
 using HostFrameTarget = Texture2D;
 #endif
 
-// Set by F12 on the main thread. The parallel-gs backend reads the next scanout back to the CPU
-// while it is set, and UploadFrame saves that frame and clears it.
+// Set by F12 on the main thread. UploadFrame clears it and has the frame saved: by PCSX2's GS as a
+// PNG at its internal resolution, or with raylib from the CPU frame.
 std::atomic<bool> g_ps2xScreenshotRequested{false};
 
-// Set by F5 on the main thread; the parallel-gs backend switches to the next super-sampling rate
-// after its next vsync and stores the new rate, which is shown on screen for a moment.
-std::atomic<bool> g_ps2xSsaaCycleRequested{false};
-std::atomic<int> g_ps2xSsaaRate{1};
+// Set by F5 on the main thread; PCSX2's GS steps to the next internal resolution at its next vsync
+// and stores the new scale here, which is shown on screen for a moment.
+std::atomic<bool> g_ps2xUpscaleCycleRequested{false};
+std::atomic<int> g_ps2xUpscaleRate{1};
 // Finished-frame presentation. A game override that knows when the game has finished a frame calls
 // PS2Runtime::gs().latchHostPresentationFrame() at that moment and stores the vsync tick here (plus
 // one, so 0 means never). Some games draw into the buffer that is shown and start the next frame
@@ -1037,7 +1036,7 @@ static void UploadFrame(HostFrameTarget &tex, PS2Runtime *rt, uint32_t &outWidth
     if (hostinput::IsKeyPressed(KEY_F12))
         g_ps2xScreenshotRequested.store(true, std::memory_order_release);
     if (hostinput::IsKeyPressed(KEY_F5))
-        g_ps2xSsaaCycleRequested.store(true, std::memory_order_release);
+        g_ps2xUpscaleCycleRequested.store(true, std::memory_order_release);
 
     static uint64_t s_lastPresentationTick = std::numeric_limits<uint64_t>::max();
     static bool s_hasLatchedInitialFrame = false;
@@ -1048,7 +1047,7 @@ static void UploadFrame(HostFrameTarget &tex, PS2Runtime *rt, uint32_t &outWidth
     static uint32_t s_lastHeight = 0u;
     static bool s_hasUploadedFrame = false;
     static std::vector<uint8_t> s_scratch;
-#if !defined(PS2X_HAS_PARALLEL_GS)
+#if !defined(PS2X_HAS_HOST_DISPLAY)
     static std::vector<uint8_t> s_uploadBuffer(DEFAULT_FB_SIZE, 0u);
 #endif
 
@@ -1085,10 +1084,9 @@ static void UploadFrame(HostFrameTarget &tex, PS2Runtime *rt, uint32_t &outWidth
         }
     }
 
-#if defined(PS2X_HAS_PARALLEL_GS)
+#if defined(PS2X_HAS_HOST_DISPLAY)
     // With PCSX2's GS the picture never comes back to the CPU: PCSX2 saves it itself, as a PNG at
     // its internal resolution, when it presents the next frame.
-    if (HostDisplay::externalPresenter())
     {
         if (g_ps2xScreenshotRequested.exchange(false, std::memory_order_acq_rel))
         {
@@ -1121,13 +1119,12 @@ static void UploadFrame(HostFrameTarget &tex, PS2Runtime *rt, uint32_t &outWidth
                                                    &sourceFbp,
                                                    &usedPreferredDisplaySource))
     {
-#if !defined(PS2X_HAS_PARALLEL_GS)
+#if !defined(PS2X_HAS_HOST_DISPLAY)
         Image blank = GenImageColor(FB_WIDTH, FB_HEIGHT, MAGENTA);
         UpdateTexture(tex, blank.data);
         UnloadImage(blank);
 #endif
-        // With parallel-gs this is the normal path: the frame went straight to the swapchain and
-        // pixels exist only while dumping frames.
+        // With PCSX2's GS this is the normal path: it draws the frame into the window itself.
         outWidth = FB_WIDTH;
         outHeight = DEFAULT_DISPLAY_HEIGHT;
         s_lastWidth = outWidth;
@@ -1161,7 +1158,7 @@ static void UploadFrame(HostFrameTarget &tex, PS2Runtime *rt, uint32_t &outWidth
     s_lastWidth = width;
     s_lastHeight = height;
 
-#if !defined(PS2X_HAS_PARALLEL_GS)
+#if !defined(PS2X_HAS_HOST_DISPLAY)
     std::fill(s_uploadBuffer.begin(), s_uploadBuffer.end(), 0u);
 #endif
     {
@@ -1182,13 +1179,7 @@ static void UploadFrame(HostFrameTarget &tex, PS2Runtime *rt, uint32_t &outWidth
         g_ps2xScreenshotRequested.store(false, std::memory_order_release);
         SaveScreenshot(s_scratch.data(), width, height);
     }
-#if defined(PS2X_HAS_PARALLEL_GS)
-    if (!tex.hasScanout() && !s_scratch.empty() && width != 0u && height != 0u &&
-        s_scratch.size() >= static_cast<size_t>(width) * height * 4u)
-    {
-        tex.setCpuFrame(s_scratch.data(), width, height); // PS2X_GS_BACKEND=cpu
-    }
-#else
+#if !defined(PS2X_HAS_HOST_DISPLAY)
     if (!s_scratch.empty() && width != 0u && height != 0u)
     {
         const uint32_t copyWidth = std::min<uint32_t>(width, FB_WIDTH);
@@ -1287,8 +1278,8 @@ PS2Runtime::~PS2Runtime()
             m_debugUiInitialized = false;
         }
 
-#if defined(PS2X_HAS_PARALLEL_GS)
-        // parallel-gs renders with the window's device, so it has to go first.
+#if defined(PS2X_HAS_HOST_DISPLAY)
+        // PCSX2's GS draws into a child of the window, so it has to go first.
         m_gs.setRasterBackend(nullptr);
         HostDisplay::destroy();
 #else
@@ -1412,37 +1403,10 @@ bool PS2Runtime::syncCoreSubsystems()
 
     m_gs.init(gsVram, static_cast<uint32_t>(PS2_GS_VRAM_SIZE), &m_memory.gs());
 
-#if defined(PS2X_HAS_PARALLEL_GS)
-
-    {
-
-        const char *gsBackendEnv = std::getenv("PS2X_GS_BACKEND");
-
-        bool useParallel = true;
-
-        if (gsBackendEnv && (_stricmp(gsBackendEnv, "cpu") == 0 || _stricmp(gsBackendEnv, "software") == 0))
-
-        {
-
-            useParallel = false;
-
-        }
-
-        if (useParallel && HostDisplay::externalPresenter())
-        {
-            // PS2X_GS_BACKEND=pcsx2: PCSX2's GS draws into the window instead.
-            m_gs.setRasterBackend(std::make_unique<GSPcsx2Backend>());
-        }
-        else if (useParallel && HostDisplay::get())
-
-        {
-
-            m_gs.setRasterBackend(std::make_unique<GSParallelBackend>());
-
-        }
-
-    }
-
+#if defined(PS2X_HAS_HOST_DISPLAY)
+    // PCSX2's GS (ps2x-gs.dll) draws the picture into the window. PS2X_GS_BACKEND=cpu or software
+    // picks its software renderer.
+    m_gs.setRasterBackend(std::make_unique<GSPcsx2Backend>());
 #endif
     m_gifArbiter.setProcessPacketFn([this](const uint8_t *data, uint32_t size, uint32_t path)
                                     { m_gs.processGIFPacket(data, size, path); });
@@ -1570,11 +1534,11 @@ bool PS2Runtime::initialize(const char *title)
             return false;
         }
 
-#if defined(PS2X_HAS_PARALLEL_GS)
-        // Before the core subsystems: parallel-gs renders with this window's Vulkan device.
+#if defined(PS2X_HAS_HOST_DISPLAY)
+        // Before the core subsystems: PCSX2's GS draws into this window.
         if (!HostDisplay::create(title, HOST_WINDOW_WIDTH, HOST_WINDOW_HEIGHT))
         {
-            std::cerr << "Failed to create the Vulkan game window" << std::endl;
+            std::cerr << "Failed to create the game window" << std::endl;
             return false;
         }
 #endif
@@ -1585,7 +1549,7 @@ bool PS2Runtime::initialize(const char *title)
         }
 #if defined(PLATFORM_VITA)
         InitWindow(HOST_WINDOW_WIDTH, HOST_WINDOW_HEIGHT, title); // raylib vita does not support audio
-#elif defined(PS2X_HAS_PARALLEL_GS)
+#elif defined(PS2X_HAS_HOST_DISPLAY)
         InitAudioDevice(); // raylib is only the audio backend here; it never opens a window
         m_audioBackend.setAudioReady(IsAudioDeviceReady());
 #else
@@ -1594,7 +1558,7 @@ bool PS2Runtime::initialize(const char *title)
         InitAudioDevice();
         m_audioBackend.setAudioReady(IsAudioDeviceReady());
 #endif
-#if !defined(PS2X_HAS_PARALLEL_GS)
+#if !defined(PS2X_HAS_HOST_DISPLAY)
         SetTargetFPS(60);
         SetExitKey(KEY_NULL); // raylib closes the window on Escape by default; Escape does nothing here
 #endif
@@ -1621,7 +1585,7 @@ bool PS2Runtime::initialize(const char *title)
 bool PS2Runtime::loadELF(const std::string &elfPath)
 {
     configureIoPathsFromElf(elfPath);
-#if defined(PS2X_HAS_PARALLEL_GS)
+#if defined(PS2X_HAS_HOST_DISPLAY)
     ps2xSetGameElfName(std::filesystem::path(elfPath).filename().string().c_str());
 #endif
 
@@ -3453,7 +3417,7 @@ void PS2Runtime::run()
 
     RUNTIME_LOG("Starting execution at address 0x" << std::hex << m_cpuContext.pc << std::dec);
 
-#if defined(PS2X_HAS_PARALLEL_GS)
+#if defined(PS2X_HAS_HOST_DISPLAY)
     HostDisplay &display = *HostDisplay::get();
     uint64_t lastPresentedTick = std::numeric_limits<uint64_t>::max();
 #else
@@ -3521,7 +3485,7 @@ void PS2Runtime::run()
 
             }
         });
-#if defined(PS2X_HAS_PARALLEL_GS)
+#if defined(PS2X_HAS_HOST_DISPLAY)
         // Each guest VSync is one frame. The timeout keeps the window and debug panel alive if
         // the game stops producing them.
         {
@@ -3556,17 +3520,12 @@ void PS2Runtime::run()
             }
             char text[32];
             std::snprintf(text, sizeof(text), "VSync/s: %.1f", s_vsyncsPerSecond);
-            const ImU32 rateColor = s_vsyncsPerSecond >= 59.0 ? IM_COL32(0, 228, 48, 255) : IM_COL32(253, 249, 0, 255);
-            ImDrawList *overlay = ImGui::GetForegroundDrawList();
-            overlay->AddText(ImGui::GetFont(), 20.0f, ImVec2(9.0f, 9.0f), IM_COL32(0, 0, 0, 255), text);
-            overlay->AddText(ImGui::GetFont(), 20.0f, ImVec2(8.0f, 8.0f), rateColor, text);
+            const uint32_t rateColor = s_vsyncsPerSecond >= 59.0 ? IM_COL32(0, 228, 48, 255) : IM_COL32(253, 249, 0, 255);
 
-            // After F5 changes the resolution, show it for two seconds. With PCSX2's GS, F5 steps
-            // its internal resolution; with parallel-gs, the super-sampling rate.
-            const bool pcsx2 = HostDisplay::externalPresenter();
-            static int s_shownRate = g_ps2xSsaaRate.load(std::memory_order_relaxed);
+            // After F5 steps PCSX2's internal resolution, show the new one for two seconds.
+            static int s_shownRate = g_ps2xUpscaleRate.load(std::memory_order_relaxed);
             static double s_rateShownUntil = 0.0;
-            const int rate = g_ps2xSsaaRate.load(std::memory_order_relaxed);
+            const int rate = g_ps2xUpscaleRate.load(std::memory_order_relaxed);
             if (rate != s_shownRate)
             {
                 s_shownRate = rate;
@@ -3574,18 +3533,10 @@ void PS2Runtime::run()
             }
             char notice[40] = "";
             if (now < s_rateShownUntil)
-            {
-                std::snprintf(notice, sizeof(notice), pcsx2 ? "Internal resolution: %dx" : "Super-sampling: %dx", rate);
-                overlay->AddText(ImGui::GetFont(), 20.0f, ImVec2(9.0f, 33.0f), IM_COL32(0, 0, 0, 255), notice);
-                overlay->AddText(ImGui::GetFont(), 20.0f, ImVec2(8.0f, 32.0f), IM_COL32(255, 255, 255, 255), notice);
-            }
-            // PCSX2 draws the picture and this frame's ImGui output is not shown, so the same lines
-            // go to its overlay instead.
-            if (pcsx2)
-            {
-                ps2xPcsx2SetOverlay(0u, text, rateColor);
-                ps2xPcsx2SetOverlay(1u, notice, IM_COL32(255, 255, 255, 255));
-            }
+                std::snprintf(notice, sizeof(notice), "Internal resolution: %dx", rate);
+            // PCSX2 draws the picture, so these lines go to its overlay.
+            ps2xPcsx2SetOverlay(0u, text, rateColor);
+            ps2xPcsx2SetOverlay(1u, notice, IM_COL32(255, 255, 255, 255));
         }
         if (m_debugUiInitialized && m_debugUiDrawCallback)
         {
@@ -3663,8 +3614,8 @@ void PS2Runtime::run()
         m_debugUiShutdownCallback(*this, m_debugUiUserData);
         m_debugUiInitialized = false;
     }
-#if defined(PS2X_HAS_PARALLEL_GS)
-    display.hide(); // closed by ~PS2Runtime, after the GS backend that renders with its device
+#if defined(PS2X_HAS_HOST_DISPLAY)
+    display.hide(); // closed by ~PS2Runtime, after the GS backend that draws into it
 #else
     UnloadTexture(frameTex);
     CloseWindow();

@@ -26,6 +26,7 @@
 #include "pcsx2/GS/GS.h"
 #include "pcsx2/GS/Renderers/Common/GSRenderer.h"
 #include "pcsx2/GameDatabase.h"
+#include "pcsx2/Memory.h"
 
 #include "ps2x_gs_api.h"
 
@@ -68,6 +69,7 @@ namespace
 	std::vector<u8> s_cur;
 	alignas(64) u8 s_regs_in[0x2000] = {};
 	bool s_open = false;
+	bool s_sys_memory = false; // SysMemory::Allocate() has run
 
 	// Between the two, under s_q_lock.
 	std::mutex s_q_lock;
@@ -494,6 +496,18 @@ PS2XGS_API int ps2xgs_open(const Ps2xGsConfig *config)
 		return 0;
 	if (!InitializeHost(*config))
 		return 0;
+	// The software renderer compiles its drawing code into memory that SysMemory reserves, which
+	// PCSX2's own GS runner allocates at start-up (VMManager::Internal::CPUThreadInitialize).
+	// Without it, the first software draw writes through a null code pointer.
+	if (!s_sys_memory)
+	{
+		if (!SysMemory::Allocate())
+		{
+			std::fprintf(stderr, "[ps2x-gs] could not reserve PCSX2's host memory\n");
+			return 0;
+		}
+		s_sys_memory = true;
+	}
 	ApplySettings(*config);
 
 	s_parent = static_cast<HWND>(config->parent_window);
@@ -613,4 +627,9 @@ PS2XGS_API void ps2xgs_close()
 	if (s_hwnd)
 		PostMessageW(s_hwnd, WM_PS2XGS_QUIT, 0, 0);
 	s_hwnd = nullptr;
+	if (s_sys_memory)
+	{
+		SysMemory::Release();
+		s_sys_memory = false;
+	}
 }

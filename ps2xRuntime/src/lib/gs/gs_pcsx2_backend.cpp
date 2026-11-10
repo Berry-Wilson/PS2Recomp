@@ -21,8 +21,8 @@ extern "C" __declspec(dllimport) unsigned long __stdcall GetLastError();
 constexpr unsigned long kLoadWithAlteredSearchPath = 0x00000008;
 #endif
 
-extern std::atomic<bool> g_ps2xSsaaCycleRequested; // ps2_runtime.cpp: F5
-extern std::atomic<int> g_ps2xSsaaRate;            // ps2_runtime.cpp: shown on screen after F5
+extern std::atomic<bool> g_ps2xUpscaleCycleRequested; // ps2_runtime.cpp: F5 wants the next upscale step
+extern std::atomic<int> g_ps2xUpscaleRate;            // ps2_runtime.cpp: shown on screen after F5
 
 namespace
 {
@@ -57,7 +57,13 @@ namespace
     {
         const char *value = std::getenv("PS2X_PCSX2_RENDERER");
         if (!value || !value[0])
+        {
+            // PS2X_GS_BACKEND=cpu (or software), the old name for a renderer on the CPU.
+            const char *backend = std::getenv("PS2X_GS_BACKEND");
+            if (backend && (std::strcmp(backend, "cpu") == 0 || std::strcmp(backend, "software") == 0))
+                return PS2XGS_RENDERER_SOFTWARE;
             return PS2XGS_RENDERER_AUTO;
+        }
         const std::string v(value);
         if (v == "dx11" || v == "d3d11")
             return PS2XGS_RENDERER_DX11;
@@ -210,7 +216,7 @@ void GSPcsx2Backend::Impl::ensureOpen()
             std::cerr << "[GSPcsx2Backend] PCSX2's GS did not start" << std::endl;
             return;
         }
-        g_ps2xSsaaRate.store(static_cast<int>(upscale), std::memory_order_relaxed);
+        g_ps2xUpscaleRate.store(static_cast<int>(upscale), std::memory_order_relaxed);
         std::cerr << "[GSPcsx2Backend] PCSX2 GS open, internal resolution " << upscale << "x"
                   << (serial.empty() ? std::string() : ", game " + serial) << std::endl;
         g_snapshot.store(snapshot, std::memory_order_release);
@@ -280,7 +286,7 @@ PresentationFrame GSPcsx2Backend::Present(const GSPresentationRequest &request)
         return result;
 
     // F5: the next internal resolution.
-    if (g_ps2xSsaaCycleRequested.exchange(false, std::memory_order_acq_rel))
+    if (g_ps2xUpscaleCycleRequested.exchange(false, std::memory_order_acq_rel))
     {
         size_t next = 0;
         for (size_t i = 0; i < std::size(kUpscaleSteps); ++i)
@@ -293,7 +299,7 @@ PresentationFrame GSPcsx2Backend::Present(const GSPresentationRequest &request)
         }
         m_impl->upscale = kUpscaleSteps[next];
         m_impl->setUpscale(m_impl->upscale);
-        g_ps2xSsaaRate.store(static_cast<int>(m_impl->upscale), std::memory_order_relaxed);
+        g_ps2xUpscaleRate.store(static_cast<int>(m_impl->upscale), std::memory_order_relaxed);
     }
 
     uint8_t *regs = static_cast<uint8_t *>(m_impl->regs());

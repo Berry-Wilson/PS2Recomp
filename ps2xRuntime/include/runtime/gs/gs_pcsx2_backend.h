@@ -5,10 +5,10 @@
 #include <memory>
 #include <vector>
 
-// PS2X_GS_BACKEND=pcsx2: PCSX2's GS, built as ps2x-gs.dll (ps2xRuntime/pcsx2-gs), draws the picture.
-// It receives the same raw GIF stream as the parallel-gs backend and the privileged registers at
-// each vsync, and draws into the game window with its own swapchain (DirectX 11/12, Vulkan or
-// OpenGL), at an upscaled internal resolution.
+// PCSX2's GS, built as ps2x-gs.dll (ps2xRuntime/pcsx2-gs), draws the picture. It receives the raw
+// GIF stream and the privileged registers at each vsync, and draws into the game window with its own
+// swapchain (DirectX 11/12, Vulkan, OpenGL or its software renderer), at an upscaled internal
+// resolution.
 class GSPcsx2Backend final : public GSRasterBackend
 {
 public:

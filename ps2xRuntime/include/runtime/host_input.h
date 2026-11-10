@@ -1,10 +1,10 @@
 #pragma once
 
 // Keyboard and gamepad state for the guest pad code, using raylib's key, button and axis numbers.
-// With parallel-gs the game window belongs to the Vulkan swapchain, so raylib never opens a window
-// and this state comes from GLFW instead. The main thread polls; the game thread reads.
+// With the PCSX2 renderer the game window is a plain GLFW window (HostDisplay), so raylib never opens
+// a window and this state comes from GLFW instead. The main thread polls; the game thread reads.
 
-#if defined(PS2X_HAS_PARALLEL_GS)
+#if defined(PS2X_HAS_HOST_DISPLAY)
 
 struct GLFWwindow;
 

@@ -1,57 +1,29 @@
 #pragma once
 
-#include <cstdint>
-#include <functional>
 #include <memory>
-#include <mutex>
 
-namespace Vulkan
-{
-    class Device;
-    class Image;
-}
-
-// The game window: a GLFW window with no client API whose Vulkan swapchain (Granite's WSI) is the
-// only thing that draws to it. It owns the Vulkan device that parallel-gs renders with, and draws
-// the scanout image straight to the swapchain, with no copy through the CPU. ImGui (the debug panel
-// and overlays) draws on top in the same frame.
+// The game window: a GLFW window with no client API. PCSX2's GS (GSPcsx2Backend) draws the picture
+// into a child of it with its own swapchain; this class only owns the window, its input and the
+// ImGui context. ImGui has nothing to draw to here, so the debug panel and overlays run as code but
+// are not shown; the VSync/s and F5 lines go to PCSX2's overlay instead.
 class HostDisplay
 {
 public:
     static bool create(const char *title, int width, int height);
     static HostDisplay *get();
-    static void destroy(); // only after everything using device() is gone
+    static void destroy();
     // The width / height to show the image at, from PS2X_ASPECT (only "16:9" so far). 0 keeps the
     // image's own shape.
     static float outputAspect();
-    // True with PS2X_GS_BACKEND=pcsx2: PCSX2's GS draws into a child of the window with its own
-    // swapchain, so this creates no Vulkan device or swapchain. ImGui calls stay valid but draw nothing.
-    static bool externalPresenter();
-    // The window's native handle (an HWND on Windows), for a renderer that draws into it.
+    // The window's native handle (an HWND on Windows), for the renderer that draws into it.
     void *nativeWindow() const;
-
-    // Granite's device is single threaded here: hold deviceMutex() around any use of device().
-    Vulkan::Device &device();
-    std::mutex &deviceMutex();
 
     void pollEvents();
     bool shouldClose() const;
     void hide();
 
-    // The image to show from now on, in TRANSFER_SRC_OPTIMAL. Call with deviceMutex() held.
-    // Only its top pictureHeight rows hold picture; those are stretched over its full height, as a
-    // game that scans out fewer lines than the video mode has still fills the screen's shape.
-    void setScanout(Vulkan::Image *image, uint32_t pictureHeight);
-    bool hasScanout() const;
-    // Runs with deviceMutex() held before each frame. Acquiring a swapchain image waits for every
-    // open command buffer on the device, so a renderer that keeps one open between calls must
-    // submit it here.
-    void setBeforeFrame(std::function<void()> fn);
-    // For a backend that renders on the CPU: RGBA8, width * height * 4 bytes.
-    void setCpuFrame(const uint8_t *rgba, uint32_t width, uint32_t height);
-
     void beginUi(); // starts an ImGui frame; ImGui calls are valid until present()
-    void present();
+    void present(); // ends the ImGui frame
 
     ~HostDisplay();
 

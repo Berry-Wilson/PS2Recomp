@@ -13,7 +13,7 @@
 #if defined(PS2X_ENABLE_DEBUG_UI) && !defined(PLATFORM_VITA)
 #include "imgui.h"
 #include "ps2_host_backend.h"
-#if !defined(PS2X_HAS_PARALLEL_GS)
+#if !defined(PS2X_HAS_HOST_DISPLAY)
 #include "rlImGui.h"
 #endif
 #include "raylib.h"
@@ -2184,7 +2184,7 @@ void PS2DebugPanel::initialize()
 #if defined(PS2X_ENABLE_DEBUG_UI) && !defined(PLATFORM_VITA)
     if (!m_initialized)
     {
-#if !defined(PS2X_HAS_PARALLEL_GS) // otherwise HostDisplay owns ImGui and draws it in its swapchain
+#if !defined(PS2X_HAS_HOST_DISPLAY) // otherwise HostDisplay owns ImGui, which has nothing to draw to there
         rlImGuiSetup(true);
 #endif
         m_initialized = true;
@@ -2197,7 +2197,7 @@ void PS2DebugPanel::shutdown()
 #if defined(PS2X_ENABLE_DEBUG_UI) && !defined(PLATFORM_VITA)
     if (m_initialized)
     {
-#if !defined(PS2X_HAS_PARALLEL_GS)
+#if !defined(PS2X_HAS_HOST_DISPLAY)
         rlImGuiShutdown();
 #endif
         m_initialized = false;
@@ -2223,7 +2223,7 @@ void PS2DebugPanel::draw(PS2Runtime &runtime)
         return;
     }
 
-#if !defined(PS2X_HAS_PARALLEL_GS)
+#if !defined(PS2X_HAS_HOST_DISPLAY)
     rlImGuiBegin();
 #endif
 
@@ -2312,7 +2312,7 @@ void PS2DebugPanel::draw(PS2Runtime &runtime)
     }
     ImGui::End();
 
-#if !defined(PS2X_HAS_PARALLEL_GS)
+#if !defined(PS2X_HAS_HOST_DISPLAY)
     rlImGuiEnd();
 #endif
 #else
