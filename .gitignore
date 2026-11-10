@@ -23,3 +23,6 @@ android/app/.cxx/
 android/local.properties
 android/.gradle/ 
 .idea/
+
+# Memory card saves written when running from this folder
+mc0/
