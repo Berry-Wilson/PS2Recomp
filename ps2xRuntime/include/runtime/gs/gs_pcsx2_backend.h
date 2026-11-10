@@ -1,0 +1,63 @@
+#pragma once
+
+#include "runtime/gs/gs_backend.h"
+
+#include <memory>
+#include <vector>
+
+// PS2X_GS_BACKEND=pcsx2: PCSX2's GS, built as ps2x-gs.dll (ps2xRuntime/pcsx2-gs), draws the picture.
+// It receives the same raw GIF stream as the parallel-gs backend and the privileged registers at
+// each vsync, and draws into the game window with its own swapchain (DirectX 11/12, Vulkan or
+// OpenGL), at an upscaled internal resolution.
+class GSPcsx2Backend final : public GSRasterBackend
+{
+public:
+    GSPcsx2Backend();
+    ~GSPcsx2Backend() override;
+
+    bool HandlesRawGif() const override { return true; }
+    void ProcessGif(uint32_t path, const uint8_t *data, uint32_t sizeBytes) override;
+    void WriteRegister(uint8_t regAddr, uint64_t value) override;
+
+    void Initialize(uint8_t *vram, uint32_t vramSize) override;
+    void Reset() override;
+
+    void Submit(const GSPrimitiveBatch &batch) override {}
+    void LoadClut(const GSTex0Reg &tex0, const GSTexClutReg &texclut) override {}
+
+    void BeginTransfer(const GSTransferCommand &command) override {}
+    void UploadImage(const uint8_t *data, uint32_t sizeBytes) override;
+
+    void Flush() override {}
+    void TextureFlush() override {}
+    void Sync(GSSyncReason reason) override {}
+    PresentationFrame Present(const GSPresentationRequest &request) override;
+
+    bool ClearFramebuffer(const GSContext &context, uint32_t rgba) override { return true; }
+    uint32_t ConsumeLocalToHostBytes(uint8_t *dst, uint32_t maxBytes) override { return 0u; }
+
+    uint32_t ReadVram(uint32_t, uint32_t, uint32_t, uint32_t, uint32_t) const override { return 0u; }
+    void WriteVram(uint32_t, uint32_t, uint32_t, uint32_t, uint32_t, uint32_t) override {}
+    void SnapshotVram(std::vector<uint8_t> &out) const override { out.clear(); }
+    GSTransferSnapshot GetTransferSnapshot() const override { return {}; }
+
+    // Saves the next presented frame as a PNG (F12, frame dumps).
+    void QueueSnapshot(const char *path);
+
+private:
+    struct Impl;
+    std::unique_ptr<Impl> m_impl;
+};
+
+// The game's ELF file name (e.g. "SLUS_207.32"), set by PS2Runtime::loadELF. The backend turns it
+// into the serial PCSX2's game database uses (SLUS-20732) to apply its per-game fixes.
+void ps2xSetGameElfName(const char *name);
+
+// Overlay text for when PCSX2's GS presents (the runtime's own ImGui output is not shown then):
+// line 0-3 in the top-left corner, rgba as IM_COL32. Empty text clears the line. Does nothing
+// until the DLL is loaded.
+void ps2xPcsx2SetOverlay(unsigned line, const char *text, uint32_t rgba);
+
+// Asks PCSX2 to save the next presented frame as a PNG at `path` (absolute), at its internal
+// resolution. Does nothing until the DLL is open.
+void ps2xPcsx2QueueSnapshot(const char *path);

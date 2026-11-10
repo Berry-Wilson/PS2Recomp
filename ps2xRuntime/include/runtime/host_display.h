@@ -24,6 +24,11 @@ public:
     // The width / height to show the image at, from PS2X_ASPECT (only "16:9" so far). 0 keeps the
     // image's own shape.
     static float outputAspect();
+    // True with PS2X_GS_BACKEND=pcsx2: PCSX2's GS draws into a child of the window with its own
+    // swapchain, so this creates no Vulkan device or swapchain. ImGui calls stay valid but draw nothing.
+    static bool externalPresenter();
+    // The window's native handle (an HWND on Windows), for a renderer that draws into it.
+    void *nativeWindow() const;
 
     // Granite's device is single threaded here: hold deviceMutex() around any use of device().
     Vulkan::Device &device();

@@ -8,6 +8,10 @@
 
 #define GLFW_INCLUDE_NONE
 #include <GLFW/glfw3.h>
+#if defined(_WIN32)
+#define GLFW_EXPOSE_NATIVE_WIN32
+#include <GLFW/glfw3native.h>
+#endif
 
 #include "imgui.h"
 #include "imgui_impl_glfw.h"
@@ -93,6 +97,7 @@ struct HostDisplay::Impl
     VkRenderPass uiRenderPass = VK_NULL_HANDLE;
     bool uiReady = false;
     bool hasScanout = false;
+    bool external = false; // PS2X_GS_BACKEND=pcsx2: another renderer owns the window's picture
     std::function<void()> beforeFrame;
 
     bool init(const char *title, int width, int height);
@@ -126,9 +131,28 @@ bool HostDisplay::Impl::init(const char *title, int width, int height)
         return false;
     }
     glfwSetWindowUserPointer(window, this);
+    // With an external presenter there is no swapchain here to resize.
     glfwSetFramebufferSizeCallback(window, [](GLFWwindow *w, int, int)
-                                   { static_cast<Impl *>(glfwGetWindowUserPointer(w))->platform->requestResize(); });
+                                   {
+                                       Impl *impl = static_cast<Impl *>(glfwGetWindowUserPointer(w));
+                                       if (impl->platform)
+                                           impl->platform->requestResize();
+                                   });
     hostinput::attach(window);
+
+    if (external)
+    {
+        // No device or swapchain here. ImGui gets a context with nothing to draw to, so the debug
+        // panel and overlays keep working as code and are simply not shown.
+        IMGUI_CHECKVERSION();
+        ImGui::CreateContext();
+        ImGuiIO &io = ImGui::GetIO();
+        unsigned char *pixels = nullptr;
+        int fontWidth = 0, fontHeight = 0;
+        io.Fonts->GetTexDataAsRGBA32(&pixels, &fontWidth, &fontHeight);
+        uiReady = true;
+        return true;
+    }
 
     Util::register_thread_index(0);
     if (!Vulkan::Context::init_loader(nullptr))
@@ -232,7 +256,7 @@ void HostDisplay::Impl::present()
 {
     int fbWidth = 0, fbHeight = 0;
     glfwGetFramebufferSize(window, &fbWidth, &fbHeight);
-    if (fbWidth <= 0 || fbHeight <= 0) // minimized: there is no swapchain to draw to
+    if (fbWidth <= 0 || fbHeight <= 0 || external) // minimized, or another renderer presents
     {
         ImGui::EndFrame();
         return;
@@ -315,6 +339,11 @@ void HostDisplay::Impl::present()
 void HostDisplay::Impl::shutdown()
 {
     frame.reset();
+    if (uiReady && external)
+    {
+        ImGui::DestroyContext();
+        uiReady = false;
+    }
     if (uiReady)
     {
         wsi.get_device().wait_idle();
@@ -344,6 +373,29 @@ HostDisplay::~HostDisplay()
     glfwTerminate();
 #if defined(_WIN32)
     timeEndPeriod(1);
+#endif
+}
+
+bool HostDisplay::externalPresenter()
+{
+    static const bool external = []()
+    {
+        const char *value = std::getenv("PS2X_GS_BACKEND");
+#if defined(_WIN32)
+        return value && _stricmp(value, "pcsx2") == 0;
+#else
+        return value && std::strcmp(value, "pcsx2") == 0;
+#endif
+    }();
+    return external;
+}
+
+void *HostDisplay::nativeWindow() const
+{
+#if defined(_WIN32)
+    return glfwGetWin32Window(m_impl->window);
+#else
+    return nullptr;
 #endif
 }
 
@@ -378,6 +430,7 @@ bool HostDisplay::create(const char *title, int width, int height)
     if (s_display)
         return true;
     std::unique_ptr<HostDisplay> display(new HostDisplay());
+    display->m_impl->external = externalPresenter();
     if (!display->m_impl->init(title, width, height))
         return false;
     s_display = std::move(display);
@@ -442,6 +495,8 @@ bool HostDisplay::hasScanout() const
 
 void HostDisplay::setCpuFrame(const uint8_t *rgba, uint32_t width, uint32_t height)
 {
+    if (m_impl->external)
+        return;
     Util::register_thread_index(0);
     std::lock_guard<std::mutex> lock(m_impl->deviceMutex);
     auto info = Vulkan::ImageCreateInfo::immutable_2d_image(width, height, VK_FORMAT_R8G8B8A8_UNORM);
@@ -455,6 +510,16 @@ void HostDisplay::setCpuFrame(const uint8_t *rgba, uint32_t width, uint32_t heig
 
 void HostDisplay::beginUi()
 {
+    if (m_impl->external)
+    {
+        int width = 0, height = 0;
+        glfwGetFramebufferSize(m_impl->window, &width, &height);
+        ImGuiIO &io = ImGui::GetIO();
+        io.DisplaySize = ImVec2(static_cast<float>(std::max(width, 1)), static_cast<float>(std::max(height, 1)));
+        io.DeltaTime = 1.0f / 60.0f;
+        ImGui::NewFrame();
+        return;
+    }
     ImGui_ImplVulkan_NewFrame();
     ImGui_ImplGlfw_NewFrame();
     ImGui::NewFrame();

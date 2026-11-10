@@ -9,6 +9,7 @@
 #if defined(PS2X_HAS_PARALLEL_GS)
 
 #include "runtime/gs/gs_parallel_backend.h"
+#include "runtime/gs/gs_pcsx2_backend.h"
 #include "runtime/host_display.h"
 #include "imgui.h"
 
@@ -920,6 +921,14 @@ std::atomic<bool> g_ps2xScreenshotRequested{false};
 // after its next vsync and stores the new rate, which is shown on screen for a moment.
 std::atomic<bool> g_ps2xSsaaCycleRequested{false};
 std::atomic<int> g_ps2xSsaaRate{1};
+// Finished-frame presentation. A game override that knows when the game has finished a frame calls
+// PS2Runtime::gs().latchHostPresentationFrame() at that moment and stores the vsync tick here (plus
+// one, so 0 means never). Some games draw into the buffer that is shown and start the next frame
+// before the vertical blank, so the frame is only complete right after it is finished. While such
+// frames keep coming, UploadFrame does not latch on its own at each vsync; it does again once none
+// has come for kFinishedFrameTimeoutTicks (a loading screen that never finishes a frame, say).
+std::atomic<uint64_t> g_ps2xFinishedFrameTick{0};
+static constexpr uint64_t kFinishedFrameTimeoutTicks = 30;
 
 // Writes tightly packed RGBA rows as a 24-bit bottom-up BMP.
 static bool WriteFrameBmp(const char *path, const uint8_t *rgba, uint32_t width, uint32_t height)
@@ -956,16 +965,57 @@ static bool WriteFrameBmp(const char *path, const uint8_t *rgba, uint32_t width,
     return std::fclose(f) == 0 && ok;
 }
 
-// F12: saves the next frame the game shows as screenshots/screenshotNNN.png in the working
-// directory. Like raylib's own F12, numbering restarts at 000 each run, overwriting older shots.
-static void SaveScreenshot(const uint8_t *rgba, uint32_t width, uint32_t height)
+// F12 saves screenshots/screenshotNNN.png in the working directory. Like raylib's own F12, numbering
+// restarts at 000 each run, overwriting older shots.
+static std::filesystem::path NextScreenshotPath()
 {
     static int s_counter = 0;
     std::error_code ec;
     std::filesystem::create_directories("screenshots", ec);
     char name[32];
     std::snprintf(name, sizeof(name), "screenshot%03d.png", s_counter++);
-    const std::filesystem::path path = std::filesystem::path("screenshots") / name;
+    return std::filesystem::absolute(std::filesystem::path("screenshots") / name, ec);
+}
+
+// Optional headless frame capture: PS2X_DUMP_FRAMES_DIR=<dir>, PS2X_DUMP_FRAMES_EVERY=<vsync ticks,
+// default 60>, PS2X_DUMP_FRAMES_AFTER=<seconds since start>, PS2X_DUMP_FRAMES_COUNT=<n>.
+struct FrameDumpSettings
+{
+    const char *dir = std::getenv("PS2X_DUMP_FRAMES_DIR");
+    uint64_t every = []()
+    {
+        const char *e = std::getenv("PS2X_DUMP_FRAMES_EVERY");
+        const long long v = e ? std::atoll(e) : 60;
+        return static_cast<uint64_t>(v > 0 ? v : 60);
+    }();
+    double after = []()
+    {
+        const char *e = std::getenv("PS2X_DUMP_FRAMES_AFTER");
+        return e ? std::atof(e) : 0.0;
+    }();
+    uint64_t left = []()
+    {
+        const char *e = std::getenv("PS2X_DUMP_FRAMES_COUNT");
+        return e ? static_cast<uint64_t>(std::atoll(e)) : ~0ull;
+    }();
+
+    bool due(uint64_t frameIndex) const
+    {
+        return dir && left > 0 && (frameIndex % every) == 0u &&
+               std::chrono::duration<double>(std::chrono::steady_clock::now() - g_processStart).count() >= after;
+    }
+};
+
+static FrameDumpSettings &FrameDumps()
+{
+    static FrameDumpSettings s_settings;
+    return s_settings;
+}
+
+static void SaveScreenshot(const uint8_t *rgba, uint32_t width, uint32_t height)
+{
+    std::error_code ec;
+    const std::filesystem::path path = NextScreenshotPath();
     std::vector<uint8_t> opaque(rgba, rgba + static_cast<size_t>(width) * height * 4u);
     for (size_t i = 3; i < opaque.size(); i += 4)
         opaque[i] = 0xFF;
@@ -1004,9 +1054,12 @@ static void UploadFrame(HostFrameTarget &tex, PS2Runtime *rt, uint32_t &outWidth
 
     const uint64_t currentTick = rt->eeScheduler().currentVSyncTick();
     const bool needsLatch = !s_hasLatchedInitialFrame || currentTick != s_lastPresentationTick;
+    const uint64_t finishedFrameTick = g_ps2xFinishedFrameTick.load(std::memory_order_acquire);
+    const bool gamePresents = finishedFrameTick != 0u && currentTick + 1u < finishedFrameTick + kFinishedFrameTimeoutTicks;
     if (needsLatch)
     {
-        rt->gs().latchHostPresentationFrame();
+        if (!gamePresents)
+            rt->gs().latchHostPresentationFrame();
         s_lastPresentationTick = currentTick;
         s_hasLatchedInitialFrame = true;
     }
@@ -1031,6 +1084,29 @@ static void UploadFrame(HostFrameTarget &tex, PS2Runtime *rt, uint32_t &outWidth
             rt->requestStop();
         }
     }
+
+#if defined(PS2X_HAS_PARALLEL_GS)
+    // With PCSX2's GS the picture never comes back to the CPU: PCSX2 saves it itself, as a PNG at
+    // its internal resolution, when it presents the next frame.
+    if (HostDisplay::externalPresenter())
+    {
+        if (g_ps2xScreenshotRequested.exchange(false, std::memory_order_acq_rel))
+        {
+            const std::filesystem::path path = NextScreenshotPath();
+            ps2xPcsx2QueueSnapshot(path.string().c_str());
+            std::cerr << "[ps2xRuntime] saving screenshot " << path.string() << std::endl;
+        }
+        FrameDumpSettings &dumps = FrameDumps();
+        if (dumps.due(frameIndex))
+        {
+            char path[1024];
+            std::snprintf(path, sizeof(path), "%s/frame_%06llu.png", dumps.dir,
+                          static_cast<unsigned long long>(frameIndex));
+            ps2xPcsx2QueueSnapshot(std::filesystem::absolute(path).string().c_str());
+            --dumps.left;
+        }
+    }
+#endif
 
     s_scratch.clear();
     uint32_t width = 0u;
@@ -1088,37 +1164,16 @@ static void UploadFrame(HostFrameTarget &tex, PS2Runtime *rt, uint32_t &outWidth
 #if !defined(PS2X_HAS_PARALLEL_GS)
     std::fill(s_uploadBuffer.begin(), s_uploadBuffer.end(), 0u);
 #endif
-    // Optional headless frame capture: PS2X_DUMP_FRAMES_DIR=<dir>, PS2X_DUMP_FRAMES_EVERY=<vsync ticks, default 60>
     {
-        static const char *s_dumpDir = std::getenv("PS2X_DUMP_FRAMES_DIR");
-        static const uint64_t s_dumpEvery = []()
-        {
-            const char *e = std::getenv("PS2X_DUMP_FRAMES_EVERY");
-            const long long v = e ? std::atoll(e) : 60;
-            return static_cast<uint64_t>(v > 0 ? v : 60);
-        }();
-        // PS2X_DUMP_FRAMES_AFTER=<seconds since start>, PS2X_DUMP_FRAMES_COUNT=<n>: dump only a window.
-        static const double s_dumpAfter = []()
-        {
-            const char *e = std::getenv("PS2X_DUMP_FRAMES_AFTER");
-            return e ? std::atof(e) : 0.0;
-        }();
-        static uint64_t s_dumpLeft = []()
-        {
-            const char *e = std::getenv("PS2X_DUMP_FRAMES_COUNT");
-            return e ? static_cast<uint64_t>(std::atoll(e)) : ~0ull;
-        }();
-        const bool dumpWindow = s_dumpLeft > 0 &&
-                                std::chrono::duration<double>(std::chrono::steady_clock::now() - g_processStart).count() >= s_dumpAfter;
-        if (s_dumpDir && dumpWindow && !s_scratch.empty() && width != 0u && height != 0u &&
-            (frameIndex % s_dumpEvery) == 0u &&
+        FrameDumpSettings &dumps = FrameDumps();
+        if (dumps.due(frameIndex) && !s_scratch.empty() && width != 0u && height != 0u &&
             s_scratch.size() >= static_cast<size_t>(width) * height * 4u)
         {
             char path[1024];
-            std::snprintf(path, sizeof(path), "%s/frame_%06llu.bmp", s_dumpDir,
+            std::snprintf(path, sizeof(path), "%s/frame_%06llu.bmp", dumps.dir,
                           static_cast<unsigned long long>(frameIndex));
             if (WriteFrameBmp(path, s_scratch.data(), width, height))
-                --s_dumpLeft;
+                --dumps.left;
         }
     }
     if (g_ps2xScreenshotRequested.load(std::memory_order_acquire) && width != 0u && height != 0u &&
@@ -1373,7 +1428,12 @@ bool PS2Runtime::syncCoreSubsystems()
 
         }
 
-        if (useParallel && HostDisplay::get())
+        if (useParallel && HostDisplay::externalPresenter())
+        {
+            // PS2X_GS_BACKEND=pcsx2: PCSX2's GS draws into the window instead.
+            m_gs.setRasterBackend(std::make_unique<GSPcsx2Backend>());
+        }
+        else if (useParallel && HostDisplay::get())
 
         {
 
@@ -1561,6 +1621,9 @@ bool PS2Runtime::initialize(const char *title)
 bool PS2Runtime::loadELF(const std::string &elfPath)
 {
     configureIoPathsFromElf(elfPath);
+#if defined(PS2X_HAS_PARALLEL_GS)
+    ps2xSetGameElfName(std::filesystem::path(elfPath).filename().string().c_str());
+#endif
 
     std::ifstream file(elfPath, std::ios::binary);
     if (!file)
@@ -3493,12 +3556,14 @@ void PS2Runtime::run()
             }
             char text[32];
             std::snprintf(text, sizeof(text), "VSync/s: %.1f", s_vsyncsPerSecond);
+            const ImU32 rateColor = s_vsyncsPerSecond >= 59.0 ? IM_COL32(0, 228, 48, 255) : IM_COL32(253, 249, 0, 255);
             ImDrawList *overlay = ImGui::GetForegroundDrawList();
             overlay->AddText(ImGui::GetFont(), 20.0f, ImVec2(9.0f, 9.0f), IM_COL32(0, 0, 0, 255), text);
-            overlay->AddText(ImGui::GetFont(), 20.0f, ImVec2(8.0f, 8.0f),
-                             s_vsyncsPerSecond >= 59.0 ? IM_COL32(0, 228, 48, 255) : IM_COL32(253, 249, 0, 255), text);
+            overlay->AddText(ImGui::GetFont(), 20.0f, ImVec2(8.0f, 8.0f), rateColor, text);
 
-            // After F5 changes the super-sampling rate, show it for two seconds.
+            // After F5 changes the resolution, show it for two seconds. With PCSX2's GS, F5 steps
+            // its internal resolution; with parallel-gs, the super-sampling rate.
+            const bool pcsx2 = HostDisplay::externalPresenter();
             static int s_shownRate = g_ps2xSsaaRate.load(std::memory_order_relaxed);
             static double s_rateShownUntil = 0.0;
             const int rate = g_ps2xSsaaRate.load(std::memory_order_relaxed);
@@ -3507,12 +3572,19 @@ void PS2Runtime::run()
                 s_shownRate = rate;
                 s_rateShownUntil = now + 2.0;
             }
+            char notice[40] = "";
             if (now < s_rateShownUntil)
             {
-                char ssaa[32];
-                std::snprintf(ssaa, sizeof(ssaa), "Super-sampling: %dx", rate);
-                overlay->AddText(ImGui::GetFont(), 20.0f, ImVec2(9.0f, 33.0f), IM_COL32(0, 0, 0, 255), ssaa);
-                overlay->AddText(ImGui::GetFont(), 20.0f, ImVec2(8.0f, 32.0f), IM_COL32(255, 255, 255, 255), ssaa);
+                std::snprintf(notice, sizeof(notice), pcsx2 ? "Internal resolution: %dx" : "Super-sampling: %dx", rate);
+                overlay->AddText(ImGui::GetFont(), 20.0f, ImVec2(9.0f, 33.0f), IM_COL32(0, 0, 0, 255), notice);
+                overlay->AddText(ImGui::GetFont(), 20.0f, ImVec2(8.0f, 32.0f), IM_COL32(255, 255, 255, 255), notice);
+            }
+            // PCSX2 draws the picture and this frame's ImGui output is not shown, so the same lines
+            // go to its overlay instead.
+            if (pcsx2)
+            {
+                ps2xPcsx2SetOverlay(0u, text, rateColor);
+                ps2xPcsx2SetOverlay(1u, notice, IM_COL32(255, 255, 255, 255));
             }
         }
         if (m_debugUiInitialized && m_debugUiDrawCallback)
