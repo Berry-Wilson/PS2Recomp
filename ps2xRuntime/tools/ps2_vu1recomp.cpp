@@ -685,6 +685,128 @@ static const uint32_t vu1MacSignBits[16] = {0x00u, 0x80u, 0x40u, 0xC0u, 0x20u, 0
         return false;
     }
 
+    // Lower special2 ops that only move data (no FDIV/EFU queue, no XGKICK), mirroring execLower.
+    // Stores are written at once, as for SQ: a queued store commits before anything else reads
+    // data memory.
+    bool emitInlineLowerSpecial2(std::ostream &o, uint32_t lower)
+    {
+        const unsigned funct2 = (lower & 0x3u) | ((lower >> 4) & 0x7Cu);
+        const unsigned dest = (lower >> 21) & 0xFu;
+        const unsigned ft = (lower >> 16) & 0x1Fu, fs = (lower >> 11) & 0x1Fu;
+        const unsigned vit = (lower >> 16) & 0xFu, vis = (lower >> 11) & 0xFu;
+        auto lanes = [&](const std::string &dst, const std::string &src)
+        {
+            for (uint32_t c = 0; c < 4u; ++c)
+                if ((dest & laneForComponent(c)) != 0u)
+                    o << " " << dst << "[" << c << "] = " << src << "[" << c << "];";
+        };
+        auto vfDst = "st.vf[" + std::to_string(ft) + "]";
+        auto addressFrom = [&](unsigned vi)
+        {
+            o << "        const uint32_t ds = A::vuDataSize(vu);\n";
+            o << "        const uint32_t addr = (static_cast<uint32_t>(static_cast<uint16_t>(st.vi[" << vi << "])) * 16u) & (ds - 1u);\n";
+        };
+        auto storeLanes = [&]()
+        {
+            for (uint32_t c = 0; c < 4u; ++c)
+                if ((dest & laneForComponent(c)) != 0u)
+                    o << " std::memcpy(A::vuData(vu) + addr + " << c * 4u << "u, &words[" << c << "], 4);";
+        };
+        auto bumpVi = [&](unsigned vi, int delta)
+        {
+            if (vi != 0u)
+                o << "        st.vi[" << vi << "] = static_cast<int16_t>(st.vi[" << vi << "] + (" << delta << "));\n";
+        };
+        switch (funct2)
+        {
+        case 0x30: // MOVE
+            o << "    { float tmp[4]; std::memcpy(tmp, st.vf[" << fs << "], 16);";
+            lanes(vfDst, "tmp");
+            o << " }\n";
+            return true;
+        case 0x31: // MR32
+            o << "    { const float tmp[4] = {st.vf[" << fs << "][1], st.vf[" << fs << "][2], st.vf[" << fs << "][3], st.vf[" << fs
+              << "][0]};";
+            lanes(vfDst, "tmp");
+            o << " }\n";
+            return true;
+        case 0x34: // LQI
+        case 0x36: // LQD
+            o << "    { // " << (funct2 == 0x34u ? "LQI" : "LQD") << " inline\n";
+            if (funct2 == 0x36u)
+                bumpVi(vis, -1);
+            addressFrom(vis);
+            o << "        if (addr + 16u <= ds) { float tmp[4]; std::memcpy(tmp, A::vuData(vu) + addr, 16);";
+            lanes(vfDst, "tmp");
+            o << " }\n";
+            if (funct2 == 0x34u)
+                bumpVi(vis, 1);
+            o << "    }\n";
+            return true;
+        case 0x35: // SQI
+        case 0x37: // SQD
+            o << "    { // " << (funct2 == 0x35u ? "SQI" : "SQD") << " inline\n";
+            if (funct2 == 0x37u)
+                bumpVi(vit, -1);
+            addressFrom(vit);
+            o << "        if (addr + 16u <= ds) { uint32_t words[4]; std::memcpy(words, st.vf[" << fs << "], sizeof(words));";
+            storeLanes();
+            o << " }\n";
+            if (funct2 == 0x35u)
+                bumpVi(vit, 1);
+            o << "    }\n";
+            return true;
+        case 0x3B: // WAITQ: the stall terms above already waited for Q
+            return true;
+        case 0x3C: // MTIR: fsf selector in bits 22:21
+            if (vit != 0u)
+                o << "    { uint32_t bits; std::memcpy(&bits, &st.vf[" << fs << "][" << ((lower >> 21) & 3u)
+                  << "], 4); st.vi[" << vit << "] = static_cast<int32_t>(static_cast<int16_t>(bits & 0xFFFFu)); }\n";
+            return true;
+        case 0x3D: // MFIR
+            o << "    { const int32_t v = static_cast<int32_t>(static_cast<int16_t>(st.vi[" << vis
+              << "] & 0xFFFF)); float f; std::memcpy(&f, &v, 4); const float tmp[4] = {f, f, f, f};";
+            lanes(vfDst, "tmp");
+            o << " }\n";
+            return true;
+        case 0x3E: // ILWR
+        {
+            const unsigned comp = (dest & 8u) ? 0u : (dest & 4u) ? 1u : (dest & 2u) ? 2u : 3u;
+            o << "    { // ILWR inline\n";
+            addressFrom(vis);
+            o << "        if (addr + 16u <= ds) { uint32_t v; std::memcpy(&v, A::vuData(vu) + addr + " << comp * 4u << "u, 4);";
+            if (vit != 0u)
+                o << " st.vi[" << vit << "] = static_cast<int32_t>(static_cast<int16_t>(v & 0xFFFFu));";
+            else
+                o << " (void)v;";
+            o << " }\n    }\n";
+            return true;
+        }
+        case 0x3F: // ISWR
+            o << "    { // ISWR inline\n";
+            addressFrom(vis);
+            o << "        if (addr + 16u <= ds) { const uint32_t val = static_cast<uint32_t>(static_cast<uint16_t>(st.vi[" << vit
+              << "] & 0xFFFF)); const uint32_t words[4] = {val, val, val, val};";
+            storeLanes();
+            o << " }\n    }\n";
+            return true;
+        case 0x64: // MFP
+            o << "    { const float tmp[4] = {st.p, st.p, st.p, st.p};";
+            lanes(vfDst, "tmp");
+            o << " }\n";
+            return true;
+        case 0x68: // XTOP
+        case 0x69: // XITOP
+            if (vit != 0u)
+                o << "    st.vi[" << vit << "] = static_cast<int32_t>(st." << (funct2 == 0x68u ? "top" : "itop") << " & 0x3FFu);\n";
+            return true;
+        case 0x7B: // WAITP: the stall terms above already waited for P
+            return true;
+        default:
+            return false;
+        }
+    }
+
     // Inline the hot lower ops, mirroring execLower case by case (same address wrap, same
     // store queue, same branch-VI backup reads). Returns false for anything else.
     bool emitInlineLower(std::ostream &o, uint32_t pc, uint32_t lower)
@@ -789,6 +911,11 @@ static const uint32_t vu1MacSignBits[16] = {0x00u, 0x80u, 0x40u, 0xC0u, 0x20u, 0
             }
             case 0x34: viWrite(vid, s + " & " + t); return true; // IAND
             case 0x35: viWrite(vid, s + " | " + t); return true; // IOR
+            case 0x3C:
+            case 0x3D:
+            case 0x3E:
+            case 0x3F:
+                return emitInlineLowerSpecial2(o, lower);
             default: return false;
             }
         }
