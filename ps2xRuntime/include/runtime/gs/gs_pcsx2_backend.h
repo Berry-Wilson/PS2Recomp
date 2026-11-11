@@ -61,3 +61,12 @@ void ps2xPcsx2SetOverlay(unsigned line, const char *text, uint32_t rgba);
 // Asks PCSX2 to save the next presented frame as a PNG at `path` (absolute), at its internal
 // resolution. Does nothing until the DLL is open.
 void ps2xPcsx2QueueSnapshot(const char *path);
+
+// The game asked the MPEG decoder for a movie picture. PCSX2's GPU renderers can garble movies that
+// double-buffer across render targets of different widths (Drakengard; see docs/movie-corruption.md in
+// the game repo), so while pictures keep coming the movie is drawn with PCSX2's software renderer, as
+// its SoftwareRendererFMV fix does; it switches back once no picture has been asked for in 15
+// vsyncs, a quarter of a second (PCSX2 likewise watches for the decoder going idle). Games need not call
+// sceMpegDelete when a movie ends or is skipped. PS2X_PCSX2_MOVIE_RENDERER=hardware keeps the GPU
+// renderer.
+void ps2xPcsx2NoteMoviePicture();

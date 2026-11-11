@@ -53,6 +53,7 @@ namespace
 		REC_GIF3 = 3, // PATH3
 		REC_SNAP = 4, // path of a PNG to save, with its NUL
 		REC_UPSCALE = 5, // a float: the new internal resolution multiplier
+		REC_SOFTWARE = 6, // an int: 1 to draw with the software renderer, 0 to go back
 	};
 
 	struct Frame
@@ -70,6 +71,7 @@ namespace
 	alignas(64) u8 s_regs_in[0x2000] = {};
 	bool s_open = false;
 	bool s_sys_memory = false; // SysMemory::Allocate() has run
+	bool s_switched_to_software = false; // ps2xgs_set_software_rendering(1) switched the renderer
 
 	// Between the two, under s_q_lock.
 	std::mutex s_q_lock;
@@ -255,6 +257,25 @@ namespace
 					case REC_SNAP:
 						GSQueueSnapshot(std::string(reinterpret_cast<const char *>(p)), 0);
 						break;
+					case REC_SOFTWARE:
+					{
+						int software;
+						std::memcpy(&software, p, sizeof(software));
+						// Only undo a switch made here: a renderer opened as software stays software.
+						if (software && GSIsHardwareRenderer())
+						{
+							GSSetSoftwareRendering(true, EmuConfig.GS.InterlaceMode);
+							s_switched_to_software = true;
+							std::fprintf(stderr, "[ps2x-gs] software renderer for a movie\n");
+						}
+						else if (!software && s_switched_to_software)
+						{
+							GSSetSoftwareRendering(false, EmuConfig.GS.InterlaceMode);
+							s_switched_to_software = false;
+							std::fprintf(stderr, "[ps2x-gs] back to the %s renderer\n", GSIsHardwareRenderer() ? "GPU" : "software");
+						}
+						break;
+					}
 					case REC_UPSCALE:
 					{
 						float upscale;
@@ -591,6 +612,16 @@ PS2XGS_API void ps2xgs_vsync(unsigned field)
 	f->field = field;
 	f->vsync = true;
 	Push(std::move(f));
+}
+
+PS2XGS_API void ps2xgs_set_software_rendering(int software)
+{
+	std::lock_guard<std::mutex> in(s_in_lock);
+	if (s_open)
+	{
+		const int value = software ? 1 : 0;
+		AppendRecord(REC_SOFTWARE, &value, sizeof(value));
+	}
 }
 
 PS2XGS_API void ps2xgs_set_upscale(float upscale)

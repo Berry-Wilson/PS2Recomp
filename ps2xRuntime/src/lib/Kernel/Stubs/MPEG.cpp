@@ -1,6 +1,7 @@
 #include "Common.h"
 #include "MPEG.h"
 #include "runtime/ee_scheduler.h"
+#include "runtime/gs/gs_pcsx2_backend.h"
 
 #if !defined(PS2X_HAS_FFMPEG)
 #define PS2X_HAS_FFMPEG 1
@@ -2440,6 +2441,8 @@ namespace ps2_stubs
 
     void sceMpegGetPicture(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
     {
+        // The renderer may draw movies differently while pictures keep coming.
+        ps2xPcsx2NoteMoviePicture();
         const uint32_t mpegAddr = getRegU32(ctx, 4);
         const uint32_t imageAddr = getRegU32(ctx, 5);
         uint32_t width = kStubMovieWidth;

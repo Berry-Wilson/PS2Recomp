@@ -41,6 +41,7 @@ typedef void (*Ps2xGsSetUpscaleFn)(float upscale);
 typedef void (*Ps2xGsSnapshotFn)(const char *path);
 typedef void (*Ps2xGsCloseFn)(void);
 typedef void (*Ps2xGsSetOverlayFn)(unsigned line, const char *text, unsigned rgba);
+typedef void (*Ps2xGsSetSoftwareRenderingFn)(int software);
 
 // Returns 1 on success.
 // int ps2xgs_open(const Ps2xGsConfig *config);
@@ -60,6 +61,9 @@ typedef void (*Ps2xGsSetOverlayFn)(unsigned line, const char *text, unsigned rgb
 // Text drawn over the picture in the top-left corner, one line per slot (0-3), in the runtime's
 // overlay style (20 px, with a shadow). rgba is 0xAABBGGRR. Empty or null text clears the line.
 // void ps2xgs_set_overlay(unsigned line, const char *text, unsigned rgba);
+// 1: draw with PCSX2's software renderer from the next vsync on, 0: back to the renderer it was opened
+// with. Used while a movie plays (PCSX2's SoftwareRendererFMV fix). No effect if opened as software.
+// void ps2xgs_set_software_rendering(int software);
 
 #ifdef __cplusplus
 }
