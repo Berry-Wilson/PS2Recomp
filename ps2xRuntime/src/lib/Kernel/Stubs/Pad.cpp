@@ -1,5 +1,9 @@
 #include "Common.h"
 #include "Pad.h"
+#include <chrono>
+#include <cstdio>
+#include <cstdlib>
+#include <vector>
 
 namespace ps2_stubs
 {
@@ -289,6 +293,107 @@ namespace ps2_stubs
             data[19] = pressureValue(state, portState, kPadBtnR2);
         }
 
+        // Input recording and replay for port 0, keyed by the number of pad reads (one per game
+        // frame), so a replay stays in step with the game's frames whatever the host speed.
+        // PS2X_INPUT_RECORD=<file>: writes "<read> <buttons hex> <lx> <ly> <rx> <ry> <seconds>" each
+        //   time the pad state the game sees changes.
+        // PS2X_INPUT_REPLAY=<file>: plays such a file back instead of live input, then hands control back.
+        struct InputLog
+        {
+            struct Sample
+            {
+                uint64_t read;
+                PadInputState state;
+            };
+            std::FILE *record = nullptr;
+            std::vector<Sample> replay;
+            size_t replayPos = 0;
+            uint64_t reads = 0;
+            bool haveLast = false;
+            PadInputState last{};
+            std::chrono::steady_clock::time_point start = std::chrono::steady_clock::now();
+
+            InputLog()
+            {
+                if (const char *path = std::getenv("PS2X_INPUT_REPLAY"))
+                {
+                    if (std::FILE *f = std::fopen(path, "r"))
+                    {
+                        char line[256];
+                        while (std::fgets(line, sizeof(line), f))
+                        {
+                            unsigned long long read = 0;
+                            unsigned int buttons = 0, lx = 0, ly = 0, rx = 0, ry = 0;
+                            if (std::sscanf(line, "%llu %x %u %u %u %u", &read, &buttons, &lx, &ly, &rx, &ry) == 6)
+                            {
+                                PadInputState st;
+                                st.buttons = static_cast<uint16_t>(buttons);
+                                st.lx = static_cast<uint8_t>(lx);
+                                st.ly = static_cast<uint8_t>(ly);
+                                st.rx = static_cast<uint8_t>(rx);
+                                st.ry = static_cast<uint8_t>(ry);
+                                replay.push_back({read, st});
+                            }
+                        }
+                        std::fclose(f);
+                        std::fprintf(stderr, "[input] replaying %zu pad changes from %s\n", replay.size(), path);
+                    }
+                    else
+                        std::fprintf(stderr, "[input] cannot open replay file %s\n", path);
+                }
+                if (const char *path = std::getenv("PS2X_INPUT_RECORD"))
+                {
+                    record = std::fopen(path, "w");
+                    if (record)
+                    {
+                        std::fprintf(record, "# ps2x pad input v1: read buttons(hex, active low) lx ly rx ry seconds\n");
+                        std::fflush(record);
+                        std::fprintf(stderr, "[input] recording pad input to %s\n", path);
+                    }
+                    else
+                        std::fprintf(stderr, "[input] cannot create record file %s\n", path);
+                }
+            }
+
+            // Replays (while a recording covers this read), then records the state the game will see.
+            void apply(PadInputState &state)
+            {
+                if (replayPos < replay.size())
+                {
+                    while (replayPos + 1 < replay.size() && replay[replayPos + 1].read <= reads)
+                        ++replayPos;
+                    if (replayPos + 1 == replay.size() && reads > replay[replayPos].read)
+                    {
+                        std::fprintf(stderr, "[input] replay finished at pad read %llu; live input from here\n",
+                                     static_cast<unsigned long long>(reads));
+                        replayPos = replay.size();
+                    }
+                    else if (replay[replayPos].read <= reads)
+                        state = replay[replayPos].state;
+                }
+                if (record)
+                {
+                    if (!haveLast || state.buttons != last.buttons || state.lx != last.lx || state.ly != last.ly ||
+                        state.rx != last.rx || state.ry != last.ry)
+                    {
+                        const double seconds = std::chrono::duration<double>(std::chrono::steady_clock::now() - start).count();
+                        std::fprintf(record, "%llu %04x %u %u %u %u %.3f\n", static_cast<unsigned long long>(reads), state.buttons,
+                                     state.lx, state.ly, state.rx, state.ry, seconds);
+                        std::fflush(record);
+                        last = state;
+                        haveLast = true;
+                    }
+                }
+                ++reads;
+            }
+        };
+
+        InputLog &inputLog()
+        {
+            static InputLog log;
+            return log;
+        }
+
         bool readPadPortData(int port, int slot, PS2Runtime *runtime, uint8_t *outData, uint32_t dataAddr)
         {
             if (!outData)
@@ -337,6 +442,9 @@ namespace ps2_stubs
                     applyKeyboardState(state, portState.analogMode);
                 }
             }
+
+            if (port == 0 && slot == 0)
+                inputLog().apply(state);
 
             fillPadStatus(outData, state, portState);
 
