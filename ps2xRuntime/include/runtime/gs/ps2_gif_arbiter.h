@@ -35,6 +35,8 @@ public:
     void submit(GifPathId pathId, const uint8_t *data, uint32_t sizeBytes, bool path2DirectHl = false);
 
     void drain();
+    // submit() followed by drain(), without copying the packet when nothing else is queued.
+    void submitAndDrain(GifPathId pathId, const uint8_t *data, uint32_t sizeBytes, bool path2DirectHl = false);
     bool empty() const { return m_count == 0u; }
 
 private:

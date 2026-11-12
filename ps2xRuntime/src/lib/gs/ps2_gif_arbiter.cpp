@@ -32,6 +32,20 @@ void GifArbiter::submit(GifPathId pathId, const uint8_t *data, uint32_t sizeByte
     pkt.data.assign(data, data + sizeBytes);
 }
 
+void GifArbiter::submitAndDrain(GifPathId pathId, const uint8_t *data, uint32_t sizeBytes, bool path2DirectHl)
+{
+    if (!data || sizeBytes < 16 || !m_processFn)
+        return;
+    // A single packet has nothing to be ordered against: hand the caller's buffer straight on.
+    if (m_count == 0u)
+    {
+        m_processFn(pathId, data, sizeBytes);
+        return;
+    }
+    submit(pathId, data, sizeBytes, path2DirectHl);
+    drain();
+}
+
 void GifArbiter::drain()
 {
     if (!m_processFn)
