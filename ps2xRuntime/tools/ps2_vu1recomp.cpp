@@ -745,7 +745,7 @@ static const uint32_t vu1MacSignBits[16] = {0x00u, 0x80u, 0x40u, 0xC0u, 0x20u, 0
             return true;
         case 0x35: // SQI
         case 0x37: // SQD
-            o << "    { // " << (funct2 == 0x35u ? "SQI" : "SQD") << " inline\n";
+            o << "    { // " << (funct2 == 0x35u ? "SQI" : "SQD") << " inline\n        A::xgkickBeforeStore(vu);\n";
             if (funct2 == 0x37u)
                 bumpVi(vit, -1);
             addressFrom(vit);
@@ -783,7 +783,7 @@ static const uint32_t vu1MacSignBits[16] = {0x00u, 0x80u, 0x40u, 0xC0u, 0x20u, 0
             return true;
         }
         case 0x3F: // ISWR
-            o << "    { // ISWR inline\n";
+            o << "    { // ISWR inline\n        A::xgkickBeforeStore(vu);\n";
             addressFrom(vis);
             o << "        if (addr + 16u <= ds) { const uint32_t val = static_cast<uint32_t>(static_cast<uint16_t>(st.vi[" << vit
               << "] & 0xFFFF)); const uint32_t words[4] = {val, val, val, val};";
@@ -839,7 +839,7 @@ static const uint32_t vu1MacSignBits[16] = {0x00u, 0x80u, 0x40u, 0xC0u, 0x20u, 0
             o << " }\n    }\n";
             return true;
         case 0x01: // SQ
-            o << "    { // SQ inline\n";
+            o << "    { // SQ inline\n        A::xgkickBeforeStore(vu);\n";
             address(vit);
             o << "        if (addr + 16u <= ds) { uint32_t words[4]; std::memcpy(words, st.vf[" << lis
               << "], sizeof(words));";
@@ -865,7 +865,7 @@ static const uint32_t vu1MacSignBits[16] = {0x00u, 0x80u, 0x40u, 0xC0u, 0x20u, 0
             return true;
         }
         case 0x05: // ISW
-            o << "    { // ISW inline\n";
+            o << "    { // ISW inline\n        A::xgkickBeforeStore(vu);\n";
             address(vis);
             o << "        if (addr + 16u <= ds) { const uint32_t val = static_cast<uint32_t>(static_cast<uint16_t>(st.vi[" << vit
               << "] & 0xFFFF));";
@@ -1206,7 +1206,7 @@ static const uint32_t vu1MacSignBits[16] = {0x00u, 0x80u, 0x40u, 0xC0u, 0x20u, 0
             o << "    else st.ebit = true;\n";
         else if (haltBranchPossible)
             o << "    else if (dHalt || tHalt) { st.haltAfterDelaySlot = true; A::pendingHaltD(vu) = dHalt; A::pendingHaltT(vu) = tHalt; }\n";
-        o << "    if (A::xgkickActive(vu)) A::advanceOneCycle(vu); else { ++cyc; A::commitReadyPipelines(vu); }\n";
+        o << "    ++cyc; A::commitReadyPipelines(vu);\n";
         o << "    if (ended) return Vu1CompiledResult::Ended;\n";
         if (compiled.count(next) != 0u && chunkOf(next) == chunkOf(pc))
             o << "    if (st.pc == " << next << "u) goto " << label(next) << ";\n";

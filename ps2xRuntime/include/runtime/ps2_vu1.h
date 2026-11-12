@@ -189,6 +189,9 @@ private:
         uint32_t currentTagEnd = 0;
         uint32_t cycleCredit = 0;
         uint64_t issueCycle = 0;
+        // Cycle through which PATH1 progress has been applied. Compiled code advances it lazily
+        // (catchUpXgkick) instead of every cycle; see catchUpXgkick for where that is required.
+        uint64_t progressCycle = 0;
         bool active = false;
         bool currentTagEop = false;
     };
@@ -300,6 +303,7 @@ private:
     void advanceTo(uint64_t targetCycle);
     void flushPipelines();
     void progressXgkick();
+    void catchUpXgkick(uint64_t targetCycle);
     void finishXgkick();
     uint64_t calculatePairReadyCycle(const DecodedInstructionPair &decoded) const;
     void markPairWrites(const DecodedInstructionPair &decoded);

@@ -185,14 +185,13 @@ public:
         vu.m_nextCommitCycle = next;
     }
     PS2X_VU1_FORCEINLINE static void advanceTo(VU1Interpreter &vu, uint64_t target) { vu.advanceTo(target); }
-    // Same steps as VU1Interpreter::advanceOneCycle, inlined.
+    // Same steps as VU1Interpreter::advanceOneCycle, inlined, except that PATH1 (XGKICK) is
+    // advanced lazily: see xgkickActive / xgkickBeforeStore and VU1Interpreter::catchUpXgkick.
     PS2X_VU1_FORCEINLINE static void advanceOneCycle(VU1Interpreter &vu)
     {
         ++vu.m_cycle;
         vu.m_state.cycles = vu.m_cycle;
         commitReadyPipelines(vu);
-        if (vu.m_xgkick.active)
-            vu.progressXgkick();
     }
     PS2X_VU1_FORCEINLINE static uint64_t pairReadyCycle(const VU1Interpreter &vu, const Decoded &decoded) { return vu.calculatePairReadyCycle(decoded); }
     PS2X_VU1_FORCEINLINE static void markPairWrites(VU1Interpreter &vu, const Decoded &decoded) { vu.markPairWrites(decoded); }
@@ -285,7 +284,21 @@ public:
         }
         return ready;
     }
-    PS2X_VU1_FORCEINLINE static bool xgkickActive(const VU1Interpreter &vu) { return vu.m_xgkick.active; }
+    // Whether PATH1 is still sending the last XGKICK's packet as of the current cycle.
+    PS2X_VU1_FORCEINLINE static bool xgkickActive(VU1Interpreter &vu)
+    {
+        if (!vu.m_xgkick.active)
+            return false;
+        vu.catchUpXgkick(vu.m_cycle);
+        return vu.m_xgkick.active;
+    }
+    // Compiled stores write VU data at once (where the interpreter queues them for the next
+    // cycle): PATH1 must first have read everything it would have read by then.
+    PS2X_VU1_FORCEINLINE static void xgkickBeforeStore(VU1Interpreter &vu)
+    {
+        if (vu.m_xgkick.active)
+            vu.catchUpXgkick(vu.m_cycle);
+    }
     PS2X_VU1_FORCEINLINE static bool &pendingHaltD(VU1Interpreter &vu) { return vu.m_pendingHaltD; }
     PS2X_VU1_FORCEINLINE static bool &pendingHaltT(VU1Interpreter &vu) { return vu.m_pendingHaltT; }
 

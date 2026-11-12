@@ -236,6 +236,7 @@ void VU1Interpreter::resetScheduler()
     m_xgkick.currentTagEnd = 0u;
     m_xgkick.cycleCredit = 0u;
     m_xgkick.issueCycle = 0u;
+    m_xgkick.progressCycle = 0u;
     m_xgkick.active = false;
     m_xgkick.currentTagEop = false;
     m_vfReady = {};
@@ -1016,6 +1017,9 @@ void VU1Interpreter::commitReadyPipelinesNow()
         }
         if (m_activeVuData && store.address + 16u <= m_activeVuDataSize)
         {
+            // Stores land at the start of a cycle, before PATH1 reads its qword for that cycle.
+            if (m_xgkick.active && m_cycle > 0u)
+                catchUpXgkick(m_cycle - 1u);
             uint32_t oldWords[4]{};
             std::memcpy(oldWords, m_activeVuData + store.address, sizeof(oldWords));
             for (uint32_t component = 0; component < 4u; ++component)
@@ -1091,12 +1095,49 @@ void VU1Interpreter::commitReadyPipelinesNow()
 
 void VU1Interpreter::progressXgkick()
 {
+    catchUpXgkick(m_cycle);
+}
+
+// PATH1 moves one qword every two cycles. Applying several cycles at once gives the same packet
+// as stepping them one by one as long as nothing writes VU data memory in between: callers catch
+// up before a store becomes visible (commitReadyPipelinesNow, compiled stores), before asking
+// whether PATH1 is still busy, and when a run returns.
+void VU1Interpreter::catchUpXgkick(uint64_t targetCycle)
+{
     if (!m_xgkick.active || !m_activeVuData || m_activeVuDataSize == 0u)
         return;
+    if (targetCycle <= m_xgkick.progressCycle)
+        return;
 
-    ++m_xgkick.cycleCredit;
+    const uint64_t elapsed = targetCycle - m_xgkick.progressCycle;
+    m_xgkick.progressCycle = targetCycle;
+    // More credit than a whole packet buffer needs is never used.
+    constexpr uint64_t kMaxCredit = 2ull * (XgkickPipeline::kBufferSize / 16u) + 2u;
+    m_xgkick.cycleCredit = static_cast<uint32_t>(std::min<uint64_t>(m_xgkick.cycleCredit + elapsed, kMaxCredit));
     while (m_xgkick.active && m_xgkick.cycleCredit >= 2u)
     {
+        // Inside a GIFtag's data, copy every due qword but the last as one span; the per-qword
+        // step below takes the last one, so tag-end and EOP handling are unchanged. currentTagEnd
+        // was bounds-checked against the packet buffer when the tag was read.
+        if (m_xgkick.currentTagEnd != 0u)
+        {
+            const uint32_t remainingQw = (m_xgkick.currentTagEnd - m_xgkick.copiedBytes) / 16u;
+            const uint32_t spanQw = std::min(m_xgkick.cycleCredit / 2u, remainingQw);
+            if (spanQw > 1u)
+            {
+                uint32_t bytes = (spanQw - 1u) * 16u;
+                m_xgkick.cycleCredit -= (spanQw - 1u) * 2u;
+                while (bytes != 0u)
+                {
+                    const uint32_t source = (m_xgkick.sourceAddress + m_xgkick.copiedBytes) % m_activeVuDataSize;
+                    const uint32_t chunk = std::min(bytes, m_activeVuDataSize - source);
+                    std::memcpy(m_xgkick.packet.data() + m_xgkick.copiedBytes, m_activeVuData + source, chunk);
+                    m_xgkick.copiedBytes += chunk;
+                    bytes -= chunk;
+                }
+            }
+        }
+
         m_xgkick.cycleCredit -= 2u;
         if (m_xgkick.copiedBytes > XgkickPipeline::kBufferSize - 16u)
         {
@@ -1204,6 +1245,7 @@ void VU1Interpreter::startXgkick(uint32_t qwordAddress)
     m_xgkick.sourceAddress = sourceAddress;
     m_xgkick.cycleCredit = 1u; // XGKICK's issue cycle counts toward PATH1.
     m_xgkick.issueCycle = m_cycle;
+    m_xgkick.progressCycle = m_cycle;
 }
 
 void VU1Interpreter::advanceOneCycle()
@@ -1917,6 +1959,8 @@ void VU1Interpreter::run(uint8_t *vuCode, uint32_t codeSize,
                     dumpVu1Entry(m_imageHash, vuCode, codeSize, m_state.pc);
                 break;
             }
+            // Compiled code advances PATH1 lazily; bring it up to date for everything after.
+            catchUpXgkick(m_cycle);
         }
     }
     while (!programEnded && !compiledStopped && m_cycle < budgetEnd && !m_stopRequested)
