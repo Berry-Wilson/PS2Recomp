@@ -147,6 +147,15 @@ namespace
 {
     bool g_vu1CompiledVerify = false;
     bool g_vu1InVerifyShadow = false; // shadow interpreter run: no compiled code, no XGKICK output
+    // Verify mode: hashes of the XGKICK packets the compiled run and the interpreter shadow send.
+    thread_local std::vector<uint64_t> t_verifyPacketsCompiled, t_verifyPacketsShadow;
+    // PS2X_VU1_STEP_CYCLES=1: advanceTo/flushPipelines step one cycle at a time (as before the
+    // event skipping), for comparisons.
+    const bool g_vu1StepCycles = []
+    {
+        const char *env = std::getenv("PS2X_VU1_STEP_CYCLES");
+        return env && env[0] == '1';
+    }();
     uint32_t g_vu1VerifyMismatches = 0;
     uint64_t g_vu1VerifiedRuns = 0;
 }
@@ -1019,7 +1028,10 @@ void VU1Interpreter::commitReadyPipelinesNow()
         {
             // Stores land at the start of a cycle, before PATH1 reads its qword for that cycle.
             if (m_xgkick.active && m_cycle > 0u)
+            {
                 catchUpXgkick(m_cycle - 1u);
+                m_xgkick.extentValid = false;
+            }
             uint32_t oldWords[4]{};
             std::memcpy(oldWords, m_activeVuData + store.address, sizeof(oldWords));
             for (uint32_t component = 0; component < 4u; ++component)
@@ -1114,56 +1126,39 @@ void VU1Interpreter::catchUpXgkick(uint64_t targetCycle)
     // More credit than a whole packet buffer needs is never used.
     constexpr uint64_t kMaxCredit = 2ull * (XgkickPipeline::kBufferSize / 16u) + 2u;
     m_xgkick.cycleCredit = static_cast<uint32_t>(std::min<uint64_t>(m_xgkick.cycleCredit + elapsed, kMaxCredit));
+
+    // VU data memory sizes are powers of two; wrap with a mask instead of a division per qword.
+    const uint32_t size = m_activeVuDataSize;
+    const bool pow2 = (size & (size - 1u)) == 0u;
+    auto wrap = [&](uint32_t address) { return pow2 ? (address & (size - 1u)) : (address % size); };
+    // Copies `bytes` (a multiple of 16) from the packet's source in VU memory.
+    auto copy = [&](uint32_t bytes)
+    {
+        while (bytes != 0u)
+        {
+            const uint32_t source = wrap(m_xgkick.sourceAddress + m_xgkick.copiedBytes);
+            const uint32_t chunk = std::min(bytes, size - source);
+            std::memcpy(m_xgkick.packet.data() + m_xgkick.copiedBytes, m_activeVuData + source, chunk);
+            m_xgkick.copiedBytes += chunk;
+            bytes -= chunk;
+        }
+    };
+
+    // One qword per two cycles: one step per GIFtag (the tag, then as much of its data as is due).
     while (m_xgkick.active && m_xgkick.cycleCredit >= 2u)
     {
-        // Inside a GIFtag's data, copy every due qword but the last as one span; the per-qword
-        // step below takes the last one, so tag-end and EOP handling are unchanged. currentTagEnd
-        // was bounds-checked against the packet buffer when the tag was read.
-        if (m_xgkick.currentTagEnd != 0u)
-        {
-            const uint32_t remainingQw = (m_xgkick.currentTagEnd - m_xgkick.copiedBytes) / 16u;
-            const uint32_t spanQw = std::min(m_xgkick.cycleCredit / 2u, remainingQw);
-            if (spanQw > 1u)
-            {
-                uint32_t bytes = (spanQw - 1u) * 16u;
-                m_xgkick.cycleCredit -= (spanQw - 1u) * 2u;
-                while (bytes != 0u)
-                {
-                    const uint32_t source = (m_xgkick.sourceAddress + m_xgkick.copiedBytes) % m_activeVuDataSize;
-                    const uint32_t chunk = std::min(bytes, m_activeVuDataSize - source);
-                    std::memcpy(m_xgkick.packet.data() + m_xgkick.copiedBytes, m_activeVuData + source, chunk);
-                    m_xgkick.copiedBytes += chunk;
-                    bytes -= chunk;
-                }
-            }
-        }
-
-        m_xgkick.cycleCredit -= 2u;
-        if (m_xgkick.copiedBytes > XgkickPipeline::kBufferSize - 16u)
-        {
-            reportReservedInstruction(false, 0xFFFFFFFBu);
-            m_xgkick.active = false;
-            return;
-        }
-
-        const uint32_t qwordOffset = m_xgkick.copiedBytes;
-        const uint32_t firstSource = (m_xgkick.sourceAddress + m_xgkick.copiedBytes) % m_activeVuDataSize;
-        if (firstSource + 16u <= m_activeVuDataSize)
-        {
-            std::memcpy(m_xgkick.packet.data() + m_xgkick.copiedBytes, m_activeVuData + firstSource, 16u);
-        }
-        else
-        {
-            for (uint32_t i = 0; i < 16u; ++i)
-            {
-                const uint32_t source = (m_xgkick.sourceAddress + m_xgkick.copiedBytes + i) % m_activeVuDataSize;
-                m_xgkick.packet[m_xgkick.copiedBytes + i] = m_activeVuData[source];
-            }
-        }
-        m_xgkick.copiedBytes += 16u;
-
         if (m_xgkick.currentTagEnd == 0u)
         {
+            if (m_xgkick.copiedBytes > XgkickPipeline::kBufferSize - 16u)
+            {
+                reportReservedInstruction(false, 0xFFFFFFFBu);
+                m_xgkick.active = false;
+                return;
+            }
+            const uint32_t qwordOffset = m_xgkick.copiedBytes;
+            m_xgkick.cycleCredit -= 2u;
+            copy(16u);
+
             uint64_t tagLo = 0;
             std::memcpy(&tagLo, m_xgkick.packet.data() + qwordOffset, sizeof(tagLo));
             const uint32_t nloop = static_cast<uint32_t>(tagLo & 0x7FFFu);
@@ -1197,6 +1192,14 @@ void VU1Interpreter::catchUpXgkick(uint64_t targetCycle)
             if (m_xgkick.currentTagEop)
                 m_xgkick.totalBytes = m_xgkick.currentTagEnd;
         }
+        else
+        {
+            // currentTagEnd was bounds-checked against the packet buffer when the tag was read.
+            const uint32_t remainingQw = (m_xgkick.currentTagEnd - m_xgkick.copiedBytes) / 16u;
+            const uint32_t qwords = std::min(m_xgkick.cycleCredit / 2u, remainingQw);
+            m_xgkick.cycleCredit -= qwords * 2u;
+            copy(qwords * 16u);
+        }
 
         if (m_xgkick.copiedBytes >= m_xgkick.currentTagEnd)
         {
@@ -1216,6 +1219,13 @@ void VU1Interpreter::finishXgkick()
 {
     if (!m_xgkick.active)
         return;
+    if (g_vu1CompiledVerify)
+    {
+        uint64_t hash = 1469598103934665603ull ^ m_xgkick.totalBytes; // FNV-1a
+        for (uint32_t i = 0; i < m_xgkick.totalBytes; ++i)
+            hash = (hash ^ m_xgkick.packet[i]) * 1099511628211ull;
+        (g_vu1InVerifyShadow ? t_verifyPacketsShadow : t_verifyPacketsCompiled).push_back(hash);
+    }
     if (g_vu1InVerifyShadow)
     {
         m_xgkick.active = false;
@@ -1246,6 +1256,46 @@ void VU1Interpreter::startXgkick(uint32_t qwordAddress)
     m_xgkick.cycleCredit = 1u; // XGKICK's issue cycle counts toward PATH1.
     m_xgkick.issueCycle = m_cycle;
     m_xgkick.progressCycle = m_cycle;
+    m_xgkick.extentValid = false;
+}
+
+void VU1Interpreter::computeXgkickExtent()
+{
+    m_xgkick.extentValid = true;
+    m_xgkick.extentEop = false;
+    m_xgkick.extentBytes = XgkickPipeline::kBufferSize; // conservative unless an EOP tag is found
+    uint32_t offset = 0u;
+    while (offset + 16u <= XgkickPipeline::kBufferSize)
+    {
+        uint64_t tagLo = 0;
+        if (offset + 16u <= m_xgkick.copiedBytes)
+            std::memcpy(&tagLo, m_xgkick.packet.data() + offset, sizeof(tagLo));
+        else
+            std::memcpy(&tagLo, m_activeVuData + (m_xgkick.sourceAddress + offset) % m_activeVuDataSize, sizeof(tagLo));
+        const uint32_t nloop = static_cast<uint32_t>(tagLo & 0x7FFFu);
+        const uint32_t format = static_cast<uint32_t>((tagLo >> 58) & 0x3u);
+        uint32_t nreg = static_cast<uint32_t>((tagLo >> 60) & 0xFu);
+        if (nreg == 0u)
+            nreg = 16u;
+        uint64_t tagBytes = 16u;
+        if (format == 0u)
+            tagBytes += static_cast<uint64_t>(nloop) * nreg * 16u;
+        else if (format == 1u)
+            tagBytes += ((static_cast<uint64_t>(nloop) * nreg + 1u) & ~1ull) * 8u;
+        else if (format == 2u)
+            tagBytes += static_cast<uint64_t>(nloop) * 16u;
+        else
+            return;
+        if (tagBytes > XgkickPipeline::kBufferSize - offset)
+            return;
+        offset += static_cast<uint32_t>(tagBytes);
+        if (((tagLo >> 15) & 1u) != 0u)
+        {
+            m_xgkick.extentBytes = offset;
+            m_xgkick.extentEop = true;
+            return;
+        }
+    }
 }
 
 void VU1Interpreter::advanceOneCycle()
@@ -1258,10 +1308,41 @@ void VU1Interpreter::advanceOneCycle()
     progressXgkick();
 }
 
+// Same as calling advanceOneCycle until targetCycle: between two pipeline events
+// (m_nextCommitCycle) nothing commits, and PATH1 progress is caught up lazily (stores that hit
+// the unread packet catch it up first, see commitReadyPipelinesNow).
 void VU1Interpreter::advanceTo(uint64_t targetCycle)
 {
+    // The verify shadow keeps stepping cycle by cycle, so verify mode checks the skipping too.
+    if (g_vu1InVerifyShadow || g_vu1StepCycles)
+    {
+        while (m_cycle < targetCycle)
+            advanceOneCycle();
+        return;
+    }
     while (m_cycle < targetCycle)
-        advanceOneCycle();
+    {
+        m_cycle = std::min(targetCycle, std::max(m_cycle + 1u, m_nextCommitCycle));
+        m_state.cycles = m_cycle;
+        commitReadyPipelines();
+    }
+    progressXgkick();
+}
+
+// The cycle at which PATH1 finishes the current packet, as stepping it would reach: the issue
+// cycle counts as one credit and each qword takes two, so qword k arrives at issue + 2k - 1.
+// Falls back to the next cycle while the packet's length is not known.
+uint64_t VU1Interpreter::xgkickDoneCycle()
+{
+    catchUpXgkick(m_cycle);
+    if (!m_xgkick.active)
+        return m_cycle;
+    if (!m_xgkick.extentValid)
+        computeXgkickExtent();
+    if (!m_xgkick.extentEop)
+        return m_cycle + 1u;
+    const uint64_t done = m_xgkick.issueCycle + 2ull * (m_xgkick.extentBytes / 16u) - 1u;
+    return std::max(done, m_cycle + 1u);
 }
 
 bool VU1Interpreter::pipelinesPending() const
@@ -1277,7 +1358,12 @@ bool VU1Interpreter::pipelinesPending() const
 void VU1Interpreter::flushPipelines()
 {
     while (pipelinesPending())
-        advanceOneCycle();
+    {
+        if (g_vu1InVerifyShadow || g_vu1StepCycles)
+            advanceOneCycle();
+        else
+            advanceTo(m_xgkick.active ? xgkickDoneCycle() : m_cycle + 1u);
+    }
 }
 
 uint64_t VU1Interpreter::calculatePairReadyCycle(const DecodedInstructionPair &decoded) const
@@ -1942,6 +2028,8 @@ void VU1Interpreter::run(uint8_t *vuCode, uint32_t codeSize,
             if (g_vu1CompiledVerify)
             {
                 verifyShadow = std::make_unique<VU1Interpreter>(*this);
+                t_verifyPacketsCompiled.clear();
+                t_verifyPacketsShadow.clear();
                 verifyDataBefore.assign(vuData, vuData + dataSize);
             }
             const auto fn = reinterpret_cast<Vu1CompiledFn>(m_compiledImage);
@@ -2243,6 +2331,7 @@ void VU1Interpreter::run(uint8_t *vuCode, uint32_t codeSize,
         check(g_vu1VerifyIgnoresCycles || a.cycles == b.cycles, "cycles");
         check(a.ebit == b.ebit && a.branchPending == b.branchPending, "control");
         check(std::memcmp(dataAfter.data(), vuData, dataSize) == 0, "data");
+        check(t_verifyPacketsCompiled == t_verifyPacketsShadow, "packets");
         std::memcpy(vuData, dataAfter.data(), dataSize);
         ++g_vu1VerifiedRuns;
         if (!diff.empty() && g_vu1VerifyMismatches++ < 50)

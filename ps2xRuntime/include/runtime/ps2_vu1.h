@@ -192,6 +192,11 @@ private:
         // Cycle through which PATH1 progress has been applied. Compiled code advances it lazily
         // (catchUpXgkick) instead of every cycle; see catchUpXgkick for where that is required.
         uint64_t progressCycle = 0;
+        // Packet length found by walking its GIFtags (copied part from the packet buffer, the rest
+        // from VU memory), to predict when PATH1 finishes. Any store while PATH1 runs invalidates it.
+        uint32_t extentBytes = 0;
+        bool extentValid = false;
+        bool extentEop = false; // extentBytes ends at an EOP tag (otherwise it is only an upper bound)
         bool active = false;
         bool currentTagEop = false;
     };
@@ -304,6 +309,8 @@ private:
     void flushPipelines();
     void progressXgkick();
     void catchUpXgkick(uint64_t targetCycle);
+    uint64_t xgkickDoneCycle();
+    void computeXgkickExtent();
     void finishXgkick();
     uint64_t calculatePairReadyCycle(const DecodedInstructionPair &decoded) const;
     void markPairWrites(const DecodedInstructionPair &decoded);

@@ -294,10 +294,23 @@ public:
     }
     // Compiled stores write VU data at once (where the interpreter queues them for the next
     // cycle): PATH1 must first have read everything it would have read by then.
-    PS2X_VU1_FORCEINLINE static void xgkickBeforeStore(VU1Interpreter &vu)
+    // Stall target for an XGKICK while the previous packet is still being sent: the cycle PATH1
+    // finishes it (0 when it already has).
+    PS2X_VU1_FORCEINLINE static uint64_t xgkickReadyCycle(VU1Interpreter &vu)
+    {
+        return vu.m_xgkick.active ? vu.xgkickDoneCycle() : 0u;
+    }
+    // Compiled stores write VU data at once (where the interpreter queues them for the next
+    // cycle): PATH1 must first have read everything it would have read by then. Catching up at
+    // every store (not only stores into the unread packet) also keeps packets reaching the GIF
+    // arbiter as early as before, so their order against PATH2/PATH3 is unchanged.
+    PS2X_VU1_FORCEINLINE static void xgkickBeforeStore(VU1Interpreter &vu, uint32_t /*address*/)
     {
         if (vu.m_xgkick.active)
+        {
             vu.catchUpXgkick(vu.m_cycle);
+            vu.m_xgkick.extentValid = false;
+        }
     }
     PS2X_VU1_FORCEINLINE static bool &pendingHaltD(VU1Interpreter &vu) { return vu.m_pendingHaltD; }
     PS2X_VU1_FORCEINLINE static bool &pendingHaltT(VU1Interpreter &vu) { return vu.m_pendingHaltT; }

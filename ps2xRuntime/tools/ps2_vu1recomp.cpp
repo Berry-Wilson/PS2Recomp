@@ -764,11 +764,11 @@ static const uint32_t vu1MacSignBits[16] = {0x00u, 0x80u, 0x40u, 0xC0u, 0x20u, 0
             return true;
         case 0x35: // SQI
         case 0x37: // SQD
-            o << "    { // " << (funct2 == 0x35u ? "SQI" : "SQD") << " inline\n        A::xgkickBeforeStore(vu);\n";
+            o << "    { // " << (funct2 == 0x35u ? "SQI" : "SQD") << " inline\n";
             if (funct2 == 0x37u)
                 bumpVi(vit, -1);
             addressFrom(vit);
-            o << "        if (addr + 16u <= ds) { uint32_t words[4]; std::memcpy(words, st.vf[" << fs << "], sizeof(words));";
+            o << "        if (addr + 16u <= ds) { A::xgkickBeforeStore(vu, addr); uint32_t words[4]; std::memcpy(words, st.vf[" << fs << "], sizeof(words));";
             storeLanes();
             o << " }\n";
             if (funct2 == 0x35u)
@@ -802,9 +802,9 @@ static const uint32_t vu1MacSignBits[16] = {0x00u, 0x80u, 0x40u, 0xC0u, 0x20u, 0
             return true;
         }
         case 0x3F: // ISWR
-            o << "    { // ISWR inline\n        A::xgkickBeforeStore(vu);\n";
+            o << "    { // ISWR inline\n";
             addressFrom(vis);
-            o << "        if (addr + 16u <= ds) { const uint32_t val = static_cast<uint32_t>(static_cast<uint16_t>(st.vi[" << vit
+            o << "        if (addr + 16u <= ds) { A::xgkickBeforeStore(vu, addr); const uint32_t val = static_cast<uint32_t>(static_cast<uint16_t>(st.vi[" << vit
               << "] & 0xFFFF)); const uint32_t words[4] = {val, val, val, val};";
             storeLanes();
             o << " }\n    }\n";
@@ -858,9 +858,9 @@ static const uint32_t vu1MacSignBits[16] = {0x00u, 0x80u, 0x40u, 0xC0u, 0x20u, 0
             o << " }\n    }\n";
             return true;
         case 0x01: // SQ
-            o << "    { // SQ inline\n        A::xgkickBeforeStore(vu);\n";
+            o << "    { // SQ inline\n";
             address(vit);
-            o << "        if (addr + 16u <= ds) { uint32_t words[4]; std::memcpy(words, st.vf[" << lis
+            o << "        if (addr + 16u <= ds) { A::xgkickBeforeStore(vu, addr); uint32_t words[4]; std::memcpy(words, st.vf[" << lis
               << "], sizeof(words));";
             // Written at once: a queued store commits at the start of the next cycle, before
             // anything else (XGKICK, the next pair's loads) reads data memory, so the result is
@@ -884,9 +884,9 @@ static const uint32_t vu1MacSignBits[16] = {0x00u, 0x80u, 0x40u, 0xC0u, 0x20u, 0
             return true;
         }
         case 0x05: // ISW
-            o << "    { // ISW inline\n        A::xgkickBeforeStore(vu);\n";
+            o << "    { // ISW inline\n";
             address(vis);
-            o << "        if (addr + 16u <= ds) { const uint32_t val = static_cast<uint32_t>(static_cast<uint16_t>(st.vi[" << vit
+            o << "        if (addr + 16u <= ds) { A::xgkickBeforeStore(vu, addr); const uint32_t val = static_cast<uint32_t>(static_cast<uint16_t>(st.vi[" << vit
               << "] & 0xFFFF));";
                 for (uint32_t c = 0; c < 4u; ++c)
                     if ((dest & laneForComponent(c)) != 0u)
@@ -1022,7 +1022,7 @@ static const uint32_t vu1MacSignBits[16] = {0x00u, 0x80u, 0x40u, 0xC0u, 0x20u, 0
         if (d.lowerUsage.waitP)
             terms.push_back("A::efuMaxPendingReady(vu)");
         if (d.lowerUsage.pipeline == A::kPipelineXgkick)
-            terms.push_back("(A::xgkickActive(vu) ? cyc + 1u : 0u)");
+            terms.push_back("A::xgkickReadyCycle(vu)");
         if (!terms.empty())
         {
             o << "    {\n        auto ready = [&]() { uint64_t r = cyc;";
