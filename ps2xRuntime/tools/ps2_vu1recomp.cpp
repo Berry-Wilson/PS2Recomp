@@ -107,6 +107,12 @@ static inline int vu1VProductSumOk(__m128 r, __m128 p, bool productNormal)
         bits &= vu1VNormalNonMax(p);
     return bits;
 }
+// Lanes that are +0 or -0 (movemask-style).
+static inline int vu1VZeroMask(__m128 v)
+{
+    return _mm_movemask_ps(_mm_castsi128_ps(_mm_cmpeq_epi32(_mm_and_si128(_mm_castps_si128(v), _mm_set1_epi32(0x7FFFFFFF)), _mm_setzero_si128())));
+}
+static inline __m128 vu1VNeg(__m128 v) { return _mm_xor_ps(v, _mm_castsi128_ps(_mm_set1_epi32(static_cast<int>(0x80000000u)))); }
 // MAC sign bits (lane c -> (8 >> c) << 4) for a movemask of the result's sign bits.
 static const uint32_t vu1MacSignBits[16] = {0x00u, 0x80u, 0x40u, 0xC0u, 0x20u, 0xA0u, 0x60u, 0xE0u,
                                             0x10u, 0x90u, 0x50u, 0xD0u, 0x30u, 0xB0u, 0x70u, 0xF0u};
@@ -581,13 +587,25 @@ static const uint32_t vu1MacSignBits[16] = {0x00u, 0x80u, 0x40u, 0xC0u, 0x20u, 0
             o << "        const __m128 p = _mm_mul_ps(s, t);\n";
             o << "        const __m128 a = vu1VNorm(_mm_loadu_ps(st.acc));\n";
             o << "        __m128 r = " << (kind == Madd ? "_mm_add_ps(a, p)" : "_mm_sub_ps(a, p)") << ";\n";
-            o << "        bool inRange = (vu1VProductSumOk(r, p" << (withFlags ? ", true" : ", false") << ") & laneBits) == laneBits;\n";
+            // A zero operand makes the product an exact signed zero, so r = acc +/- 0 is exact too
+            // (round-toward-zero gives the same signed zero as the interpreter's exact sum).
+            o << "        const int exactZero = vu1VZeroMask(s) | vu1VZeroMask(t);\n";
+            o << "        bool inRange = ((vu1VProductSumOk(r, p" << (withFlags ? ", true" : ", false") << ") | exactZero) & laneBits) == laneBits;\n";
         }
         else
         {
             o << "        __m128 r = " << opName << "(s, t);\n";
             if (withFlags)
-                o << "        bool inRange = (vu1VNormalNonMax(r) & laneBits) == laneBits;\n";
+            {
+                // Lanes whose exact result is zero: the float result is that signed zero too.
+                if (kind == Mul)
+                    o << "        const int exactZero = vu1VZeroMask(s) | vu1VZeroMask(t);\n";
+                else if (kind == Add)
+                    o << "        const int exactZero = _mm_movemask_ps(_mm_cmpeq_ps(s, vu1VNeg(t)));\n";
+                else
+                    o << "        const int exactZero = _mm_movemask_ps(_mm_cmpeq_ps(s, t));\n";
+                o << "        bool inRange = ((vu1VNormalNonMax(r) | exactZero) & laneBits) == laneBits;\n";
+            }
             else
                 o << "        bool inRange = (vu1VSingleRoundingOk(r) & laneBits) == laneBits; r = vu1VZeroDenormals(r);\n";
         }
@@ -598,12 +616,13 @@ static const uint32_t vu1MacSignBits[16] = {0x00u, 0x80u, 0x40u, 0xC0u, 0x20u, 0
             o << "A::normalizeFmacValues(vu, " << hex32(upper) << ", rv, " << dest << "u); r = _mm_load_ps(rv); }\n";
         if (withFlags)
         {
-            o << "        else { const uint32_t mac = vu1MacSignBits[_mm_movemask_ps(r) & laneBits];";
+            o << "        else { const int zeroLanes = vu1VZeroMask(r) & laneBits; const uint32_t signMac = vu1MacSignBits[_mm_movemask_ps(r) & laneBits];"
+                 " const uint32_t mac = signMac | (vu1MacSignBits[zeroLanes] >> 4);";
             if (productSum)
-                o << " const uint32_t productSticky = (_mm_movemask_ps(p) & laneBits) != 0 ? 2u : 0u;";
+                o << " const uint32_t productSticky = ((_mm_movemask_ps(p) & laneBits) != 0 ? 2u : 0u) | ((exactZero & laneBits) != 0 ? 1u : 0u);";
             else
                 o << " const uint32_t productSticky = 0u;";
-            o << " A::queueFmacFlags(vu, mac, mac != 0u ? 2u : 0u, productSticky); }\n";
+            o << " A::queueFmacFlags(vu, mac, (zeroLanes != 0 ? 1u : 0u) | (signMac != 0u ? 2u : 0u), productSticky); }\n";
         }
         const std::string target = accTarget ? "st.acc" : "st.vf[" + std::to_string(fd) + "]";
         if (laneBits == 0xFu)
