@@ -556,6 +556,27 @@ void GS::latchHostPresentationFrame()
             m_backend->Flush();
             m_backend->Sync(GSSyncReason::Presentation);
             frame = m_backend->Present(request);
+            // The guest may flip (DISPFB/DISPLAY/PMODE) while the backend drains and scans out, and
+            // the drained GS work can already include its next frame's clear of the buffer that
+            // was displayed. The flip comes first in guest order, so if the clear was drained the
+            // flip is visible now: present again with the registers as they are after the scan-out.
+            for (int retry = 0; retry < 2; ++retry)
+            {
+                GSPresentationRequest latest{};
+                {
+                    std::lock_guard<std::recursive_mutex> lock(m_stateMutex);
+                    if (!m_privRegs)
+                        break;
+                    latest = buildPresentationRequestUnlocked();
+                }
+                if (latest.dispfb1 == request.dispfb1 && latest.dispfb2 == request.dispfb2 && latest.display1 == request.display1 &&
+                    latest.display2 == request.display2 && latest.pmode == request.pmode)
+                    break;
+                request = latest;
+                m_backend->Flush();
+                m_backend->Sync(GSSyncReason::Presentation);
+                frame = m_backend->Present(request);
+            }
         }
     }
 
