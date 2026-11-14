@@ -70,3 +70,8 @@ void ps2xPcsx2QueueSnapshot(const char *path);
 // sceMpegDelete when a movie ends or is skipped. PS2X_PCSX2_MOVIE_RENDERER=hardware keeps the GPU
 // renderer.
 void ps2xPcsx2NoteMoviePicture();
+
+// A movie is playing, by the same count of vsyncs. With a widescreen picture PCSX2 shows the movie in
+// 4:3 with bars at the sides for as long as this is true, so game code that reshapes its drawing for
+// widescreen should leave it alone meanwhile.
+bool ps2xPcsx2MoviePlaying();

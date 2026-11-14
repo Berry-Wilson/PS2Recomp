@@ -23,6 +23,7 @@ constexpr unsigned long kLoadWithAlteredSearchPath = 0x00000008;
 #endif
 
 extern std::atomic<bool> g_ps2xUpscaleCycleRequested; // ps2_runtime.cpp: F5 wants the next upscale step
+extern std::atomic<bool> g_ps2xOsdToggleRequested;    // ps2_runtime.cpp: F1 shows or hides PCSX2's overlay
 extern std::atomic<int> g_ps2xUpscaleRate;            // ps2_runtime.cpp: shown on screen after F5
 
 namespace
@@ -32,8 +33,10 @@ namespace
     std::atomic<Ps2xGsSetOverlayFn> g_setOverlay{nullptr};
     std::atomic<Ps2xGsSnapshotFn> g_snapshot{nullptr}; // set once PCSX2's GS is open
     std::atomic<Ps2xGsSetSoftwareRenderingFn> g_setSoftware{nullptr}; // likewise; optional
+    std::atomic<Ps2xGsSetMoviePlayingFn> g_setMoviePlaying{nullptr}; // likewise; optional
     std::atomic<int> g_vsyncsSinceMoviePicture{1 << 20}; // vsyncs since the MPEG decoder last gave a picture
     bool g_movieSoftware = false;                         // the software renderer is on for a movie (GS thread)
+    bool g_movieTold = false;                             // PCSX2 was last told a movie plays (GS thread)
     constexpr int kMovieEndVsyncs = 15;
 
     // "SLUS_207.32" -> "SLUS-20732", the form PCSX2's GameIndex.yaml uses.
@@ -113,6 +116,11 @@ void ps2xPcsx2NoteMoviePicture()
     g_vsyncsSinceMoviePicture.store(0, std::memory_order_relaxed);
 }
 
+bool ps2xPcsx2MoviePlaying()
+{
+    return g_vsyncsSinceMoviePicture.load(std::memory_order_relaxed) < kMovieEndVsyncs;
+}
+
 void ps2xSetGameElfName(const char *name)
 {
     std::lock_guard<std::mutex> lock(g_elfNameMutex);
@@ -129,6 +137,9 @@ struct GSPcsx2Backend::Impl
     Ps2xGsSetUpscaleFn setUpscale = nullptr;
     Ps2xGsSnapshotFn snapshot = nullptr;
     Ps2xGsSetSoftwareRenderingFn setSoftware = nullptr; // optional: older DLLs keep the GPU renderer for movies
+    Ps2xGsSetMoviePlayingFn setMoviePlaying = nullptr;   // optional: older DLLs stretch movies in widescreen
+    Ps2xGsSetOsdFn setOsd = nullptr;                     // optional: with older DLLs F1 does nothing
+    bool osd = false;                                    // PCSX2's statistics overlay is showing
     Ps2xGsCloseFn close = nullptr;
 
     std::filesystem::path dllDir;
@@ -181,6 +192,8 @@ bool GSPcsx2Backend::Impl::load()
     // Optional: an older DLL without it just shows no overlay.
     g_setOverlay.store(reinterpret_cast<Ps2xGsSetOverlayFn>(get("ps2xgs_set_overlay")), std::memory_order_release);
     setSoftware = reinterpret_cast<Ps2xGsSetSoftwareRenderingFn>(get("ps2xgs_set_software_rendering"));
+    setMoviePlaying = reinterpret_cast<Ps2xGsSetMoviePlayingFn>(get("ps2xgs_set_movie_playing"));
+    setOsd = reinterpret_cast<Ps2xGsSetOsdFn>(get("ps2xgs_set_osd"));
     std::cerr << "[GSPcsx2Backend] loaded " << dll.string() << std::endl;
     return true;
 #else
@@ -220,6 +233,7 @@ void GSPcsx2Backend::Impl::ensureOpen()
         config.sharpness = static_cast<int>(envFloat("PS2X_PCSX2_SHARPNESS", 0.0f));
         config.vsync = 0; // the runtime paces frames itself
         config.osd = envFloat("PS2X_PCSX2_OSD", 0.0f) != 0.0f ? 1 : 0;
+        osd = config.osd != 0;
         config.data_dir = dataDir.c_str();
         config.resources_dir = resources.c_str();
         config.serial = serial.empty() ? nullptr : serial.c_str();
@@ -233,6 +247,7 @@ void GSPcsx2Backend::Impl::ensureOpen()
                   << (serial.empty() ? std::string() : ", game " + serial) << std::endl;
         g_snapshot.store(snapshot, std::memory_order_release);
         g_setSoftware.store(setSoftware, std::memory_order_release);
+        g_setMoviePlaying.store(setMoviePlaying, std::memory_order_release);
         ready.store(true, std::memory_order_release);
     });
 }
@@ -298,6 +313,13 @@ PresentationFrame GSPcsx2Backend::Present(const GSPresentationRequest &request)
     if (!m_impl->ready.load(std::memory_order_acquire))
         return result;
 
+    // F1: PCSX2's statistics overlay.
+    if (g_ps2xOsdToggleRequested.exchange(false, std::memory_order_acq_rel) && m_impl->setOsd)
+    {
+        m_impl->osd = !m_impl->osd;
+        m_impl->setOsd(m_impl->osd ? 1 : 0);
+    }
+
     // F5: the next internal resolution.
     if (g_ps2xUpscaleCycleRequested.exchange(false, std::memory_order_acq_rel))
     {
@@ -325,8 +347,8 @@ PresentationFrame GSPcsx2Backend::Present(const GSPresentationRequest &request)
     put(kDispfb2, request.dispfb2);
     put(kDisplay2, request.display2);
     put(kBgcolor, request.bgcolor);
-    // Movies on the software renderer (ps2xPcsx2NoteMoviePicture). Queued before this vsync, so the
-    // switch lands between frames.
+    // Movies (ps2xPcsx2NoteMoviePicture): PCSX2 is told one is playing, and draws it with its software
+    // renderer. Queued before this vsync, so the switches land between frames.
     {
         static const bool keepHardware = []()
         {
@@ -337,6 +359,12 @@ PresentationFrame GSPcsx2Backend::Present(const GSPresentationRequest &request)
         if (since <= kMovieEndVsyncs)
             g_vsyncsSinceMoviePicture.fetch_add(1, std::memory_order_relaxed);
         const bool movie = since < kMovieEndVsyncs;
+        if (movie != g_movieTold)
+        {
+            if (Ps2xGsSetMoviePlayingFn fn = g_setMoviePlaying.load(std::memory_order_acquire))
+                fn(movie ? 1 : 0);
+            g_movieTold = movie;
+        }
         if (!keepHardware && movie != g_movieSoftware)
         {
             if (Ps2xGsSetSoftwareRenderingFn fn = g_setSoftware.load(std::memory_order_acquire))

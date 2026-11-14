@@ -42,6 +42,8 @@ typedef void (*Ps2xGsSnapshotFn)(const char *path);
 typedef void (*Ps2xGsCloseFn)(void);
 typedef void (*Ps2xGsSetOverlayFn)(unsigned line, const char *text, unsigned rgba);
 typedef void (*Ps2xGsSetSoftwareRenderingFn)(int software);
+typedef void (*Ps2xGsSetMoviePlayingFn)(int playing);
+typedef void (*Ps2xGsSetOsdFn)(int show);
 
 // Returns 1 on success.
 // int ps2xgs_open(const Ps2xGsConfig *config);
@@ -64,6 +66,11 @@ typedef void (*Ps2xGsSetSoftwareRenderingFn)(int software);
 // 1: draw with PCSX2's software renderer from the next vsync on, 0: back to the renderer it was opened
 // with. Used while a movie plays (PCSX2's SoftwareRendererFMV fix). No effect if opened as software.
 // void ps2xgs_set_software_rendering(int software);
+// 1 while a movie plays, 0 when it is over. With a widescreen picture (Ps2xGsConfig.widescreen), movies
+// are shown in 4:3 with bars at the sides, as PCSX2's FMV aspect ratio switch does.
+// void ps2xgs_set_movie_playing(int playing);
+// Shows or hides PCSX2's statistics overlay while running (Ps2xGsConfig.osd is how it starts).
+// void ps2xgs_set_osd(int show);
 
 #ifdef __cplusplus
 }

@@ -919,6 +919,8 @@ std::atomic<bool> g_ps2xScreenshotRequested{false};
 // Set by F5 on the main thread; PCSX2's GS steps to the next internal resolution at its next vsync
 // and stores the new scale here, which is shown on screen for a moment.
 std::atomic<bool> g_ps2xUpscaleCycleRequested{false};
+// F1 was pressed: show or hide PCSX2's statistics overlay.
+std::atomic<bool> g_ps2xOsdToggleRequested{false};
 std::atomic<int> g_ps2xUpscaleRate{1};
 // Finished-frame presentation. A game override that knows when the game has finished a frame calls
 // PS2Runtime::gs().latchHostPresentationFrame() at that moment and stores the vsync tick here (plus
@@ -1037,6 +1039,10 @@ static void UploadFrame(HostFrameTarget &tex, PS2Runtime *rt, uint32_t &outWidth
         g_ps2xScreenshotRequested.store(true, std::memory_order_release);
     if (hostinput::IsKeyPressed(KEY_F5))
         g_ps2xUpscaleCycleRequested.store(true, std::memory_order_release);
+#if defined(PS2X_HAS_HOST_DISPLAY)
+    if (hostinput::IsKeyPressed(KEY_F1))
+        g_ps2xOsdToggleRequested.store(true, std::memory_order_release);
+#endif
 
     static uint64_t s_lastPresentationTick = std::numeric_limits<uint64_t>::max();
     static bool s_hasLatchedInitialFrame = false;
@@ -3538,12 +3544,16 @@ void PS2Runtime::run()
             char notice[40] = "";
             if (now < s_rateShownUntil)
                 std::snprintf(notice, sizeof(notice), "Internal resolution: %dx", rate);
+            // F3 shows and hides the rate.
+            static bool s_showRate = false;
+            if (hostinput::IsKeyPressed(KEY_F3))
+                s_showRate = !s_showRate;
             // PCSX2 draws the picture, so these lines go to its overlay.
-            ps2xPcsx2SetOverlay(0u, text, rateColor);
+            ps2xPcsx2SetOverlay(0u, s_showRate ? text : "", rateColor);
             ps2xPcsx2SetOverlay(1u, notice, IM_COL32(255, 255, 255, 255));
         }
-        // The debug panel (F1) is not drawn here: PCSX2 owns the picture and its ImGui lives in the
-        // DLL, so the panel has nothing to draw into.
+        // The debug panel is not drawn here: PCSX2 owns the picture and its ImGui lives in the DLL, so
+        // the panel has nothing to draw into. F1 shows PCSX2's statistics overlay instead.
 
         if (display.shouldClose())
         {

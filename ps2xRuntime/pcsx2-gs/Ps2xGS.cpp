@@ -26,6 +26,7 @@
 #include "pcsx2/GS/GS.h"
 #include "pcsx2/GS/Renderers/Common/GSRenderer.h"
 #include "pcsx2/GameDatabase.h"
+#include "pcsx2/ImGui/ImGuiOverlays.h"
 #include "pcsx2/Memory.h"
 
 #include "ps2x_gs_api.h"
@@ -54,6 +55,8 @@ namespace
 		REC_SNAP = 4, // path of a PNG to save, with its NUL
 		REC_UPSCALE = 5, // a float: the new internal resolution multiplier
 		REC_SOFTWARE = 6, // an int: 1 to draw with the software renderer, 0 to go back
+		REC_MOVIE = 7, // an int: 1 while a movie plays, 0 when it is over
+		REC_OSD = 8, // an int: 1 to show PCSX2's statistics overlay, 0 to hide it
 	};
 
 	struct Frame
@@ -72,6 +75,17 @@ namespace
 	bool s_open = false;
 	bool s_sys_memory = false; // SysMemory::Allocate() has run
 	bool s_switched_to_software = false; // ps2xgs_set_software_rendering(1) switched the renderer
+
+	// PCSX2's statistics overlay: speed, resolution, GS and GPU figures, frame times and messages.
+	void ApplyOsd(Pcsx2Config::GSOptions &options, bool show)
+	{
+		options.OsdShowFPS = show;
+		options.OsdShowResolution = show;
+		options.OsdShowGSStats = show;
+		options.OsdShowFrameTimes = show;
+		options.OsdShowGPU = show;
+		options.OsdMessagesPos = show ? OsdOverlayPos::TopLeft : OsdOverlayPos::None;
+	}
 
 	// Between the two, under s_q_lock.
 	std::mutex s_q_lock;
@@ -276,6 +290,26 @@ namespace
 						}
 						break;
 					}
+					case REC_MOVIE:
+					{
+						int movie;
+						std::memcpy(&movie, p, sizeof(movie));
+						// What PCSX2's FMV aspect switch does. It goes by the IPU, which the runtime
+						// doesn't use, so the runtime says when a movie plays.
+						if (EmuConfig.GS.AspectRatio == AspectRatioType::R16_9)
+							EmuConfig.CurrentAspectRatio = movie ? AspectRatioType::R4_3 : EmuConfig.GS.AspectRatio;
+						break;
+					}
+					case REC_OSD:
+					{
+						int show;
+						std::memcpy(&show, p, sizeof(show));
+						Pcsx2Config::GSOptions options = EmuConfig.GS;
+						ApplyOsd(options, show != 0);
+						GSUpdateConfig(options);
+						EmuConfig.GS = options;
+						break;
+					}
 					case REC_UPSCALE:
 					{
 						float upscale;
@@ -441,13 +475,13 @@ namespace
 		if (const char *lg = std::getenv("PS2X_PCSX2_LOG"); lg && lg[0] == '1')
 			Log::SetFileOutputLevel(LOGLEVEL_DEBUG, Path::Combine(EmuFolders::DataRoot, "logs" FS_OSPATH_SEPARATOR_STR "ps2x-gs.log"));
 
-		const bool osd = config.osd != 0;
-		si.SetBoolValue("EmuCore/GS", "OsdShowFPS", osd);
-		si.SetBoolValue("EmuCore/GS", "OsdShowResolution", osd);
-		si.SetBoolValue("EmuCore/GS", "OsdShowGSStats", osd);
-		si.SetBoolValue("EmuCore/GS", "OsdShowFrameTimes", osd);
-		si.SetBoolValue("EmuCore/GS", "OsdShowGPU", osd);
-		si.SetIntValue("EmuCore/GS", "OsdMessagesPos", static_cast<int>(osd ? OsdOverlayPos::TopLeft : OsdOverlayPos::None));
+		// The statistics overlay starts hidden; ApplyOsd turns it on.
+		si.SetBoolValue("EmuCore/GS", "OsdShowFPS", false);
+		si.SetBoolValue("EmuCore/GS", "OsdShowResolution", false);
+		si.SetBoolValue("EmuCore/GS", "OsdShowGSStats", false);
+		si.SetBoolValue("EmuCore/GS", "OsdShowFrameTimes", false);
+		si.SetBoolValue("EmuCore/GS", "OsdShowGPU", false);
+		si.SetIntValue("EmuCore/GS", "OsdMessagesPos", static_cast<int>(OsdOverlayPos::None));
 		// Screenshots at the resolution the GS draws at, not the window's.
 		si.SetIntValue("EmuCore/GS", "ScreenshotSize", static_cast<int>(GSScreenshotSize::InternalResolution));
 		si.SetFloatValue("EmuCore/GS", "upscale_multiplier", config.upscale < 1.0f ? 1.0f : config.upscale);
@@ -482,6 +516,7 @@ namespace
 			}
 		}
 		ApplyRendererSwitches(game);
+		ApplyOsd(EmuConfig.GS, config.osd != 0);
 		EmuConfig.CurrentAspectRatio = EmuConfig.GS.AspectRatio;
 	}
 }
@@ -495,6 +530,10 @@ namespace Host
 void Host::BeginPresentFrame()
 {
 	DrawOverlay();
+	// PCSX2 draws its statistics only while its own virtual machine runs, which it never does here,
+	// so they are drawn from here when the overlay is on (ApplyOsd).
+	if (GSConfig.OsdShowFPS)
+		ImGuiManager::RenderOverlays();
 }
 
 #define PS2XGS_API extern "C" __declspec(dllexport)
@@ -621,6 +660,26 @@ PS2XGS_API void ps2xgs_set_software_rendering(int software)
 	{
 		const int value = software ? 1 : 0;
 		AppendRecord(REC_SOFTWARE, &value, sizeof(value));
+	}
+}
+
+PS2XGS_API void ps2xgs_set_movie_playing(int playing)
+{
+	std::lock_guard<std::mutex> in(s_in_lock);
+	if (s_open)
+	{
+		const int value = playing ? 1 : 0;
+		AppendRecord(REC_MOVIE, &value, sizeof(value));
+	}
+}
+
+PS2XGS_API void ps2xgs_set_osd(int show)
+{
+	std::lock_guard<std::mutex> in(s_in_lock);
+	if (s_open)
+	{
+		const int value = show ? 1 : 0;
+		AppendRecord(REC_OSD, &value, sizeof(value));
 	}
 }
 

@@ -2213,10 +2213,13 @@ void PS2DebugPanel::draw(PS2Runtime &runtime)
         return;
     }
 
+#if !defined(PS2X_HAS_HOST_DISPLAY)
+    // With PCSX2's GS drawing the picture the panel can't be shown, and F1 is its overlay's key.
     if (hostinput::IsKeyPressed(KEY_F1))
     {
         toggleVisible();
     }
+#endif
 
     if (!m_visible)
     {
