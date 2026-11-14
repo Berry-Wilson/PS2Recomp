@@ -16,6 +16,12 @@
 
 namespace
 {
+    // Set when this thread raised GS FINISH (CSR bit 1) while processing GIF data.
+    thread_local bool t_finishSetOnThisThread = false;
+}
+
+namespace
+{
     std::atomic<GifRewriter *> g_gifRewriter{nullptr};
 }
 
@@ -697,6 +703,7 @@ void GS::applyPrivilegedSideEffects(const uint8_t *data, uint32_t sizeBytes)
                         else if (reg == GS_REG_FINISH)
                         {
                             m_privRegs->csr.fetch_or(0x2);
+                            t_finishSetOnThisThread = true;
                         }
                         else if (reg == GS_REG_LABEL)
                         {
@@ -825,6 +832,13 @@ void ps2xSetGifCaptureRam(const uint8_t *ram, uint32_t size)
 namespace
 {
     thread_local uint32_t t_privilegedEffectsAppliedPaths = 0u;
+}
+
+bool GS::takeFinishSetOnThisThread()
+{
+    const bool set = t_finishSetOnThisThread;
+    t_finishSetOnThisThread = false;
+    return set;
 }
 
 void GS::setPrivilegedEffectsAppliedPaths(uint32_t pathMask)
@@ -1727,7 +1741,10 @@ void GS::writeRegisterUnlocked(uint8_t regAddr, uint64_t value)
             m_backend->Sync(GSSyncReason::Finish);
         }
         if (m_privRegs)
+        {
             m_privRegs->csr.fetch_or(0x2);
+            t_finishSetOnThisThread = true;
+        }
         break;
     }
     case GS_REG_LABEL:

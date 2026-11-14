@@ -1,5 +1,6 @@
 #include "runtime/ps2_pad.h"
 #include "runtime/input_bindings.h"
+#include "runtime/ps2_guest_clock.h"
 #include "ps2_host_backend.h"
 #include <cmath>
 #include <cstring>
@@ -166,6 +167,8 @@ namespace
                 if (record)
                 {
                     std::fprintf(record, "# ps2x pad input v1: read buttons(hex, active low) lx ly rx ry seconds\n");
+                    // The guest clock's start, so a replay sees the same clock (ps2_guest_clock.h).
+                    std::fprintf(record, "# clock %lld\n", static_cast<long long>(ps2xGuestClockStart()));
                     std::fflush(record);
                     std::fprintf(stderr, "[input] recording pad input to %s\n", path);
                 }

@@ -1887,7 +1887,7 @@ void PS2Memory::vif1WorkerLoop()
             job = std::move(m_vif1Jobs.front());
             m_vif1Jobs.pop_front();
         }
-        const bool finishBefore = (gs_regs.csr.load() & 0x2u) != 0u;
+        GS::takeFinishSetOnThisThread();
         // The EE applied this job's PATH2 (VIF1 DIRECT) or PATH3 privileged effects when it queued
         // it; PATH1 (XGKICK output) is not known in advance and is applied here.
         GS::setPrivilegedEffectsAppliedPaths(job.gif ? (1u << 3) : (1u << 2));
@@ -1909,8 +1909,10 @@ void PS2Memory::vif1WorkerLoop()
         }
         GS::setPrivilegedEffectsAppliedPaths(0u);
         // FINISH set here (PATH1, or PATH3 released from a mask) comes after the EE's INTC_GS check
-        // for the transfer, so ask the EE thread to check again.
-        if (!finishBefore && (gs_regs.csr.load() & 0x2u) != 0u && m_gsFinishNotify)
+        // for the transfer, so ask the EE thread to check again. Only a FINISH this job raised counts:
+        // the EE sets the same CSR bit for later transfers while this one runs, and a notice for
+        // those would reach the game at a moment that depends on how fast the host is.
+        if (GS::takeFinishSetOnThisThread() && m_gsFinishNotify)
             m_gsFinishNotify();
         {
             std::lock_guard<std::mutex> lock(m_vif1Mutex);

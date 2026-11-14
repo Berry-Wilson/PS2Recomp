@@ -12,8 +12,6 @@
 #include <GLFW/glfw3native.h>
 #endif
 
-#include "imgui.h"
-
 #include <algorithm>
 #include <cmath>
 #include <cstdio>
@@ -38,15 +36,12 @@ namespace
 struct HostDisplay::Impl
 {
     GLFWwindow *window = nullptr;
-    bool uiReady = false;
 };
 
 HostDisplay::HostDisplay() : m_impl(std::make_unique<Impl>()) {}
 
 HostDisplay::~HostDisplay()
 {
-    if (m_impl->uiReady)
-        ImGui::DestroyContext();
     hostinput::detach();
     if (m_impl->window)
         glfwDestroyWindow(m_impl->window);
@@ -117,14 +112,6 @@ bool HostDisplay::create(const char *title, int width, int height)
     display->m_impl->window = window;
     hostinput::attach(window);
 
-    // No renderer for ImGui: its font atlas is built so frames can start, and its output is dropped.
-    IMGUI_CHECKVERSION();
-    ImGui::CreateContext();
-    unsigned char *pixels = nullptr;
-    int fontWidth = 0, fontHeight = 0;
-    ImGui::GetIO().Fonts->GetTexDataAsRGBA32(&pixels, &fontWidth, &fontHeight);
-    display->m_impl->uiReady = true;
-
     s_display = std::move(display);
     return true;
 }
@@ -153,19 +140,4 @@ bool HostDisplay::shouldClose() const
 void HostDisplay::hide()
 {
     glfwHideWindow(m_impl->window);
-}
-
-void HostDisplay::beginUi()
-{
-    int width = 0, height = 0;
-    glfwGetFramebufferSize(m_impl->window, &width, &height);
-    ImGuiIO &io = ImGui::GetIO();
-    io.DisplaySize = ImVec2(static_cast<float>(std::max(width, 1)), static_cast<float>(std::max(height, 1)));
-    io.DeltaTime = 1.0f / 60.0f;
-    ImGui::NewFrame();
-}
-
-void HostDisplay::present()
-{
-    ImGui::EndFrame();
 }

@@ -1892,6 +1892,11 @@ void PS2Runtime::configureIoPathsFromElf(const std::string &elfPath)
         paths.cdRoot = paths.elfDirectory;
         paths.mcRoot = paths.elfDirectory / "mc0";
     }
+    // PS2X_MEMCARD_DIR=<folder>: where memory card 1's saves live, instead of mc0 beside the game.
+    if (const char *folder = std::getenv("PS2X_MEMCARD_DIR"); folder && folder[0])
+    {
+        paths.mcRoot = folder;
+    }
 
     setIoPaths(paths);
 }
@@ -3504,7 +3509,6 @@ void PS2Runtime::run()
         uint32_t presentHeight = DEFAULT_DISPLAY_HEIGHT;
         UploadFrame(display, this, presentWidth, presentHeight);
 
-        display.beginUi();
         {
             // Guest VSyncs per second (60 = full speed NTSC), averaged over half-second windows.
             static double s_rateStart = hostinput::GetTime();
@@ -3538,11 +3542,8 @@ void PS2Runtime::run()
             ps2xPcsx2SetOverlay(0u, text, rateColor);
             ps2xPcsx2SetOverlay(1u, notice, IM_COL32(255, 255, 255, 255));
         }
-        if (m_debugUiInitialized && m_debugUiDrawCallback)
-        {
-            m_debugUiDrawCallback(*this, m_debugUiUserData);
-        }
-        display.present();
+        // The debug panel (F1) is not drawn here: PCSX2 owns the picture and its ImGui lives in the
+        // DLL, so the panel has nothing to draw into.
 
         if (display.shouldClose())
         {

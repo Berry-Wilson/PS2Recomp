@@ -1,0 +1,27 @@
+# Line endings are fixed per file type, whatever core.autocrlf says, so a file's bytes are the
+# same on every checkout and scripted edits can rely on them.
+* text=auto
+*.cpp text eol=lf
+*.h text eol=lf
+*.py text eol=lf
+*.md text eol=lf
+*.toml text eol=lf
+*.json text eol=lf
+*.csv text eol=lf
+*.txt text eol=lf
+*.cmake text eol=lf
+CMakeLists.txt text eol=lf
+.gitignore text eol=lf
+.gitattributes text eol=lf
+*.bat text eol=crlf
+*.ps1 text eol=crlf
+*.rc text eol=crlf
+*.patch -text
+*.png binary
+*.ico binary
+LICENSE text eol=lf
+*.c text eol=lf
+*.hpp text eol=lf
+*.yml text eol=lf
+*.yaml text eol=lf
+*.sh text eol=lf

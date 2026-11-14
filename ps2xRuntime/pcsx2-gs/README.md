@@ -42,3 +42,9 @@ PCSX2 at commit `1ccd6a8dc` (4 November 2026) is known to work.
    ```
 
 After changing `Ps2xGS.cpp`, run step 4 again.
+
+## Giving the DLL to others
+
+PCSX2 is under the GPL version 3 or later, so a built `ps2x-gs.dll` may only be passed on with its
+source: this folder, and the PCSX2 commit it was built from. Step 4 writes that commit to
+`pcsx2-commit.txt` beside the DLL for this purpose.

@@ -7,6 +7,7 @@
 #ifdef _DEBUG
 #include "ps2_log.h"
 #endif
+#include "runtime/ps2x_config.h"
 
 #include <iostream>
 #include <string>
@@ -174,6 +175,7 @@ int main(int argc, char *argv[])
     try
     {
         std::filesystem::path pathObj = getExecutablePath(argc, argv);
+        ps2xLoadConfigFile(pathObj.parent_path());
 
         std::string filePathStr = pathObj.string();
         std::string elfName = pathObj.filename().string();

@@ -3,9 +3,8 @@
 #include <memory>
 
 // The game window: a GLFW window with no client API. PCSX2's GS (GSPcsx2Backend) draws the picture
-// into a child of it with its own swapchain; this class only owns the window, its input and the
-// ImGui context. ImGui has nothing to draw to here, so the debug panel and overlays run as code but
-// are not shown; the VSync/s and F5 lines go to PCSX2's overlay instead.
+// into a child of it with its own swapchain; this class only owns the window and its input. The
+// VSync/s and F5 lines go to PCSX2's overlay; the F1 debug panel is not available.
 class HostDisplay
 {
 public:
@@ -21,9 +20,6 @@ public:
     void pollEvents();
     bool shouldClose() const;
     void hide();
-
-    void beginUi(); // starts an ImGui frame; ImGui calls are valid until present()
-    void present(); // ends the ImGui frame
 
     ~HostDisplay();
 

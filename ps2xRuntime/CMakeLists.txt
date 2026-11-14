@@ -407,6 +407,8 @@ add_library(ps2_runtime STATIC
     src/lib/vu/ps2_vu1_lower.cpp
     src/lib/vu/ps2_vu1_native.cpp
     src/lib/ps2_write_watch.cpp
+    src/lib/ps2x_config.cpp
+    src/lib/ps2_guest_clock.cpp
     src/lib/games_database.cpp
 )
 
@@ -451,23 +453,35 @@ target_sources(ps2_runtime PRIVATE
     ${KERNEL_SRC_FILES}
 )
 
-# Drakengard-PC repo root (this checkout lives at <root>/external/PS2Recomp)
-get_filename_component(DRAKENGARD_ROOT "${CMAKE_CURRENT_SOURCE_DIR}/../../.." ABSOLUTE)
-set(DRAKENGARD_RECOMP_DIR "${DRAKENGARD_ROOT}/recomp/batched")
-set(DRAKENGARD_SRC_DIR "${DRAKENGARD_ROOT}/src")
+# A game project that keeps its code outside this tree points the runner at it:
+#   PS2X_GAME_RECOMP_DIR  the translated sources, with ps2_recompiled_functions.h and
+#                         ps2_recompiled_stubs.h beside them
+#   PS2X_GAME_SRC_DIR     the game's own sources (overrides, translated VU programs); optional
+# Left empty, the runner is built from src/runner and include/ as usual.
+set(PS2X_GAME_RECOMP_DIR "" CACHE PATH "Folder of the game's translated sources and generated headers")
+set(PS2X_GAME_SRC_DIR "" CACHE PATH "Folder of the game's own sources")
 
-file(GLOB RUNNER_SRC_FILES CONFIGURE_DEPENDS
-    "${DRAKENGARD_RECOMP_DIR}/*.cpp"
-    "${DRAKENGARD_SRC_DIR}/*.cpp"
-)
+if(PS2X_GAME_RECOMP_DIR)
+    set(PS2X_GENERATED_HEADER_DIR "${PS2X_GAME_RECOMP_DIR}")
+    file(GLOB RUNNER_SRC_FILES CONFIGURE_DEPENDS "${PS2X_GAME_RECOMP_DIR}/*.cpp")
+else()
+    set(PS2X_GENERATED_HEADER_DIR "${CMAKE_CURRENT_SOURCE_DIR}/include")
+    file(GLOB RUNNER_SRC_FILES CONFIGURE_DEPENDS "${CMAKE_CURRENT_SOURCE_DIR}/src/runner/*.cpp")
+    list(FILTER RUNNER_SRC_FILES EXCLUDE REGEX "/src/runner/main[.]cpp$")
+endif()
 
-# Full debug info for the translated VU microprograms so samplers can attribute time to source
-# lines (the release link already has /DEBUG). They do not use the runner PCH.
-if(MSVC)
-    file(GLOB DRAKENGARD_VU_SRC_FILES CONFIGURE_DEPENDS "${DRAKENGARD_SRC_DIR}/vu*_programs_*.cpp")
-    set_source_files_properties(${DRAKENGARD_VU_SRC_FILES} PROPERTIES
-        COMPILE_OPTIONS "/Zi"
-        SKIP_PRECOMPILE_HEADERS ON)
+if(PS2X_GAME_SRC_DIR)
+    file(GLOB PS2X_GAME_SRC_FILES CONFIGURE_DEPENDS "${PS2X_GAME_SRC_DIR}/*.cpp")
+    list(APPEND RUNNER_SRC_FILES ${PS2X_GAME_SRC_FILES})
+
+    # Full debug info for translated VU microprograms so samplers can attribute time to source
+    # lines (the release link already has /DEBUG). They do not use the runner PCH.
+    if(MSVC)
+        file(GLOB PS2X_GAME_VU_SRC_FILES CONFIGURE_DEPENDS "${PS2X_GAME_SRC_DIR}/vu*_programs_*.cpp")
+        set_source_files_properties(${PS2X_GAME_VU_SRC_FILES} PROPERTIES
+            COMPILE_OPTIONS "/Zi"
+            SKIP_PRECOMPILE_HEADERS ON)
+    endif()
 endif()
 
 set(RUNNER_MAIN_CPP "${CMAKE_CURRENT_SOURCE_DIR}/src/runner/main.cpp")
@@ -491,7 +505,7 @@ else()
     )
 endif()
 
-target_include_directories(ps2EntryRunner PRIVATE "${DRAKENGARD_RECOMP_DIR}")
+target_include_directories(ps2EntryRunner PRIVATE "${PS2X_GENERATED_HEADER_DIR}")
 
 if(PS2X_ENABLE_RUNNER_PCH)
     set(PS2X_RUNNER_PCH_HEADERS
@@ -500,8 +514,8 @@ if(PS2X_ENABLE_RUNNER_PCH)
     )
 
     foreach(PS2X_RUNNER_GENERATED_HEADER IN ITEMS
-        "${DRAKENGARD_RECOMP_DIR}/ps2_recompiled_functions.h"
-        "${DRAKENGARD_RECOMP_DIR}/ps2_recompiled_stubs.h")
+        "${PS2X_GENERATED_HEADER_DIR}/ps2_recompiled_functions.h"
+        "${PS2X_GENERATED_HEADER_DIR}/ps2_recompiled_stubs.h")
         if(EXISTS "${PS2X_RUNNER_GENERATED_HEADER}")
             list(APPEND PS2X_RUNNER_PCH_HEADERS "${PS2X_RUNNER_GENERATED_HEADER}")
         endif()

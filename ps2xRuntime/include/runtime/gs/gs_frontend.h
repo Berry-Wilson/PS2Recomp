@@ -121,6 +121,9 @@ public:
     // PATHn, per thread). Only raw-GIF backends take this route.
     void applyGifPrivilegedEffects(const uint8_t *data, uint32_t sizeBytes);
     static void setPrivilegedEffectsAppliedPaths(uint32_t pathMask);
+    // True if this thread set FINISH since the last call. The VIF1 worker uses it to tell the EE
+    // about a FINISH it raised itself (PATH1), not one the EE set meanwhile for a later transfer.
+    static bool takeFinishSetOnThisThread();
     bool handlesRawGif() const;
     bool processNativePackedGIFPacket(const uint8_t *data, uint32_t sizeBytes);
     void uploadImageNative(uint64_t bitbltbuf,

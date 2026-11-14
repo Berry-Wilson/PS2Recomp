@@ -2119,15 +2119,15 @@ void EeScheduler::waitForEvent()
     }
     if (hasTimerDeadline)
     {
-        const auto timerHostDeadline = std::chrono::steady_clock::now() + eeCyclesToHostDuration(timerCycles);
-        if (timerHostDeadline < hostDeadline)
+        // Which comes first is decided on the guest clock alone, so that the order a game sees its
+        // timer interrupts and other events in does not depend on how fast the host ran: guest time
+        // often runs ahead of real time, and the two host deadlines can then be the other way round.
+        // Guest time never jumps past the earlier of the two.
+        const uint64_t timerCycle = m_eeCycle + timerCycles;
+        if (m_deadlines.empty() || timerCycle < deadlineCycle)
         {
-            // Guest time often runs ahead of real time, so a timer can be due sooner on the host clock
-            // but later on the guest clock than the next deadline. Waking early is harmless, but guest
-            // time must not jump past that deadline: a thread waiting on it would lose the difference.
-            const uint64_t timerCycle = m_eeCycle + timerCycles;
-            deadlineCycle = m_deadlines.empty() ? timerCycle : std::min(deadlineCycle, timerCycle);
-            hostDeadline = timerHostDeadline;
+            deadlineCycle = timerCycle;
+            hostDeadline = std::min(hostDeadline, std::chrono::steady_clock::now() + eeCyclesToHostDuration(timerCycles));
         }
     }
 
