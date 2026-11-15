@@ -1,4 +1,5 @@
 #include "runtime/gs/gs_pcsx2_backend.h"
+#include "gs_frame_interpolation.h"
 #include "runtime/host_display.h"
 
 #include "../../../pcsx2-gs/ps2x_gs_api.h"
@@ -6,12 +7,19 @@
 #include <algorithm>
 #include <atomic>
 #include <cctype>
+#include <chrono>
+#include <condition_variable>
+#include <cstdio>
+#include <deque>
 #include <cstdlib>
 #include <cstring>
 #include <filesystem>
 #include <iostream>
+#include <memory>
 #include <mutex>
 #include <string>
+#include <thread>
+#include <vector>
 
 #if defined(_WIN32)
 // windows.h clashes with this runtime's headers, so only what is used is declared.
@@ -19,6 +27,7 @@ extern "C" __declspec(dllimport) void *__stdcall LoadLibraryExW(const wchar_t *,
 extern "C" __declspec(dllimport) void *__stdcall GetProcAddress(void *, const char *);
 extern "C" __declspec(dllimport) unsigned long __stdcall GetModuleFileNameW(void *, wchar_t *, unsigned long);
 extern "C" __declspec(dllimport) unsigned long __stdcall GetLastError();
+extern "C" __declspec(dllimport) int __stdcall SetDllDirectoryW(const wchar_t *);
 constexpr unsigned long kLoadWithAlteredSearchPath = 0x00000008;
 #endif
 
@@ -127,8 +136,81 @@ void ps2xSetGameElfName(const char *name)
     g_elfName = name ? name : "";
 }
 
+// Experimental frame interpolation (PS2X_FRAME_INTERPOLATION=1): the game's frames are collected
+// here instead of going straight to PCSX2, and a presenter thread sends each one twice per vsync,
+// first halfway from the frame before it and then as it is (see gs_frame_interpolation.h). That
+// shows every frame one vsync late.
+struct FramePresenter
+{
+    using Clock = std::chrono::steady_clock;
+    struct Job
+    {
+        std::shared_ptr<const ps2x_interp::Frame> frame; // may be null: show the last picture again
+        bool vsync = false;
+        uint64_t regs[8] = {};
+        uint32_t field = 0;
+        Clock::time_point due;
+        std::string snapshot; // a PNG to save of this picture
+    };
+
+    // Collecting, under collectMutex: packets come from the EE thread and the VIF1 worker.
+    std::mutex collectMutex;
+    ps2x_interp::Frame building;
+    std::vector<std::shared_ptr<ps2x_interp::Frame>> complete;
+    int presentsSinceFinish = 0;
+    std::shared_ptr<const ps2x_interp::Frame> previous;
+
+    std::mutex queueMutex;
+    std::condition_variable queueChanged;
+    std::deque<Job> queue;
+    bool stopping = false;
+    std::thread thread;
+
+    // PS2X_FRAME_INTERPOLATION_DUMP=<folder>: saves the first 240 pictures presented after
+    // PS2X_DUMP_FRAMES_AFTER seconds, in-between ones as *_m.png.
+    std::string dumpDir;
+    double dumpAfter = 0.0;
+    Clock::time_point started = Clock::now();
+    uint32_t dumped = 0;
+    uint32_t reported = 0;
+    std::atomic<int64_t> worstLateMicros{0}; // how far behind its time a picture was sent
+    ps2x_interp::Stats total;
+
+    void add(uint32_t path, const void *data, uint32_t size)
+    {
+        std::lock_guard<std::mutex> lock(collectMutex);
+        building.add(path, data, size);
+        if (ps2x_interp::writesFinish(data, size))
+        {
+            complete.push_back(std::make_shared<ps2x_interp::Frame>(std::move(building)));
+            building = ps2x_interp::Frame{};
+            presentsSinceFinish = 0;
+        }
+    }
+
+    void push(Job job)
+    {
+        {
+            std::lock_guard<std::mutex> lock(queueMutex);
+            queue.push_back(std::move(job));
+        }
+        queueChanged.notify_one();
+    }
+};
+
 struct GSPcsx2Backend::Impl
 {
+    std::unique_ptr<FramePresenter> presenter; // set when frame interpolation is on
+    void send(uint32_t path, const void *data, uint32_t size)
+    {
+        if (presenter)
+            presenter->add(path, data, size);
+        else
+            gif(path, data, size);
+    }
+    void presentInterpolated(const uint64_t regs[8]);
+    void runPresenter();
+
     void *module = nullptr;
     Ps2xGsOpenFn open = nullptr;
     Ps2xGsGifFn gif = nullptr;
@@ -150,6 +232,7 @@ struct GSPcsx2Backend::Impl
 
     bool load();
     void ensureOpen();
+    void writeRegs(const uint64_t values[8]);
 };
 
 bool GSPcsx2Backend::Impl::load()
@@ -167,9 +250,14 @@ bool GSPcsx2Backend::Impl::load()
         if (!std::filesystem::exists(dll))
             dll = dir / "ps2x-gs.dll";
     }
-    // Its own dependencies (SDL3, FreeType, ...) sit next to it.
+    // Its own dependencies (SDL3, FreeType, ...) sit next to it. The altered search path finds the
+    // ones it imports; the ones PCSX2 loads by name while running (shaderc_shared.dll for Vulkan)
+    // need the folder on the DLL search path too.
     dll = std::filesystem::absolute(dll);
     dllDir = dll.parent_path();
+    if (!SetDllDirectoryW(dllDir.wstring().c_str()))
+        std::cerr << "[GSPcsx2Backend] cannot add " << dllDir.string() << " to the DLL search path (error "
+                  << GetLastError() << ")" << std::endl;
     module = LoadLibraryExW(dll.wstring().c_str(), nullptr, kLoadWithAlteredSearchPath);
     if (!module)
     {
@@ -248,6 +336,17 @@ void GSPcsx2Backend::Impl::ensureOpen()
         g_snapshot.store(snapshot, std::memory_order_release);
         g_setSoftware.store(setSoftware, std::memory_order_release);
         g_setMoviePlaying.store(setMoviePlaying, std::memory_order_release);
+        if (envFloat("PS2X_FRAME_INTERPOLATION", 0.0f) != 0.0f)
+        {
+            presenter = std::make_unique<FramePresenter>();
+            if (const char *value = std::getenv("PS2X_FRAME_INTERPOLATION_DUMP"); value && value[0])
+            {
+                presenter->dumpDir = std::filesystem::absolute(value).make_preferred().string();
+                presenter->dumpAfter = envFloat("PS2X_DUMP_FRAMES_AFTER", 0.0f);
+            }
+            presenter->thread = std::thread([this] { runPresenter(); });
+            std::cerr << "[GSPcsx2Backend] frame interpolation on: two pictures per vsync" << std::endl;
+        }
         ready.store(true, std::memory_order_release);
     });
 }
@@ -256,8 +355,135 @@ GSPcsx2Backend::GSPcsx2Backend() : m_impl(std::make_unique<Impl>()) {}
 
 GSPcsx2Backend::~GSPcsx2Backend()
 {
+    if (m_impl && m_impl->presenter)
+    {
+        {
+            std::lock_guard<std::mutex> lock(m_impl->presenter->queueMutex);
+            m_impl->presenter->stopping = true;
+        }
+        m_impl->presenter->queueChanged.notify_one();
+        if (m_impl->presenter->thread.joinable())
+            m_impl->presenter->thread.join();
+    }
     if (m_impl && m_impl->ready.load(std::memory_order_acquire))
         m_impl->close();
+}
+
+void GSPcsx2Backend::Impl::writeRegs(const uint64_t values[8])
+{
+    static constexpr size_t kOffsets[8] = {kPmode, kSmode1, kSmode2, kDispfb1, kDisplay1, kDispfb2, kDisplay2, kBgcolor};
+    uint8_t *block = static_cast<uint8_t *>(regs());
+    for (size_t i = 0; i < 8; ++i)
+        std::memcpy(block + kOffsets[i], &values[i], sizeof(uint64_t));
+}
+
+// Called at each vsync. The frames the game finished since the last one go to the presenter: all but
+// the newest as they are, the newest as two pictures half a vsync apart.
+void GSPcsx2Backend::Impl::presentInterpolated(const uint64_t regValues[8])
+{
+    using Clock = FramePresenter::Clock;
+    FramePresenter &p = *presenter;
+    std::vector<std::shared_ptr<ps2x_interp::Frame>> frames;
+    {
+        std::lock_guard<std::mutex> lock(p.collectMutex);
+        frames.swap(p.complete);
+        // Screens that never write FINISH still have to be shown.
+        if (frames.empty() && !p.building.empty() && ++p.presentsSinceFinish >= 2)
+        {
+            frames.push_back(std::make_shared<ps2x_interp::Frame>(std::move(p.building)));
+            p.building = ps2x_interp::Frame{};
+        }
+    }
+    const Clock::time_point now = Clock::now();
+    const auto halfVsync = std::chrono::microseconds(8342);
+    auto job = [&](std::shared_ptr<const ps2x_interp::Frame> frame, bool vsyncAfter, Clock::time_point due)
+    {
+        FramePresenter::Job j;
+        j.frame = std::move(frame);
+        j.vsync = vsyncAfter;
+        std::memcpy(j.regs, regValues, sizeof(j.regs));
+        j.field = field;
+        j.due = due;
+        return j;
+    };
+    if (frames.empty())
+    {
+        p.push(job(nullptr, true, now));
+        return;
+    }
+    for (size_t i = 0; i + 1 < frames.size(); ++i)
+        p.push(job(frames[i], false, now));
+    const std::shared_ptr<const ps2x_interp::Frame> newest = frames.back();
+    const bool movie = ps2xPcsx2MoviePlaying();
+    if (p.previous && !movie)
+    {
+        auto middle = std::make_shared<ps2x_interp::Frame>();
+        ps2x_interp::Stats stats;
+        ps2x_interp::buildMiddle(*p.previous, *newest, *middle, stats);
+        p.total.batches += stats.batches;
+        p.total.paired += stats.paired;
+        p.total.moved += stats.moved;
+        p.total.rejected += stats.rejected;
+        if (++p.reported % 300u == 0u)
+        {
+            std::cerr << "[GSPcsx2Backend] interpolation, last 300 frames: " << p.total.batches << " batches, "
+                      << p.total.paired << " paired, " << p.total.moved << " moved, " << p.total.rejected
+                      << " rejected; draws to FBP " << stats.frameFirst << ".." << stats.frameLast << ", shows FBP "
+                      << (regValues[3] & 0x1FFu) << "/" << (regValues[5] & 0x1FFu) << "; latest picture " << p.worstLateMicros.exchange(0, std::memory_order_relaxed) / 1000.0 << " ms late" << std::endl;
+            p.total = ps2x_interp::Stats{};
+        }
+        FramePresenter::Job first = job(middle, true, now);
+        FramePresenter::Job second = job(newest, true, now + halfVsync);
+        if (!p.dumpDir.empty() && p.dumped < 240u &&
+            std::chrono::duration<double>(now - p.started).count() >= p.dumpAfter)
+        {
+            char name[64];
+            std::snprintf(name, sizeof(name), "\\frame_%06u_m.png", p.dumped);
+            first.snapshot = p.dumpDir + name;
+            std::snprintf(name, sizeof(name), "\\frame_%06u_n.png", p.dumped);
+            second.snapshot = p.dumpDir + name;
+            ++p.dumped;
+        }
+        p.push(std::move(first));
+        p.push(std::move(second));
+    }
+    else
+    {
+        p.push(job(newest, true, now));
+    }
+    p.previous = newest;
+}
+
+void GSPcsx2Backend::Impl::runPresenter()
+{
+    FramePresenter &p = *presenter;
+    for (;;)
+    {
+        FramePresenter::Job j;
+        {
+            std::unique_lock<std::mutex> lock(p.queueMutex);
+            p.queueChanged.wait(lock, [&] { return p.stopping || !p.queue.empty(); });
+            if (p.stopping)
+                return;
+            j = std::move(p.queue.front());
+            p.queue.pop_front();
+        }
+        std::this_thread::sleep_until(j.due);
+        if (j.frame)
+        {
+            for (const ps2x_interp::Packet &packet : j.frame->packets)
+                gif(packet.path, j.frame->data.data() + packet.offset, packet.size);
+        }
+        if (!j.vsync)
+            continue;
+        if (!j.snapshot.empty())
+            snapshot(j.snapshot.c_str());
+        writeRegs(j.regs);
+        vsync(j.field);
+        const int64_t late = std::chrono::duration_cast<std::chrono::microseconds>(FramePresenter::Clock::now() - j.due).count();
+        if (late > p.worstLateMicros.load(std::memory_order_relaxed))
+            p.worstLateMicros.store(late, std::memory_order_relaxed);
+    }
 }
 
 void GSPcsx2Backend::Initialize(uint8_t *, uint32_t)
@@ -274,7 +500,7 @@ void GSPcsx2Backend::ProcessGif(uint32_t path, const uint8_t *data, uint32_t siz
     if (!m_impl->ready.load(std::memory_order_acquire) || !data || sizeBytes < 16)
         return;
     // The arbiter numbers paths 1-3; anything else is treated as PATH3.
-    m_impl->gif(path >= 1 && path <= 3 ? path : 3u, data, sizeBytes & ~15u);
+    m_impl->send(path >= 1 && path <= 3 ? path : 3u, data, sizeBytes & ~15u);
 }
 
 // A register write outside any GIF packet becomes a one-register A+D packet. It goes on PATH2 so
@@ -289,7 +515,7 @@ void GSPcsx2Backend::WriteRegister(uint8_t regAddr, uint64_t value)
     packet[1] = 0xEull;                             // A+D
     packet[2] = value;
     packet[3] = regAddr;
-    m_impl->gif(2u, packet, sizeof(packet));
+    m_impl->send(2u, packet, sizeof(packet));
 }
 
 // Image data written through HWREG, after BITBLTBUF/TRXPOS/TRXREG/TRXDIR were set the same way.
@@ -303,7 +529,7 @@ void GSPcsx2Backend::UploadImage(const uint8_t *data, uint32_t sizeBytes)
     const uint64_t tag = static_cast<uint64_t>(qwords & 0x7FFFu) | (1ull << 15) | (2ull << 58); // IMAGE, EOP
     std::memcpy(packet.data(), &tag, sizeof(tag));
     std::memcpy(packet.data() + 16, data, sizeBytes);
-    m_impl->gif(2u, packet.data(), static_cast<unsigned>(packet.size()));
+    m_impl->send(2u, packet.data(), static_cast<unsigned>(packet.size()));
 }
 
 PresentationFrame GSPcsx2Backend::Present(const GSPresentationRequest &request)
@@ -337,16 +563,8 @@ PresentationFrame GSPcsx2Backend::Present(const GSPresentationRequest &request)
         g_ps2xUpscaleRate.store(static_cast<int>(m_impl->upscale), std::memory_order_relaxed);
     }
 
-    uint8_t *regs = static_cast<uint8_t *>(m_impl->regs());
-    auto put = [regs](size_t offset, uint64_t value) { std::memcpy(regs + offset, &value, sizeof(value)); };
-    put(kPmode, request.pmode);
-    put(kSmode1, kSmode1Ntsc);
-    put(kSmode2, request.smode2);
-    put(kDispfb1, request.dispfb1);
-    put(kDisplay1, request.display1);
-    put(kDispfb2, request.dispfb2);
-    put(kDisplay2, request.display2);
-    put(kBgcolor, request.bgcolor);
+    const uint64_t regValues[8] = {request.pmode, kSmode1Ntsc, request.smode2, request.dispfb1,
+                                   request.display1, request.dispfb2, request.display2, request.bgcolor};
     // Movies (ps2xPcsx2NoteMoviePicture): PCSX2 is told one is playing, and draws it with its software
     // renderer. Queued before this vsync, so the switches land between frames.
     {
@@ -372,7 +590,15 @@ PresentationFrame GSPcsx2Backend::Present(const GSPresentationRequest &request)
             g_movieSoftware = movie;
         }
     }
-    m_impl->vsync(m_impl->field);
+    if (m_impl->presenter)
+    {
+        m_impl->presentInterpolated(regValues);
+    }
+    else
+    {
+        m_impl->writeRegs(regValues);
+        m_impl->vsync(m_impl->field);
+    }
     m_impl->field ^= 1u;
 
     result.presentedToDisplay = true;

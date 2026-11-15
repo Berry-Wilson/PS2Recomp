@@ -3548,6 +3548,9 @@ void PS2Runtime::run()
             static bool s_showRate = false;
             if (hostinput::IsKeyPressed(KEY_F3))
                 s_showRate = !s_showRate;
+            // F11 switches between full screen and a window.
+            if (hostinput::IsKeyPressed(KEY_F11))
+                display.toggleFullscreen();
             // PCSX2 draws the picture, so these lines go to its overlay.
             ps2xPcsx2SetOverlay(0u, s_showRate ? text : "", rateColor);
             ps2xPcsx2SetOverlay(1u, notice, IM_COL32(255, 255, 255, 255));

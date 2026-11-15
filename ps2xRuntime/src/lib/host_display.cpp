@@ -36,7 +36,44 @@ namespace
 struct HostDisplay::Impl
 {
     GLFWwindow *window = nullptr;
+    // Where the window goes when it leaves full screen. Without a position, it is centred.
+    int windowedWidth = 0;
+    int windowedHeight = 0;
+    int windowedX = 0;
+    int windowedY = 0;
+    bool hasWindowedPos = false;
 };
+
+namespace
+{
+    // The monitor with most of the window on it, else the primary one.
+    GLFWmonitor *monitorUnder(GLFWwindow *window)
+    {
+        int wx = 0, wy = 0, ww = 0, wh = 0;
+        glfwGetWindowPos(window, &wx, &wy);
+        glfwGetWindowSize(window, &ww, &wh);
+        int count = 0;
+        GLFWmonitor **monitors = glfwGetMonitors(&count);
+        GLFWmonitor *best = glfwGetPrimaryMonitor();
+        long long bestArea = 0;
+        for (int i = 0; i < count; ++i)
+        {
+            const GLFWvidmode *mode = glfwGetVideoMode(monitors[i]);
+            if (!mode)
+                continue;
+            int mx = 0, my = 0;
+            glfwGetMonitorPos(monitors[i], &mx, &my);
+            const long long w = std::max(0, std::min(wx + ww, mx + mode->width) - std::max(wx, mx));
+            const long long h = std::max(0, std::min(wy + wh, my + mode->height) - std::max(wy, my));
+            if (w * h > bestArea)
+            {
+                bestArea = w * h;
+                best = monitors[i];
+            }
+        }
+        return best;
+    }
+}
 
 HostDisplay::HostDisplay() : m_impl(std::make_unique<Impl>()) {}
 
@@ -103,13 +140,43 @@ bool HostDisplay::create(const char *title, int width, int height)
     // The renderer makes its own swapchain on a child window, so this one gets no client API.
     glfwWindowHint(GLFW_CLIENT_API, GLFW_NO_API);
     glfwWindowHint(GLFW_RESIZABLE, GLFW_TRUE);
-    GLFWwindow *window = glfwCreateWindow(width, height, title, nullptr, nullptr);
+    glfwWindowHint(GLFW_AUTO_ICONIFY, GLFW_FALSE); // full screen stays up when another window takes focus
+    const int windowedWidth = width;
+    const int windowedHeight = height;
+
+    // PS2X_FULLSCREEN=1 covers the primary monitor at its current mode, so the display mode doesn't
+    // change, and PS2X_WINDOW_SIZE isn't used. The child window follows this one's size.
+    GLFWmonitor *monitor = nullptr;
+    if (const char *value = std::getenv("PS2X_FULLSCREEN"); value && std::strcmp(value, "1") == 0)
+    {
+        monitor = glfwGetPrimaryMonitor();
+        if (const GLFWvidmode *mode = monitor ? glfwGetVideoMode(monitor) : nullptr)
+        {
+            glfwWindowHint(GLFW_RED_BITS, mode->redBits);
+            glfwWindowHint(GLFW_GREEN_BITS, mode->greenBits);
+            glfwWindowHint(GLFW_BLUE_BITS, mode->blueBits);
+            glfwWindowHint(GLFW_REFRESH_RATE, mode->refreshRate);
+            width = mode->width;
+            height = mode->height;
+        }
+        else
+        {
+            std::cerr << "[HostDisplay] no monitor found for PS2X_FULLSCREEN, opening a window" << std::endl;
+            monitor = nullptr;
+        }
+    }
+    GLFWwindow *window = glfwCreateWindow(width, height, title, monitor, nullptr);
     if (!window)
     {
         std::cerr << "[HostDisplay] Failed to create the window" << std::endl;
         return false;
     }
     display->m_impl->window = window;
+    display->m_impl->windowedWidth = windowedWidth;
+    display->m_impl->windowedHeight = windowedHeight;
+    display->m_impl->hasWindowedPos = monitor == nullptr;
+    if (!monitor)
+        glfwGetWindowPos(window, &display->m_impl->windowedX, &display->m_impl->windowedY);
     hostinput::attach(window);
 
     s_display = std::move(display);
@@ -140,4 +207,36 @@ bool HostDisplay::shouldClose() const
 void HostDisplay::hide()
 {
     glfwHideWindow(m_impl->window);
+}
+
+void HostDisplay::toggleFullscreen()
+{
+    Impl &impl = *m_impl;
+    if (GLFWmonitor *current = glfwGetWindowMonitor(impl.window))
+    {
+        int x = impl.windowedX, y = impl.windowedY;
+        if (!impl.hasWindowedPos)
+        {
+            int ax = 0, ay = 0, aw = 0, ah = 0;
+            glfwGetMonitorWorkarea(current, &ax, &ay, &aw, &ah);
+            x = ax + std::max(0, (aw - impl.windowedWidth) / 2);
+            y = ay + std::max(0, (ah - impl.windowedHeight) / 2);
+        }
+        glfwSetWindowMonitor(impl.window, nullptr, x, y, impl.windowedWidth, impl.windowedHeight, GLFW_DONT_CARE);
+        std::cerr << "[HostDisplay] windowed, " << impl.windowedWidth << "x" << impl.windowedHeight << std::endl;
+        return;
+    }
+    glfwGetWindowPos(impl.window, &impl.windowedX, &impl.windowedY);
+    glfwGetWindowSize(impl.window, &impl.windowedWidth, &impl.windowedHeight);
+    impl.hasWindowedPos = true;
+    GLFWmonitor *monitor = monitorUnder(impl.window);
+    const GLFWvidmode *mode = monitor ? glfwGetVideoMode(monitor) : nullptr;
+    if (!mode)
+    {
+        std::cerr << "[HostDisplay] no monitor found for full screen" << std::endl;
+        return;
+    }
+    // The monitor's current mode, so the display mode doesn't change.
+    glfwSetWindowMonitor(impl.window, monitor, 0, 0, mode->width, mode->height, mode->refreshRate);
+    std::cerr << "[HostDisplay] full screen, " << mode->width << "x" << mode->height << std::endl;
 }
