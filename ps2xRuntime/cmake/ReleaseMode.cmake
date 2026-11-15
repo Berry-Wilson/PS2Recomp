@@ -32,6 +32,23 @@ function(EnableFastReleaseMode TargetName)
                 >
             )
         endif()
+    elseif(NOT PS2X_IS_ARM_TARGET AND CMAKE_CXX_COMPILER_ID MATCHES "Clang|GNU")
+        # The same CPU level as MSVC's /arch:AVX2; the translated code uses SSE4.1 and AVX
+        # intrinsics, which clang and GCC only allow with the target feature on. No contraction of
+        # a * b + c into one rounding, so float results match a plain build.
+        target_compile_options(${TargetName} PRIVATE
+            $<$<CONFIG:Release>:
+                -mavx2
+                -mfma
+                -ffp-contract=off
+                -fno-math-errno
+            >
+        )
+    endif()
+
+    if(MINGW)
+        # The C++ library and its unwinder go into the program, so it doesn't need the toolchain's DLLs.
+        target_link_options(${TargetName} PRIVATE -static-libstdc++ -static-libgcc)
     endif()
 
     if(IPO_SUPPORTED)

@@ -546,6 +546,9 @@ target_include_directories(ps2_runtime PUBLIC
 )
 
 target_link_libraries(ps2_runtime PUBLIC ps2_host_backend ffmpeg ps2_iop)
+if(WIN32)
+    target_link_libraries(ps2_runtime PUBLIC dbghelp) # ps2_write_watch.cpp names the writing code
+endif()
 
 if(PS2X_USE_HOST_DISPLAY)
     target_compile_definitions(ps2_runtime PUBLIC PS2X_HAS_HOST_DISPLAY=1)

@@ -154,7 +154,11 @@ namespace ps2recomp
         {
             file << "# Detected MMIO accesses\n";
             file << "[mmio]\n";
-            for (const auto &[instAddr, mmioAddr] : input.mmioByInstructionAddress)
+            // By instruction address, so the file doesn't depend on the hash map's order.
+            std::vector<std::pair<uint32_t, uint32_t>> mmio(input.mmioByInstructionAddress.begin(),
+                                                             input.mmioByInstructionAddress.end());
+            std::sort(mmio.begin(), mmio.end());
+            for (const auto &[instAddr, mmioAddr] : mmio)
             {
                 file << "\"0x" << std::hex << instAddr << "\" = \"0x" << mmioAddr << "\"\n"
                      << std::dec;

@@ -1103,10 +1103,11 @@ static void UploadFrame(HostFrameTarget &tex, PS2Runtime *rt, uint32_t &outWidth
         FrameDumpSettings &dumps = FrameDumps();
         if (dumps.due(frameIndex))
         {
-            char path[1024];
-            std::snprintf(path, sizeof(path), "%s/frame_%06llu.png", dumps.dir,
-                          static_cast<unsigned long long>(frameIndex));
-            ps2xPcsx2QueueSnapshot(std::filesystem::absolute(path).string().c_str());
+            char name[32];
+            std::snprintf(name, sizeof(name), "frame_%06llu.png", static_cast<unsigned long long>(frameIndex));
+            // Backslashes for PCSX2 on Windows: not every C++ library's absolute() converts them.
+            const std::filesystem::path path = std::filesystem::absolute(std::filesystem::path(dumps.dir) / name).make_preferred();
+            ps2xPcsx2QueueSnapshot(path.string().c_str());
             --dumps.left;
         }
     }
