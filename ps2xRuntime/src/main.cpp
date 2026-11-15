@@ -179,8 +179,11 @@ int main(int argc, char *argv[])
 
         std::string filePathStr = pathObj.string();
         std::string elfName = pathObj.filename().string();
-        std::string normalizedId = normalizeGameId(elfName);
 
+#if defined(PS2X_WINDOW_TITLE)
+        std::string windowTitle = PS2X_WINDOW_TITLE;
+#else
+        std::string normalizedId = normalizeGameId(elfName);
         std::string windowTitle = "PS2-Recomp | ";
         const char *gameName = getGameName(normalizedId);
 
@@ -194,6 +197,7 @@ int main(int argc, char *argv[])
         {
             windowTitle += elfName;
         }
+#endif
 
         PS2Runtime runtime;
 #if defined(PS2X_ENABLE_DEBUG_UI) && !defined(PLATFORM_VITA)

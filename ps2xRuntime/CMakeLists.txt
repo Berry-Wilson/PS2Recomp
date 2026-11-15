@@ -628,6 +628,29 @@ if(CMAKE_BUILD_TYPE STREQUAL "Release" OR CMAKE_BUILD_TYPE STREQUAL "RelWithDebI
     endif()
 endif()
 
+# A game port can name its window and give the runner an icon. The title is defined for main.cpp
+# alone, so changing it rebuilds one file. On Windows the icon becomes the exe's icon, and GLFW
+# uses it for the window and taskbar (the GLFW_ICON resource).
+set(PS2X_WINDOW_TITLE "" CACHE STRING "Game window title; empty keeps \"PS2-Recomp | game | ELF\"")
+set(PS2X_RUNNER_ICON "" CACHE FILEPATH "Windows .ico for ps2EntryRunner and its window; optional")
+
+if(PS2X_WINDOW_TITLE)
+    set_property(SOURCE "${RUNNER_MAIN_CPP}" "${ROOT_MAIN_CPP}" APPEND PROPERTY
+        COMPILE_DEFINITIONS "PS2X_WINDOW_TITLE=\"${PS2X_WINDOW_TITLE}\"")
+    set_property(SOURCE "${RUNNER_MAIN_CPP}" "${ROOT_MAIN_CPP}" PROPERTY SKIP_UNITY_BUILD_INCLUSION TRUE)
+endif()
+
+if(WIN32 AND PS2X_RUNNER_ICON)
+    if(NOT EXISTS "${PS2X_RUNNER_ICON}")
+        message(FATAL_ERROR "PS2X_RUNNER_ICON doesn't exist: ${PS2X_RUNNER_ICON}")
+    endif()
+    file(TO_CMAKE_PATH "${PS2X_RUNNER_ICON}" PS2X_RUNNER_ICON_PATH)
+    file(CONFIGURE OUTPUT "${CMAKE_CURRENT_BINARY_DIR}/ps2x_runner_icon.rc"
+         CONTENT "GLFW_ICON ICON \"@PS2X_RUNNER_ICON_PATH@\"\n" @ONLY)
+    set_property(SOURCE "${CMAKE_CURRENT_BINARY_DIR}/ps2x_runner_icon.rc" APPEND PROPERTY OBJECT_DEPENDS "${PS2X_RUNNER_ICON}")
+    target_sources(ps2EntryRunner PRIVATE "${CMAKE_CURRENT_BINARY_DIR}/ps2x_runner_icon.rc")
+endif()
+
 # Work around WinAPI vs raylib symbol clash for CloseWindow on x64
 if(MSVC)
     target_link_options(ps2EntryRunner PRIVATE "/FORCE:MULTIPLE")
