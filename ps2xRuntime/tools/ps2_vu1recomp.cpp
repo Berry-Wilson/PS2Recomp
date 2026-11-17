@@ -775,6 +775,40 @@ static const uint32_t vu1MacSignBits[16] = {0x00u, 0x80u, 0x40u, 0xC0u, 0x20u, 0
                 bumpVi(vit, 1);
             o << "    }\n";
             return true;
+        case 0x38: // DIV
+        case 0x3A: // RSQRT
+        {
+            const unsigned fsf = (lower >> 21) & 3u, ftf = (lower >> 23) & 3u;
+            o << "    { // " << (funct2 == 0x38u ? "DIV" : "RSQRT") << " inline\n";
+            o << "        const float num = vu1NormalizeOperand(st.vf[" << fs << "][" << fsf << "]);\n";
+            if (funct2 == 0x38u)
+            {
+                o << "        const float den = vu1NormalizeOperand(st.vf[" << ft << "][" << ftf << "]);\n";
+                o << "        uint32_t statusDi = 0u; float result = 0.0f;\n";
+                o << "        if (den == 0.0f) { statusDi = num == 0.0f ? 0x10u : 0x20u; result = std::signbit(num) != std::signbit(den) ? "
+                     "-std::numeric_limits<float>::max() : std::numeric_limits<float>::max(); }\n";
+                o << "        else result = num / den;\n";
+                o << "        A::queueQ(vu, A::normalizeResult(vu, result), 7u, statusDi);\n    }\n";
+            }
+            else
+            {
+                o << "        const float radicand = vu1NormalizeOperand(st.vf[" << ft << "][" << ftf << "]);\n";
+                o << "        const float den = std::sqrt(std::fabs(radicand));\n";
+                o << "        uint32_t statusDi = radicand < 0.0f ? 0x10u : 0u; float result = 0.0f;\n";
+                o << "        if (den != 0.0f) result = num / den;\n";
+                o << "        else { statusDi = num == 0.0f ? 0x10u : 0x20u; result = std::signbit(num) ? -std::numeric_limits<float>::max() : "
+                     "std::numeric_limits<float>::max(); }\n";
+                o << "        A::queueQ(vu, A::normalizeResult(vu, result), 13u, statusDi);\n    }\n";
+            }
+            return true;
+        }
+        case 0x39: // SQRT
+        {
+            const unsigned ftf = (lower >> 23) & 3u;
+            o << "    { // SQRT inline\n        const float val = vu1NormalizeOperand(st.vf[" << ft << "][" << ftf << "]);\n";
+            o << "        A::queueQ(vu, std::sqrt(std::fabs(val)), 7u, val < 0.0f ? 0x10u : 0u);\n    }\n";
+            return true;
+        }
         case 0x3B: // WAITQ: the stall terms above already waited for Q
             return true;
         case 0x3C: // MTIR: fsf selector in bits 22:21
@@ -814,6 +848,9 @@ static const uint32_t vu1MacSignBits[16] = {0x00u, 0x80u, 0x40u, 0xC0u, 0x20u, 0
             lanes(vfDst, "tmp");
             o << " }\n";
             return true;
+        case 0x6C: // XGKICK (the stall terms above waited for the previous packet)
+            o << "    A::startXgkick(vu, static_cast<uint32_t>(static_cast<uint16_t>(st.vi[" << vis << "])));\n";
+            return true;
         case 0x68: // XTOP
         case 0x69: // XITOP
             if (vit != 0u)
@@ -821,6 +858,48 @@ static const uint32_t vu1MacSignBits[16] = {0x00u, 0x80u, 0x40u, 0xC0u, 0x20u, 0
             return true;
         case 0x7B: // WAITP: the stall terms above already waited for P
             return true;
+        // EFU ops with plain float formulas (mirroring execLower; transcendentals stay there).
+        case 0x70: // ESADD
+        case 0x71: // ERSADD
+        case 0x72: // ELENG
+        case 0x73: // ERLENG
+        {
+            o << "    { // EFU inline\n";
+            for (uint32_t c = 0; c < 3u; ++c)
+                o << "        const float " << "xyz"[c] << " = vu1NormalizeOperand(st.vf[" << fs << "][" << c << "]);\n";
+            if (funct2 == 0x70u)
+                o << "        A::queueP(vu, x * x + y * y + z * z, 11u);\n";
+            else if (funct2 == 0x71u)
+                o << "        const float sum = x * x + y * y + z * z;\n        A::queueP(vu, sum != 0.0f ? 1.0f / sum : sum, 18u);\n";
+            else if (funct2 == 0x72u)
+                o << "        A::queueP(vu, std::sqrt(x * x + y * y + z * z), 18u);\n";
+            else
+                o << "        const float len = std::sqrt(x * x + y * y + z * z);\n        A::queueP(vu, len != 0.0f ? 1.0f / len : len, 24u);\n";
+            o << "    }\n";
+            return true;
+        }
+        case 0x76: // ESUM
+            o << "    { // ESUM inline\n        float sum = 0.0f;\n";
+            for (uint32_t c = 0; c < 4u; ++c)
+                o << "        sum += vu1NormalizeOperand(st.vf[" << fs << "][" << c << "]);\n";
+            o << "        A::queueP(vu, sum, 12u);\n    }\n";
+            return true;
+        case 0x78: // ESQRT
+        case 0x79: // ERSQRT
+        case 0x7A: // ERCPR
+        {
+            const unsigned component = (lower >> 21) & 3u;
+            o << "    { // EFU inline\n        const float value = vu1NormalizeOperand(st.vf[" << fs << "][" << component << "]);\n";
+            if (funct2 == 0x78u)
+                o << "        A::queueP(vu, value >= 0.0f ? std::sqrt(value) : value, 12u);\n";
+            else if (funct2 == 0x79u)
+                o << "        float result = value;\n        if (result >= 0.0f) { result = std::sqrt(result); if (result != 0.0f) result = 1.0f / result; }\n"
+                     "        A::queueP(vu, result, 18u);\n";
+            else
+                o << "        A::queueP(vu, value != 0.0f ? 1.0f / value : value, 12u);\n";
+            o << "    }\n";
+            return true;
+        }
         default:
             return false;
         }
@@ -904,6 +983,23 @@ static const uint32_t vu1MacSignBits[16] = {0x00u, 0x80u, 0x40u, 0xC0u, 0x20u, 0
         case 0x1A: // FMAND
             viWrite(vit, "static_cast<int32_t>(st.mac & static_cast<uint32_t>(static_cast<uint16_t>(st.vi[" + std::to_string(vis) +
                              "])))");
+            return true;
+        case 0x20: // B
+        case 0x21: // BAL
+        {
+            const uint32_t target = (pc + 8u + static_cast<uint32_t>(imm11 * 8)) & kPcMask;
+            if (opHi == 0x21u)
+                viWrite(vit, std::to_string((pc + 16u) / 8u));
+            o << "    st.branchPending = true; st.branchTarget = " << target << "u & pcMask; st.branchDelay = 1;\n";
+            return true;
+        }
+        case 0x24: // JR
+        case 0x25: // JALR
+            o << "    { const uint32_t target = (static_cast<uint32_t>(static_cast<uint16_t>(A::readBranchVi(vu, " << vis
+              << "))) * 8u) & pcMask;";
+            if (opHi == 0x25u && vit != 0u)
+                o << " st.vi[" << vit << "] = " << (pc + 16u) / 8u << ";";
+            o << " st.branchPending = true; st.branchTarget = target; st.branchDelay = 1; }\n";
             return true;
         case 0x28: // IBEQ
         case 0x29: // IBNE

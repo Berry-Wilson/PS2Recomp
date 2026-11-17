@@ -146,11 +146,10 @@ public:
     {
         if (vu.m_cycle < vu.m_nextCommitCycle)
             return;
-        // Compiled code mostly has only FMAC flag writes in flight (stores are written at once,
-        // VF/VI/ACC use immediate writeback): commit those inline, exactly as
-        // commitReadyPipelinesNow does, instead of calling it every few cycles.
-        if ((vu.m_storeValidMask | vu.m_vfWriteValidMask | vu.m_viWriteValidMask | vu.m_accWriteValidMask) != 0u ||
-            vu.m_fdiv.valid || vu.m_efu[0].valid || vu.m_efu[1].valid)
+        // Compiled code mostly has FMAC flags, Q (FDIV) and P (EFU) in flight (stores are written
+        // at once, VF/VI/ACC use immediate writeback): commit those inline, in the same order as
+        // commitReadyPipelinesNow (flags, Q, P), instead of calling it every few cycles.
+        if ((vu.m_storeValidMask | vu.m_vfWriteValidMask | vu.m_viWriteValidMask | vu.m_accWriteValidMask) != 0u)
         {
             vu.commitReadyPipelinesNow();
             return;
@@ -182,6 +181,30 @@ public:
             entry.valid = false;
             vu.m_flagValidMask &= ~(1u << slot);
         }
+        if (vu.m_fdiv.valid)
+        {
+            if (vu.m_fdiv.readyCycle <= vu.m_cycle)
+            {
+                vu.m_state.q = vu.m_fdiv.value;
+                const uint32_t currentDi = vu.m_fdiv.statusDi & 0x30u;
+                vu.m_state.status = (vu.m_state.status & 0xFCFu) | currentDi | (currentDi << 6);
+                vu.m_fdiv = {};
+            }
+            else if (vu.m_fdiv.readyCycle < next)
+                next = vu.m_fdiv.readyCycle;
+        }
+        for (auto &entry : vu.m_efu)
+        {
+            if (!entry.valid)
+                continue;
+            if (entry.readyCycle <= vu.m_cycle)
+            {
+                vu.m_state.p = entry.value;
+                entry = {};
+            }
+            else if (entry.readyCycle < next)
+                next = entry.readyCycle;
+        }
         vu.m_nextCommitCycle = next;
     }
     PS2X_VU1_FORCEINLINE static void advanceTo(VU1Interpreter &vu, uint64_t target) { vu.advanceTo(target); }
@@ -199,6 +222,17 @@ public:
     PS2X_VU1_FORCEINLINE static void clearViBranchBackup(VU1Interpreter &vu) { vu.m_viBranchBackupValid = false; }
     PS2X_VU1_FORCEINLINE static uint32_t microAddressMask(const VU1Interpreter &vu) { return vu.microAddressMask(); }
     PS2X_VU1_FORCEINLINE static float normalizeOperand(const VU1Interpreter &vu, float value) { return vu.normalizeOperand(value); }
+    PS2X_VU1_FORCEINLINE static float normalizeResult(const VU1Interpreter &vu, float value)
+    {
+        uint32_t ignoredFlags = 0u;
+        return vu.normalizeResult(value, ignoredFlags);
+    }
+    PS2X_VU1_FORCEINLINE static void queueQ(VU1Interpreter &vu, float value, uint32_t latency, uint32_t statusDi)
+    {
+        vu.queueQ(value, latency, statusDi);
+    }
+    PS2X_VU1_FORCEINLINE static void queueP(VU1Interpreter &vu, float value, uint32_t latency) { vu.queueP(value, latency); }
+    PS2X_VU1_FORCEINLINE static void startXgkick(VU1Interpreter &vu, uint32_t qwordAddress) { vu.startXgkick(qwordAddress); }
 
     PS2X_VU1_FORCEINLINE static void execUpper(VU1Interpreter &vu, uint32_t instr) { vu.execUpper(instr); }
     PS2X_VU1_FORCEINLINE static void execLower(VU1Interpreter &vu, uint32_t instr, uint32_t upper)
