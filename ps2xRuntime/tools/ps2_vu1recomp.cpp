@@ -968,10 +968,90 @@ static const uint32_t vu1MacSignBits[16] = {0x00u, 0x80u, 0x40u, 0xC0u, 0x20u, 0
         for (uint32_t reg = 1; reg < 16u; ++reg)
             if ((usage.viRead & (1u << reg)) != 0u)
                 keep(g_block.vi[reg], "A::viReady(vu, " + std::to_string(reg) + ")");
-        for (uint32_t c = 0; c < 4u; ++c)
-            if ((usage.accRead & laneForComponent(c)) != 0u)
-                keep(g_block.acc[c], "A::accReady(vu, " + std::to_string(c) + ")");
+        // ACC needs no check: every ACC write has latency 1 (kAccForwardLatency) and every pair
+        // advances at least one cycle, so the next reader always finds ACC ready.
     }
+
+    // Static facts about the pairs around a pair, for leaving out per-pair bookkeeping that no
+    // later pair can observe.
+    bool isDelaySlot(const VU1Interpreter &vu, const uint8_t *code, uint32_t pc)
+    {
+        if (pc < 8u)
+            return false;
+        const uint32_t prev = pc - 8u;
+        const Flow flow = lowerFlow(prev, A::decode(vu, code, prev).lower);
+        return flow.staticBranch || flow.jump;
+    }
+
+    // Control may continue somewhere other than pc + 8 after this pair (delay slot of a taken
+    // branch or jump, program end, D/T halts, a fallback to the interpreter).
+    bool mayLeaveAfter(const VU1Interpreter &vu, const uint8_t *code, const std::set<uint32_t> &compiled, uint32_t pc)
+    {
+        const A::Decoded d = A::decode(vu, code, pc);
+        if (isDelaySlot(vu, code, pc) || d.eBit || d.dBit || d.tBit || d.upperUsage.reserved || d.lowerUsage.reserved)
+            return true;
+        if (pc >= 8u)
+        {
+            const A::Decoded pd = A::decode(vu, code, pc - 8u);
+            if (pd.eBit || pd.dBit || pd.tBit)
+                return true;
+        }
+        return compiled.count((pc + 8u) & kPcMask) == 0u;
+    }
+
+    bool pairReadsVf(const A::Decoded &d, unsigned reg, uint8_t lanes)
+    {
+        for (const A::Usage *usage : {&d.upperUsage, &d.lowerUsage})
+            for (uint32_t i = 0; i < usage->vfReadCount; ++i)
+                if (usage->vfRead[i].reg == reg && (usage->vfRead[i].lanes & lanes) != 0u)
+                    return true;
+        return false;
+    }
+
+    // A VF ready-time store only matters to a reader that could still find the register pending:
+    // one of the next latency - 1 pairs, or any pair after the block ends within that window (a
+    // later block or the interpreter reads the table). For latency >= 3 an older value left in the
+    // table instead (at most 3 cycles past this pair) cannot hold up a reader at distance
+    // >= latency either.
+    bool vfReadyStoreNeeded(const VU1Interpreter &vu, const uint8_t *code, const std::set<uint32_t> &compiled, uint32_t pc,
+                            unsigned reg, uint8_t lanes, unsigned latency)
+    {
+        if (latency < 3u)
+            return true;
+        for (uint32_t k = 1; k < latency; ++k)
+        {
+            if (mayLeaveAfter(vu, code, compiled, (pc + 8u * (k - 1u)) & kPcMask))
+                return true;
+            const uint32_t q = (pc + 8u * k) & kPcMask;
+            if (g_blockStarts.count(q) != 0u)
+                return true;
+            if (pairReadsVf(A::decode(vu, code, q), reg, lanes))
+                return true;
+        }
+        return false;
+    }
+
+    // The VI branch backup is read only by a branch in the next executed pair: the next pair when
+    // it is a branch, or anything after a delay slot (the jump target is not known statically).
+    bool viBackupNeeded(const VU1Interpreter &vu, const uint8_t *code, const std::set<uint32_t> &compiled, uint32_t pc)
+    {
+        if (isDelaySlot(vu, code, pc))
+            return true;
+        const uint32_t next = (pc + 8u) & kPcMask;
+        if (compiled.count(next) == 0u)
+            return true;
+        const Flow flow = lowerFlow(next, A::decode(vu, code, next).lower);
+        return flow.staticBranch || flow.jump;
+    }
+
+    bool pairRecordsViBackup(const VU1Interpreter &vu, const uint8_t *code, const std::set<uint32_t> &compiled, uint32_t pc)
+    {
+        const A::Decoded d = A::decode(vu, code, pc);
+        return (d.lowerUsage.viWrite & 0xFFFEu) != 0u && d.lowerUsage.delaysNextBranchRead &&
+               viBackupNeeded(vu, code, compiled, pc);
+    }
+
+    uint32_t g_vfStoresSkipped = 0u, g_vfStoresKept = 0u;
 
     uint32_t inlinedSimple = 0u;
     uint32_t inlinedFlags = 0u;
@@ -1106,7 +1186,10 @@ static const uint32_t vu1MacSignBits[16] = {0x00u, 0x80u, 0x40u, 0xC0u, 0x20u, 0
                     o << "    A::execLower(vu, " << hex32(d.lower) << ", " << hex32(d.upper) << ");\n";
             }
         }
-        o << "    A::clearViBranchBackup(vu);\n";
+        // The backup can only be valid if the previous pair recorded one, or on entering a block
+        // (jump targets, interpreter entries).
+        if (blockStart || pc < 8u || pairRecordsViBackup(vu, code, compiled, pc - 8u))
+            o << "    A::clearViBranchBackup(vu);\n";
 
         // Immediate writeback (mirrors run()).
         if (hasUpperWrite && laneExactWriteback)
@@ -1138,20 +1221,27 @@ static const uint32_t vu1MacSignBits[16] = {0x00u, 0x80u, 0x40u, 0xC0u, 0x20u, 0
             o << "    st.vi[" << unsigned(writtenVi) << "] = static_cast<int16_t>(st.vi[" << unsigned(writtenVi) << "]);\n";
 
         // markPairWrites with constants (exact timing only).
+        auto emitVfReady = [&](unsigned reg, uint8_t lanes, unsigned latency)
+        {
+            for (uint32_t c = 0; c < 4u; ++c)
+            {
+                if ((lanes & laneForComponent(c)) == 0u)
+                    continue;
+                if (!vfReadyStoreNeeded(vu, code, compiled, pc, reg, laneForComponent(c), latency))
+                {
+                    ++g_vfStoresSkipped;
+                    continue;
+                }
+                ++g_vfStoresKept;
+                o << "    A::vfReadyRef(vu, " << reg << ", " << c << ") = cyc + " << latency << "u;\n";
+            }
+        };
         if (g_exactTiming && lowerWrite.reg != 0u && d.suppressedLowerVf != lowerWrite.reg)
-        {
-            const unsigned latency = d.lowerUsage.vfLatency != 0u ? d.lowerUsage.vfLatency : d.lowerUsage.latency;
-            for (uint32_t c = 0; c < 4u; ++c)
-                if ((lowerWrite.lanes & laneForComponent(c)) != 0u)
-                    o << "    A::vfReadyRef(vu, " << unsigned(lowerWrite.reg) << ", " << c << ") = cyc + " << latency << "u;\n";
-        }
+            emitVfReady(lowerWrite.reg, lowerWrite.lanes,
+                        d.lowerUsage.vfLatency != 0u ? d.lowerUsage.vfLatency : d.lowerUsage.latency);
         if (g_exactTiming && upperWrite.reg != 0u)
-        {
-            const unsigned latency = d.upperUsage.vfLatency != 0u ? d.upperUsage.vfLatency : d.upperUsage.latency;
-            for (uint32_t c = 0; c < 4u; ++c)
-                if ((upperWrite.lanes & laneForComponent(c)) != 0u)
-                    o << "    A::vfReadyRef(vu, " << unsigned(upperWrite.reg) << ", " << c << ") = cyc + " << latency << "u;\n";
-        }
+            emitVfReady(upperWrite.reg, upperWrite.lanes,
+                        d.upperUsage.vfLatency != 0u ? d.upperUsage.vfLatency : d.upperUsage.latency);
         if (g_exactTiming)
         {
             const unsigned latency = d.lowerUsage.viLatency != 0u ? d.lowerUsage.viLatency : d.lowerUsage.latency;
@@ -1159,10 +1249,8 @@ static const uint32_t vu1MacSignBits[16] = {0x00u, 0x80u, 0x40u, 0xC0u, 0x20u, 0
                 if ((d.lowerUsage.viWrite & (1u << reg)) != 0u)
                     o << "    A::viReadyRef(vu, " << reg << ") = cyc + " << latency << "u;\n";
         }
-        for (uint32_t c = 0; g_exactTiming && c < 4u; ++c)
-            if ((d.upperUsage.accWrite & laneForComponent(c)) != 0u)
-                o << "    A::accReadyRef(vu, " << c << ") = cyc + " << A::kAccForwardLatency << "u;\n";
-        if (writtenVi != 0u && d.lowerUsage.delaysNextBranchRead)
+        // (No ACC ready stores: see emitStallTerms.)
+        if (writtenVi != 0u && d.lowerUsage.delaysNextBranchRead && viBackupNeeded(vu, code, compiled, pc))
             o << "    A::recordViWriteForBranch(vu, " << unsigned(writtenVi) << ", oldVi);\n";
         {
             const uint32_t w = g_block.index;
@@ -1217,19 +1305,40 @@ static const uint32_t vu1MacSignBits[16] = {0x00u, 0x80u, 0x40u, 0xC0u, 0x20u, 0
             o << "    const bool dHalt = " << (dBit ? "st.dBitEnabled" : "false") << ";\n";
             o << "    const bool tHalt = " << (tBit ? "st.tBitEnabled" : "false") << ";\n";
         }
-        o << "    if (st.haltAfterDelaySlot) { st.stoppedByD = A::pendingHaltD(vu); st.stoppedByT = A::pendingHaltT(vu); ended = true; }\n";
-        o << "    else if (st.ebit) ended = true;\n";
+        // st.haltAfterDelaySlot / st.ebit are set by the previous pair (a D/T-bit branch, an E-bit
+        // pair) or were set before entering at a block start.
+        bool pendingEndPossible = blockStart || pc < 8u;
+        if (!pendingEndPossible)
+        {
+            const A::Decoded pd = A::decode(vu, code, pc - 8u);
+            pendingEndPossible = pd.eBit || pd.dBit || pd.tBit;
+        }
+        if (pendingEndPossible)
+        {
+            o << "    if (st.haltAfterDelaySlot) { st.stoppedByD = A::pendingHaltD(vu); st.stoppedByT = A::pendingHaltT(vu); ended = true; }\n";
+            o << "    else if (st.ebit) ended = true;\n";
+        }
+        const char *const elseIf = pendingEndPossible ? "    else if" : "    if";
         if ((dBit || tBit) && !haltBranchPossible)
-            o << "    else if (dHalt || tHalt) { st.stoppedByD = dHalt; st.stoppedByT = tHalt; ended = true; }\n";
+            o << elseIf << " (dHalt || tHalt) { st.stoppedByD = dHalt; st.stoppedByT = tHalt; ended = true; }\n";
+        const bool anyEndBefore = pendingEndPossible || ((dBit || tBit) && !haltBranchPossible);
         if (d.eBit)
-            o << "    else st.ebit = true;\n";
+            o << (anyEndBefore ? "    else st.ebit = true;\n" : "    st.ebit = true;\n");
         else if (haltBranchPossible)
-            o << "    else if (dHalt || tHalt) { st.haltAfterDelaySlot = true; A::pendingHaltD(vu) = dHalt; A::pendingHaltT(vu) = tHalt; }\n";
+            o << (anyEndBefore ? "    else if" : "    if")
+              << " (dHalt || tHalt) { st.haltAfterDelaySlot = true; A::pendingHaltD(vu) = dHalt; A::pendingHaltT(vu) = tHalt; }\n";
         o << "    ++cyc; A::commitReadyPipelines(vu);\n";
         o << "    if (ended) return Vu1CompiledResult::Ended;\n";
+        const bool pcMayChange = pairFlow.staticBranch || pairFlow.jump || delaySlot;
         if (compiled.count(next) != 0u && chunkOf(next) == chunkOf(pc))
-            o << "    if (st.pc == " << next << "u) goto " << label(next) << ";\n";
-        o << "    goto dispatch;\n}\n";
+        {
+            if (pcMayChange)
+                o << "    if (st.pc == " << next << "u) goto " << label(next) << ";\n";
+            else
+                o << "    goto " << label(next) << ";\n}\n";
+        }
+        if (pcMayChange || compiled.count(next) == 0u || chunkOf(next) != chunkOf(pc))
+            o << "    goto dispatch;\n}\n";
     }
 }
 
@@ -1338,6 +1447,7 @@ int main(int argc, char **argv)
                     g_blockStarts.insert(pc);
             }
             g_stallChecksRemoved = g_stallChecksKept = 0u;
+            g_vfStoresSkipped = g_vfStoresKept = 0u;
         }
         char fnName[64];
         std::snprintf(fnName, sizeof(fnName), "vu1img_%016llx", static_cast<unsigned long long>(hash));
@@ -1381,7 +1491,8 @@ int main(int argc, char **argv)
         images.push_back(fnName);
         statusMasks.push_back(inlined != 0u ? 0x03Fu : 0xFFFu);
         std::cout << name << ": " << g_blockStarts.size() << " block starts, stall checks removed " << g_stallChecksRemoved
-                  << " kept " << g_stallChecksKept << " (max latency vf " << g_maxVfLatency << " vi " << g_maxViLatency << ")\n";
+                  << " kept " << g_stallChecksKept << " (max latency vf " << g_maxVfLatency << " vi " << g_maxViLatency
+                  << "); VF ready stores kept " << g_vfStoresKept << ", skipped " << g_vfStoresSkipped << "\n";
         std::cout << name << ": " << pairs.size() << " pairs from " << entries.size() << " entries; flag writers "
                   << analysis.writers << ", unobserved " << analysis.deadFlagWriters.size() << ", inlined " << inlined << " (+" << inlinedFlags << " with flags, " << inlinedSimple << " simple upper, " << inlinedLower << " lower)"
                   << (analysis.stickyObservable ? " (sticky status observable: no flag elimination)" : "") << "\n";
