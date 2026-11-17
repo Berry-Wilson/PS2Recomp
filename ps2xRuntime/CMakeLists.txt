@@ -406,6 +406,13 @@ add_library(ps2_runtime STATIC
     src/lib/games_database.cpp
 )
 
+# PCSX2's GS as a renderer, loaded at run time from pcsx2-gs/ps2x-gs.dll next to the exe
+# (PS2X_GS_BACKEND=pcsx2 at run time; build the DLL with pcsx2-gs/build-ps2x-gs.bat).
+if(WIN32)
+    target_sources(ps2_runtime PRIVATE src/lib/gs/gs_pcsx2_backend.cpp)
+    target_compile_definitions(ps2_runtime PUBLIC PS2X_GS_PCSX2=1)
+endif()
+
 if(PS2X_GS_BACKEND STREQUAL "PARALLEL_GS")
     message(STATUS "Using ParallelGS backend for PS2 graphics")
     include("${CMAKE_CURRENT_SOURCE_DIR}/cmake/ParallelGS.cmake")

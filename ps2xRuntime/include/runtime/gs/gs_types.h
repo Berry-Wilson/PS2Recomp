@@ -315,6 +315,8 @@ struct PresentationFrame
     uint32_t sourceFbp = 0;
     bool usedPreferred = false;
     float aspectRatio = 0.0f;
+    // The backend showed the frame itself (PCSX2's GS draws into its own child window).
+    bool presentedToDisplay = false;
 
     explicit operator bool() const
     {

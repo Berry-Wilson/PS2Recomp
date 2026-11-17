@@ -8,6 +8,11 @@
 #ifdef PS2X_GS_PARALLEL
 #include "runtime/gs/gs_parallel_backend.h"
 #endif
+#ifdef PS2X_GS_PCSX2
+#include "runtime/gs/gs_pcsx2_backend.h"
+// PS2X_GS_BACKEND=pcsx2 was asked for (set in initialize, the GS is opened in loadELF).
+static bool g_pcsx2Requested = false;
+#endif
 #include "runtime/ee_scheduler.h"
 #include "ThreadNaming.h"
 #include "Kernel/Stubs/Audio.h"
@@ -481,6 +486,44 @@ static void dumpPresentedFrame(const std::vector<uint8_t> &rgba, uint32_t width,
     }
 }
 
+#ifdef PS2X_GS_PCSX2
+// PS2X_FRAME_DUMP_* with PCSX2's GS: it saves the PNG itself, at its internal resolution.
+static void dumpPresentedFramePcsx2(uint64_t tick)
+{
+    static const std::string s_dir = []
+    {
+        const char *env = std::getenv("PS2X_FRAME_DUMP_DIR");
+        return std::string(env ? env : "");
+    }();
+    if (s_dir.empty())
+        return;
+    static const uint32_t s_every = []
+    {
+        const char *env = std::getenv("PS2X_FRAME_DUMP_EVERY");
+        const long value = env ? std::strtol(env, nullptr, 10) : 60;
+        return static_cast<uint32_t>(value > 0 ? value : 60);
+    }();
+    static const uint32_t s_max = []
+    {
+        const char *env = std::getenv("PS2X_FRAME_DUMP_MAX");
+        const long value = env ? std::strtol(env, nullptr, 10) : 300;
+        return static_cast<uint32_t>(value > 0 ? value : 300);
+    }();
+    static uint32_t s_frameIndex = 0u;
+    static uint32_t s_written = 0u;
+    const uint32_t frameIndex = s_frameIndex++;
+    if (frameIndex % s_every != 0u || s_written >= s_max)
+        return;
+    std::error_code ec;
+    std::filesystem::create_directories(s_dir, ec);
+    const std::string path = (std::filesystem::absolute(s_dir) /
+                              ("frame_" + std::to_string(frameIndex) + "_tick" + std::to_string(tick) + ".png"))
+                                 .string();
+    if (ps2xPcsx2QueueSnapshot(path.c_str()))
+        ++s_written;
+}
+#endif
+
 static void UploadFrame(Texture2D &tex, PS2Runtime *rt, uint32_t &outWidth, uint32_t &outHeight)
 {
     static uint64_t s_lastPresentationTick = std::numeric_limits<uint64_t>::max();
@@ -501,7 +544,20 @@ static void UploadFrame(Texture2D &tex, PS2Runtime *rt, uint32_t &outWidth, uint
         rt->gs().latchHostPresentationFrame();
         s_lastPresentationTick = currentTick;
         s_hasLatchedInitialFrame = true;
+#ifdef PS2X_GS_PCSX2
+        if (ps2xPcsx2Active())
+            dumpPresentedFramePcsx2(currentTick);
+#endif
     }
+#ifdef PS2X_GS_PCSX2
+    if (ps2xPcsx2Active())
+    {
+        // PCSX2's GS shows the picture in its own child window; the host texture is not used.
+        outWidth = FB_WIDTH;
+        outHeight = DEFAULT_DISPLAY_HEIGHT;
+        return;
+    }
+#endif
 #ifdef PS2X_GS_PARALLEL
     // parallel-gs in GL-interop mode presents a shared GL texture that run() draws directly;
     // in readback mode the frame arrives as pixels and takes the normal upload path below.
@@ -1074,10 +1130,21 @@ bool PS2Runtime::initialize(const char *title)
         m_audioBackend.setAudioReady(IsAudioDeviceReady());
         startSpu2Stream();
 #endif
-#ifdef PS2X_GS_PARALLEL
-        // Needs the window's current OpenGL context to share the Vulkan scanout image.
-        m_gs.setRasterBackend(CreateParallelGSBackend(m_memory.gs()));
+#ifdef PS2X_GS_PCSX2
+        // PS2X_GS_BACKEND=pcsx2: PCSX2's GS draws into a child of this window. It is opened in
+        // loadELF, once the game's serial (for PCSX2's per-game fixes) is known.
+        {
+            const char *env = std::getenv("PS2X_GS_BACKEND");
+            g_pcsx2Requested = env && (std::string(env) == "pcsx2" || std::string(env) == "PCSX2");
+        }
+        if (!g_pcsx2Requested)
 #endif
+        {
+#ifdef PS2X_GS_PARALLEL
+            // Needs the window's current OpenGL context to share the Vulkan scanout image.
+            m_gs.setRasterBackend(CreateParallelGSBackend(m_memory.gs()));
+#endif
+        }
         SetTargetFPS(60);
         if (m_debugUiInitCallback)
         {
@@ -1101,6 +1168,20 @@ bool PS2Runtime::initialize(const char *title)
 
 bool PS2Runtime::loadELF(const std::string &elfPath)
 {
+#ifdef PS2X_GS_PCSX2
+    if (g_pcsx2Requested && !ps2xPcsx2Active())
+    {
+        if (auto backend = CreatePcsx2GSBackend(m_memory.gs(), GetWindowHandle(), elfPath.c_str()))
+            m_gs.setRasterBackend(std::move(backend));
+        else
+        {
+            std::cerr << "[pcsx2-gs] falling back to the built-in renderer" << std::endl;
+#ifdef PS2X_GS_PARALLEL
+            m_gs.setRasterBackend(CreateParallelGSBackend(m_memory.gs()));
+#endif
+        }
+    }
+#endif
     configureIoPathsFromElf(elfPath);
 
     std::ifstream file(elfPath, std::ios::binary);
@@ -2854,6 +2935,26 @@ void PS2Runtime::run()
                 s_windowStart = now;
                 s_tickStart = tick;
             }
+#ifdef PS2X_GS_PCSX2
+            if (ps2xPcsx2Active())
+            {
+                // The picture is PCSX2's child window, so the counter goes on its overlay.
+                static std::string s_lastText;
+                std::string text;
+                uint32_t rgba = 0xFF2FE000u; // green, 0xAABBGGRR
+                if (s_showFps)
+                {
+                    text = TextFormat("%.1f / 60  (%d%%)", s_gameRate, static_cast<int>(s_gameRate / 60.0f * 100.0f + 0.5f));
+                    rgba = s_gameRate >= 57.0f ? 0xFF2FE000u : (s_gameRate >= 45.0f ? 0xFF00F9FDu : 0xFF3729E6u);
+                }
+                if (text != s_lastText)
+                {
+                    ps2xPcsx2SetOverlay(0u, text.c_str(), rgba);
+                    s_lastText = text;
+                }
+            }
+            else
+#endif
             if (s_showFps)
             {
                 const int fontSize = std::max(16, GetScreenHeight() / 36);
@@ -2864,6 +2965,15 @@ void PS2Runtime::run()
                 DrawText(text, pad, pad, fontSize, s_gameRate >= 57.0f ? LIME : (s_gameRate >= 45.0f ? YELLOW : RED));
             }
         }
+#ifdef PS2X_GS_PCSX2
+        // F12: raylib saves its own (black) window contents as screenshotNNN.png during EndDrawing;
+        // PCSX2 saves the real picture under the same name at its next present, replacing it.
+        if (ps2xPcsx2Active() && IsKeyPressed(KEY_F12))
+        {
+            static int s_screenshotCounter = 0; // mirrors raylib's counter
+            ps2xPcsx2QueueSnapshot(TextFormat("%s/screenshot%03i.png", GetWorkingDirectory(), s_screenshotCounter++));
+        }
+#endif
         if (m_debugUiInitialized && m_debugUiDrawCallback)
         {
             m_debugUiDrawCallback(*this, m_debugUiUserData);
