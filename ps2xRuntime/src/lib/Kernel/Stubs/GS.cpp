@@ -14,7 +14,7 @@ namespace
 {
     // DISPLAYn as libgs computes it. In NTSC/PAL its width and X origin are in video clocks
     // (2560 per line): a W-pixel framebuffer is magnified by MAGH = ceil(2560/W) - 1 so it spans
-    // the line. Hardware-accurate scanout (parallel-gs) honours this; the CPU presenter ignores it.
+    // the line. Hardware-accurate scanout (PCSX2's GS) honours this; the CPU presenter ignores it.
     uint64_t makeDefaultDisplay(uint32_t width, uint32_t height, int32_t dx = 0, int32_t dy = 0)
     {
         if (width == 0u)

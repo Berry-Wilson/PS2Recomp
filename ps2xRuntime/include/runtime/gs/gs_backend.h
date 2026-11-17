@@ -15,7 +15,7 @@ public:
     virtual void Initialize(uint8_t *vram, uint32_t vramSize) = 0;
     virtual void Reset() = 0;
 
-    // Raw-command backends (parallel-gs) consume GIF data and register writes directly and
+    // Raw-command backends (PCSX2's GS) consume GIF data and register writes directly and
     // keep the GS state themselves; the frontend then skips its own decoding.
     virtual bool UsesRawCommands() const { return false; }
     virtual void ProcessGIF(uint32_t, const uint8_t *, uint32_t) {}

@@ -88,7 +88,17 @@ namespace
     // which this runtime does not set.
     constexpr uint64_t kSmode1Ntsc = 0x740834504ull;
 
-    constexpr uint8_t kRegSignal = 0x60, kRegFinish = 0x61, kRegLabel = 0x62;
+    constexpr uint8_t kRegSignal = 0x60, kRegFinish = 0x61, kRegLabel = 0x62, kRegTrxdir = 0x53;
+
+    // The DLL cannot send GS memory back: report the first few times the game asks for it.
+    void noteReadback(const char *what, uint32_t bytes)
+    {
+        static std::atomic<uint32_t> s_count{0};
+        const uint32_t n = s_count.fetch_add(1u, std::memory_order_relaxed);
+        if (n < 8u || (n & (n - 1u)) == 0u)
+            std::cerr << "[pcsx2-gs] readback not supported: " << what
+                      << (bytes ? " (" + std::to_string(bytes) + " bytes)" : std::string()) << ", #" << (n + 1u) << std::endl;
+    }
 
     uint64_t word(const uint8_t *p)
     {
@@ -252,8 +262,16 @@ namespace
 
         bool ClearFramebuffer(const GSContext &, uint32_t) override { return false; }
         // PCSX2's GS has no readback path through the DLL; local-to-host transfers read zeros.
-        uint32_t ConsumeLocalToHostBytes(uint8_t *, uint32_t) override { return 0u; }
-        uint32_t ReadVram(uint32_t, uint32_t, uint32_t, uint32_t, uint32_t) const override { return 0u; }
+        uint32_t ConsumeLocalToHostBytes(uint8_t *, uint32_t maxBytes) override
+        {
+            noteReadback("local-to-host read", maxBytes);
+            return 0u;
+        }
+        uint32_t ReadVram(uint32_t, uint32_t, uint32_t, uint32_t, uint32_t) const override
+        {
+            noteReadback("VRAM pixel read", 0u);
+            return 0u;
+        }
         void WriteVram(uint32_t, uint32_t, uint32_t, uint32_t, uint32_t, uint32_t) override {}
         void SnapshotVram(std::vector<uint8_t> &out) const override { out.clear(); }
         GSTransferSnapshot GetTransferSnapshot() const override { return {}; }
@@ -305,6 +323,8 @@ namespace
         // SIGNAL, FINISH and LABEL as the GS would apply them (the same as the CPU frontend does).
         void applyRegister(uint8_t addr, uint64_t value)
         {
+            if (addr == kRegTrxdir && (value & 3u) == 1u)
+                noteReadback("TRXDIR local-to-host transfer", 0u);
             const uint32_t id = static_cast<uint32_t>(value);
             const uint32_t mask = static_cast<uint32_t>(value >> 32);
             if (addr == kRegSignal)

@@ -168,7 +168,6 @@ void GS::reset()
     {
         std::lock_guard<std::mutex> presentationLock(m_presentationMutex);
         m_hostPresentationFrame.clear();
-        m_hostPresentationGpuFrame.reset();
         std::fill(std::begin(m_pathImageRemainingQw), std::end(m_pathImageRemainingQw), 0u);
         m_hostPresentationWidth = 0u;
         m_hostPresentationHeight = 0u;
@@ -540,8 +539,7 @@ void GS::latchHostPresentationFrame()
         {
             std::lock_guard<std::mutex> presentationLock(m_presentationMutex);
             m_hostPresentationFrame.clear();
-            m_hostPresentationGpuFrame.reset();
-            m_hasHostPresentationFrame = false;
+                m_hasHostPresentationFrame = false;
             m_hostPresentationWidth = m_hostPresentationHeight = 0u;
             return;
         }
@@ -589,7 +587,6 @@ void GS::latchHostPresentationFrame()
     {
         std::lock_guard<std::mutex> presentationLock(m_presentationMutex);
         m_hostPresentationFrame = std::move(frame.pixels);
-        m_hostPresentationGpuFrame = std::move(frame.gpu);
         m_hostPresentationAspectRatio = frame.aspectRatio;
         m_hostPresentationWidth = width;
         m_hostPresentationHeight = height;
@@ -1802,17 +1799,6 @@ void GS::updatePreferredDisplaySourceForDraw(const GSPrimitiveBatch &batch)
     }
 }
 
-std::shared_ptr<GSGpuFrame> GS::getLatchedGpuFrame(uint32_t &width, uint32_t &height, float &aspectRatio) const
-{
-    std::lock_guard<std::mutex> lock(m_presentationMutex);
-    if (!m_hostPresentationGpuFrame)
-        return {};
-    width = m_hostPresentationWidth;
-    height = m_hostPresentationHeight;
-    aspectRatio = m_hostPresentationAspectRatio;
-    return m_hostPresentationGpuFrame;
-}
-
 float GS::getLatchedPresentationAspectRatio() const
 {
     std::lock_guard<std::mutex> lock(m_presentationMutex);
@@ -1824,7 +1810,6 @@ void GS::shutdownBackend()
     std::lock_guard<std::recursive_mutex> stateLock(m_stateMutex);
     std::lock_guard<std::mutex> backendLock(m_backendLifetimeMutex);
     std::lock_guard<std::mutex> presentationLock(m_presentationMutex);
-    m_hostPresentationGpuFrame.reset();
     m_hostPresentationFrame.clear();
     m_hasHostPresentationFrame = false;
     m_backend.reset();

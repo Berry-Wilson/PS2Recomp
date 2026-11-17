@@ -100,7 +100,7 @@ static void feedVif1Path2(PS2Memory &mem, const uint8_t *data, uint32_t qwCount,
 {
     // An IMAGE transfer started by an earlier DIRECT continues with this payload: the GIF keeps
     // its NLOOP state per path across VIF DIRECT commands, so the data is passed on raw and the
-    // GS side (CPU decoder or parallel-gs) continues the transfer.
+    // GS side (CPU decoder or PCSX2's GS) continues the transfer.
     uint32_t consumedQw = 0u;
     if (mem.m_vif1PendingPath2ImageQwc != 0u && qwCount != 0u)
     {

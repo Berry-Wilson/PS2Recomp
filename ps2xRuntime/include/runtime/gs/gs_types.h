@@ -294,20 +294,9 @@ struct GSPresentationRequest
     bool hasPreferredSource = false;
 };
 
-// A presented frame that lives in a host GPU texture (parallel-gs). The presentation thread
-// acquires the GL texture for drawing and releases it afterwards.
-class GSGpuFrame
-{
-public:
-    virtual ~GSGpuFrame() = default;
-    virtual uint32_t AcquireTexture() = 0;
-    virtual void ReleaseTexture() = 0;
-};
-
 struct PresentationFrame
 {
     std::vector<uint8_t> pixels;
-    std::shared_ptr<GSGpuFrame> gpu;
     uint32_t width = 0;
     uint32_t height = 0;
     uint32_t stride = 0; // pixels per row of `pixels`; 0 means the CPU backend's 640-pixel rows
@@ -320,7 +309,7 @@ struct PresentationFrame
 
     explicit operator bool() const
     {
-        return (gpu || !pixels.empty()) && width != 0u && height != 0u;
+        return !pixels.empty() && width != 0u && height != 0u;
     }
 };
 

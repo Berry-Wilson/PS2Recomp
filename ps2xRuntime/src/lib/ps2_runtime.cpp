@@ -5,12 +5,9 @@
 #include "game_overrides.h"
 #include "ps2_runtime_macros.h"
 #include "runtime/gs/gs_frontend.h"
-#ifdef PS2X_GS_PARALLEL
-#include "runtime/gs/gs_parallel_backend.h"
-#endif
 #ifdef PS2X_GS_PCSX2
 #include "runtime/gs/gs_pcsx2_backend.h"
-// PS2X_GS_BACKEND=pcsx2 was asked for (set in initialize, the GS is opened in loadELF).
+// PCSX2's GS draws the picture unless PS2X_GS_BACKEND=cpu (set in initialize, opened in loadELF).
 static bool g_pcsx2Requested = false;
 #endif
 #include "runtime/ee_scheduler.h"
@@ -556,20 +553,6 @@ static void UploadFrame(Texture2D &tex, PS2Runtime *rt, uint32_t &outWidth, uint
         outWidth = FB_WIDTH;
         outHeight = DEFAULT_DISPLAY_HEIGHT;
         return;
-    }
-#endif
-#ifdef PS2X_GS_PARALLEL
-    // parallel-gs in GL-interop mode presents a shared GL texture that run() draws directly;
-    // in readback mode the frame arrives as pixels and takes the normal upload path below.
-    {
-        float aspect = 0.0f;
-        uint32_t gpuWidth = 0u, gpuHeight = 0u;
-        if (rt->gs().getLatchedGpuFrame(gpuWidth, gpuHeight, aspect))
-        {
-            outWidth = gpuWidth;
-            outHeight = gpuHeight;
-            return;
-        }
     }
 #endif
     if (!needsLatch && s_hasUploadedFrame)
@@ -1131,20 +1114,14 @@ bool PS2Runtime::initialize(const char *title)
         startSpu2Stream();
 #endif
 #ifdef PS2X_GS_PCSX2
-        // PS2X_GS_BACKEND=pcsx2: PCSX2's GS draws into a child of this window. It is opened in
-        // loadELF, once the game's serial (for PCSX2's per-game fixes) is known.
+        // PCSX2's GS draws into a child of this window. It is opened in loadELF, once the game's
+        // serial (for PCSX2's per-game fixes) is known. PS2X_GS_BACKEND=cpu keeps the software
+        // rasterizer instead.
         {
             const char *env = std::getenv("PS2X_GS_BACKEND");
-            g_pcsx2Requested = env && (std::string(env) == "pcsx2" || std::string(env) == "PCSX2");
+            g_pcsx2Requested = !(env && (std::string(env) == "cpu" || std::string(env) == "CPU"));
         }
-        if (!g_pcsx2Requested)
 #endif
-        {
-#ifdef PS2X_GS_PARALLEL
-            // Needs the window's current OpenGL context to share the Vulkan scanout image.
-            m_gs.setRasterBackend(CreateParallelGSBackend(m_memory.gs()));
-#endif
-        }
         SetTargetFPS(60);
         if (m_debugUiInitCallback)
         {
@@ -1175,10 +1152,7 @@ bool PS2Runtime::loadELF(const std::string &elfPath)
             m_gs.setRasterBackend(std::move(backend));
         else
         {
-            std::cerr << "[pcsx2-gs] falling back to the built-in renderer" << std::endl;
-#ifdef PS2X_GS_PARALLEL
-            m_gs.setRasterBackend(CreateParallelGSBackend(m_memory.gs()));
-#endif
+            std::cerr << "[pcsx2-gs] falling back to the software renderer" << std::endl;
         }
     }
 #endif
@@ -2864,22 +2838,9 @@ void PS2Runtime::run()
 
         Texture2D presentationTexture = frameTex;
         float aspectRatio = 0.0f;
-#ifdef PS2X_GS_PARALLEL
-        uint32_t gpuWidth = 0u, gpuHeight = 0u;
-        auto gpuFrame = m_gs.getLatchedGpuFrame(gpuWidth, gpuHeight, aspectRatio);
-        if (gpuFrame)
-        {
-            presentWidth = gpuWidth;
-            presentHeight = gpuHeight;
-            presentationTexture = Texture2D{gpuFrame->AcquireTexture(), int(presentWidth), int(presentHeight), 1, PIXELFORMAT_UNCOMPRESSED_R8G8B8A8};
-        }
-        else
-        {
-            // Readback frames carry the same CRTC aspect (4:3 for a full-screen mode); without it
-            // a 640x448 scanout would be shown with square pixels, ~7% too wide.
-            aspectRatio = m_gs.getLatchedPresentationAspectRatio();
-        }
-#endif
+        // Frames carry the CRTC aspect (4:3 for a full-screen mode); without it a 640x448
+        // scanout would be shown with square pixels, ~7% too wide.
+        aspectRatio = m_gs.getLatchedPresentationAspectRatio();
 
         BeginDrawing();
         ClearBackground(BLACK);
@@ -2907,13 +2868,6 @@ void PS2Runtime::run()
             rlDrawRenderBatchActive();
             rlEnableColorBlend();
         }
-#ifdef PS2X_GS_PARALLEL
-        if (gpuFrame)
-        {
-            rlDrawRenderBatchActive(); // GL must sample the shared texture before it is released.
-            gpuFrame->ReleaseTexture();
-        }
-#endif
         // FPS overlay: PS2X_SHOW_FPS=1 shows it from the start, F3 toggles it. Shows guest VSync
         // ticks per second (60 = full speed on NTSC).
         {

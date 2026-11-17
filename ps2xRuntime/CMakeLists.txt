@@ -5,18 +5,6 @@ project(PS2Runtime VERSION 0.1.0 LANGUAGES CXX)
 set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 
-# PARALLEL_GS renders the GS on the GPU with parallel-gs (Vulkan compute, fetched at configure
-# time, LGPLv3). CPU is the software rasterizer.
-set(PS2X_GS_BACKEND "CPU" CACHE STRING "GS backend: CPU or PARALLEL_GS")
-set_property(CACHE PS2X_GS_BACKEND PROPERTY STRINGS CPU PARALLEL_GS)
-if(NOT PS2X_GS_BACKEND MATCHES "^(CPU|PARALLEL_GS)$")
-    message(FATAL_ERROR "PS2X_GS_BACKEND must be CPU or PARALLEL_GS")
-endif()
-if(PS2X_GS_BACKEND STREQUAL "PARALLEL_GS" AND
-   (ANDROID OR NOT (WIN32 OR CMAKE_SYSTEM_NAME STREQUAL "Linux")))
-    message(FATAL_ERROR "PARALLEL_GS is supported only on Windows and Linux desktop")
-endif()
-
 option(PS2X_ENABLE_RUNNER_UNITY_BUILD "Build ps2EntryRunner with CMake unity build" ON)
 set(PS2X_RUNNER_UNITY_BUILD_BATCH_SIZE 32 CACHE STRING "Unity build batch size for ps2EntryRunner")
 option(PS2X_ENABLE_RUNNER_PCH "Precompile the heavy runtime headers for ps2EntryRunner" ON)
@@ -406,16 +394,12 @@ add_library(ps2_runtime STATIC
     src/lib/games_database.cpp
 )
 
-# PCSX2's GS as a renderer, loaded at run time from pcsx2-gs/ps2x-gs.dll next to the exe
-# (PS2X_GS_BACKEND=pcsx2 at run time; build the DLL with pcsx2-gs/build-ps2x-gs.bat).
+# The renderer is PCSX2's GS, loaded at run time from pcsx2-gs/ps2x-gs.dll next to the exe (build
+# it with pcsx2-gs/build-ps2x-gs.bat). Without it, or with PS2X_GS_BACKEND=cpu, the GS is drawn by
+# the software rasterizer.
 if(WIN32)
     target_sources(ps2_runtime PRIVATE src/lib/gs/gs_pcsx2_backend.cpp)
     target_compile_definitions(ps2_runtime PUBLIC PS2X_GS_PCSX2=1)
-endif()
-
-if(PS2X_GS_BACKEND STREQUAL "PARALLEL_GS")
-    message(STATUS "Using ParallelGS backend for PS2 graphics")
-    include("${CMAKE_CURRENT_SOURCE_DIR}/cmake/ParallelGS.cmake")
 endif()
 
 if(PS2X_ENABLE_RUNTIME_LOGS)

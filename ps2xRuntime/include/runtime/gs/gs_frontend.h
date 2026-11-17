@@ -134,7 +134,6 @@ public:
     void setDebugHistoryPaused(bool paused);
     bool getPreferredDisplaySource(GSFrameReg &outSource, uint32_t &outDestFbp) const;
     void latchHostPresentationFrame();
-    std::shared_ptr<GSGpuFrame> getLatchedGpuFrame(uint32_t &width, uint32_t &height, float &aspectRatio) const;
     // Display aspect ratio of the latched frame (0 when the backend does not report one).
     float getLatchedPresentationAspectRatio() const;
     bool copyLatchedHostPresentationFrame(std::vector<uint8_t> &outPixels,
@@ -230,7 +229,6 @@ private:
     uint32_t m_preferredDisplayDestFbp = 0;
     bool m_hasPreferredDisplaySource = false;
     std::vector<uint8_t> m_hostPresentationFrame;
-    std::shared_ptr<GSGpuFrame> m_hostPresentationGpuFrame;
     float m_hostPresentationAspectRatio = 0.0f;
     // Quadwords of IMAGE data each GIF path still owes (index = path 1..3).
     uint32_t m_pathImageRemainingQw[4] = {};
