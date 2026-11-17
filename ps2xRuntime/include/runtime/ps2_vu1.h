@@ -301,6 +301,7 @@ private:
     void startXgkick(uint32_t qwordAddress);
 
     void resetScheduler();
+    bool runsOwnMicroMemory(const uint8_t *vuCode, uint32_t codeSize, const PS2Memory *memory) const;
     void refreshCompiledImage(const uint8_t *vuCode, uint32_t codeSize, const PS2Memory *memory);
     void commitReadyPipelines();
     void commitReadyPipelinesNow();

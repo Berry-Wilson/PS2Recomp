@@ -7,6 +7,7 @@
 #include "runtime/ps2_vu1_compiled.h"
 
 #include <algorithm>
+#include <atomic>
 #include <memory>
 #include <vector>
 #include <fstream>
@@ -146,7 +147,8 @@ void setVu1CompiledImagesEnabled(bool enabled)
 namespace
 {
     bool g_vu1CompiledVerify = false;
-    bool g_vu1InVerifyShadow = false; // shadow interpreter run: no compiled code, no XGKICK output
+    // Per thread: VU0 (EE thread) and VU1 (VIF1 worker) can be verified at the same time.
+    thread_local bool g_vu1InVerifyShadow = false; // shadow interpreter run: no compiled code, no XGKICK output
     // Verify mode: hashes of the XGKICK packets the compiled run and the interpreter shadow send.
     thread_local std::vector<uint64_t> t_verifyPacketsCompiled, t_verifyPacketsShadow;
     // PS2X_VU1_STEP_CYCLES=1: advanceTo/flushPipelines step one cycle at a time (as before the
@@ -156,8 +158,8 @@ namespace
         const char *env = std::getenv("PS2X_VU1_STEP_CYCLES");
         return env && env[0] == '1';
     }();
-    uint32_t g_vu1VerifyMismatches = 0;
-    uint64_t g_vu1VerifiedRuns = 0;
+    std::atomic<uint32_t> g_vu1VerifyMismatches{0};
+    std::atomic<uint64_t> g_vu1VerifiedRuns{0};
 }
 
 void setVu1CompiledVerify(bool enabled)
@@ -189,9 +191,20 @@ uint64_t hashVu1CodeImage(const uint8_t *code, uint32_t size)
     return hash;
 }
 
+// Whether vuCode is this unit's own micro memory (images are compiled and dumped for those only).
+bool VU1Interpreter::runsOwnMicroMemory(const uint8_t *vuCode, uint32_t codeSize, const PS2Memory *memory) const
+{
+    if (memory == nullptr)
+        return false;
+    if (m_unit == Unit::VU1)
+        return vuCode == memory->getVU1Code() && codeSize == PS2_VU1_CODE_SIZE;
+    return vuCode == memory->getVU0Code() && codeSize == PS2_VU0_CODE_SIZE;
+}
+
 void VU1Interpreter::refreshCompiledImage(const uint8_t *vuCode, uint32_t codeSize, const PS2Memory *memory)
 {
-    const uint64_t generation = memory->getVU1CodeGeneration();
+    // VU0 and VU1 images differ in size, so their hashes never collide in the shared registry.
+    const uint64_t generation = m_unit == Unit::VU1 ? memory->getVU1CodeGeneration() : memory->getVU0CodeGeneration();
     if (generation == m_imageGeneration)
         return;
     m_imageGeneration = generation;
@@ -1982,7 +1995,7 @@ void VU1Interpreter::execute(uint8_t *vuCode, uint32_t codeSize,
     m_state.vf[0][1] = 0.0f;
     m_state.vf[0][2] = 0.0f;
     m_state.vf[0][3] = 1.0f;
-    if (m_unit == Unit::VU1 && memory != nullptr && vuCode == memory->getVU1Code() && !g_vu1ImageDumpDir.empty())
+    if (!g_vu1ImageDumpDir.empty() && runsOwnMicroMemory(vuCode, codeSize, memory))
     {
         refreshCompiledImage(vuCode, codeSize, memory);
         dumpVu1Entry(m_imageHash, vuCode, codeSize, m_state.pc);
@@ -2015,12 +2028,14 @@ void VU1Interpreter::run(uint8_t *vuCode, uint32_t codeSize,
     const bool useVuRounding = std::fesetround(FE_TOWARDZERO) == 0;
     const uint64_t budgetEnd = m_cycle + maxCycles;
     bool programEnded = false;
-    const bool immediateWriteback = g_vu1ImmediateWriteback && m_unit == Unit::VU1;
+    // VU0 microprograms run to completion inside the EE's VCALLMS, so like VU1 only their final
+    // state is observable and immediate writeback applies to both units.
+    const bool immediateWriteback = g_vu1ImmediateWriteback;
     bool compiledStopped = false;
     std::unique_ptr<VU1Interpreter> verifyShadow;
     std::vector<uint8_t> verifyDataBefore;
-    if (immediateWriteback && g_vu1CompiledEnabled && !g_vu1InVerifyShadow && memory != nullptr && vuCode == memory->getVU1Code() &&
-        codeSize == PS2_VU1_CODE_SIZE && !compiledImages().empty())
+    if (immediateWriteback && g_vu1CompiledEnabled && !g_vu1InVerifyShadow && runsOwnMicroMemory(vuCode, codeSize, memory) &&
+        !compiledImages().empty())
     {
         refreshCompiledImage(vuCode, codeSize, memory);
         if (m_compiledImage != nullptr && m_cycle < budgetEnd && !m_stopRequested)
@@ -2333,14 +2348,14 @@ void VU1Interpreter::run(uint8_t *vuCode, uint32_t codeSize,
         check(std::memcmp(dataAfter.data(), vuData, dataSize) == 0, "data");
         check(t_verifyPacketsCompiled == t_verifyPacketsShadow, "packets");
         std::memcpy(vuData, dataAfter.data(), dataSize);
-        ++g_vu1VerifiedRuns;
+        const uint64_t verifiedRuns = ++g_vu1VerifiedRuns;
         if (!diff.empty() && g_vu1VerifyMismatches++ < 50)
             std::fprintf(stderr, "[vu1-verify] image %016llx mismatch:%s (pc %x/%x cycles %llu/%llu)\n",
                          static_cast<unsigned long long>(m_imageHash), diff.c_str(), a.pc, b.pc,
                          static_cast<unsigned long long>(a.cycles), static_cast<unsigned long long>(b.cycles));
-        if ((g_vu1VerifiedRuns & 0xFFFu) == 0u)
+        if ((verifiedRuns & 0xFFFu) == 0u)
             std::fprintf(stderr, "[vu1-verify] %llu compiled runs checked, %u mismatches\n",
-                         static_cast<unsigned long long>(g_vu1VerifiedRuns), g_vu1VerifyMismatches);
+                         static_cast<unsigned long long>(verifiedRuns), g_vu1VerifyMismatches.load());
     }
     if (useVuRounding && previousRoundingMode != -1)
         std::fesetround(previousRoundingMode);
