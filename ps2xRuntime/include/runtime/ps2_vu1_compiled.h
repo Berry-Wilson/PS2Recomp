@@ -32,7 +32,8 @@ using Vu1CompiledFn = Vu1CompiledResult (*)(VU1Interpreter &vu, uint64_t budgetE
 
 // statusVerifyMask: status bits verify mode compares at program end. The translator clears
 // the sticky bits (0xFC0) when it proved them unobservable and skipped flag updates.
-void registerVu1CompiledImage(uint64_t imageHash, Vu1CompiledFn fn, uint32_t statusVerifyMask = 0xFFFu);
+// fastFn: the image's fast-float variant (used with PS2X_VU1_FAST_FLOAT=1, see vu1CompiledFastFloat).
+void registerVu1CompiledImage(uint64_t imageHash, Vu1CompiledFn fn, uint32_t statusVerifyMask = 0xFFFu, Vu1CompiledFn fastFn = nullptr);
 // Writes every newly seen VU1 code image (<hash>.bin) and MSCAL entry PCs (<hash>.entries)
 // to the directory; empty disables dumping.
 void setVu1ImageDumpDir(const char *directory);
@@ -46,6 +47,9 @@ void setVu1CompiledVerify(bool enabled);
 // cycle counts legitimately differ from the interpreter's; verify then skips the cycle check.
 void setVu1CompiledVerifyIgnoresCycles(bool ignore);
 uint64_t hashVu1CodeImage(const uint8_t *code, uint32_t size);
+// PS2X_VU1_FAST_FLOAT=1: compiled images run their fast-float variant (no exact PS2 float
+// rounding or range handling; results clamped to +/-FLT_MAX, denormals as zero). Off in verify mode.
+bool vu1CompiledFastFloat();
 
 // Generated code calls these per lane; MSVC otherwise leaves some of them out of line.
 #if defined(_MSC_VER)

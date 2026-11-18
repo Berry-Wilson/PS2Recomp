@@ -116,6 +116,13 @@ static inline int vu1VZeroMask(__m128 v)
     return _mm_movemask_ps(_mm_castsi128_ps(_mm_cmpeq_epi32(_mm_and_si128(_mm_castps_si128(v), _mm_set1_epi32(0x7FFFFFFF)), _mm_setzero_si128())));
 }
 static inline __m128 vu1VNeg(__m128 v) { return _mm_xor_ps(v, _mm_castsi128_ps(_mm_set1_epi32(static_cast<int>(0x80000000u)))); }
+// Fast-float variant (kFast, PS2X_VU1_FAST_FLOAT=1): operands are used as they are (the image
+// function sets DAZ/FTZ, so denormals read and round to zero) and results are clamped to
+// +/-FLT_MAX instead of the interpreter's exact PS2 rounding and range handling.
+static inline __m128 vu1VFastClamp(__m128 v)
+{
+    return _mm_min_ps(_mm_max_ps(v, _mm_set1_ps(-3.402823466e+38f)), _mm_set1_ps(3.402823466e+38f));
+}
 // MAC sign bits (lane c -> (8 >> c) << 4) for a movemask of the result's sign bits.
 static const uint32_t vu1MacSignBits[16] = {0x00u, 0x80u, 0x40u, 0xC0u, 0x20u, 0xA0u, 0x60u, 0xE0u,
                                             0x10u, 0x90u, 0x50u, 0xD0u, 0x30u, 0xB0u, 0x70u, 0xF0u};
@@ -574,13 +581,13 @@ static const uint32_t vu1MacSignBits[16] = {0x00u, 0x80u, 0x40u, 0xC0u, 0x20u, 0
         o << "    { // " << names[kind] << (accTarget ? "A" : "") << (withFlags ? " inline SSE (fast flags)\n" : " inline SSE (flags unobserved)\n");
         // Operands, normalized as the interpreter does, four lanes at a time. Packed SSE add/sub/mul
         // round each lane exactly like the scalar float code (same MXCSR rounding mode).
-        o << "        const __m128 s = vu1VNorm(_mm_loadu_ps(st.vf[" << fs << "]));\n";
+        o << "        const __m128 s = VU1_VNORM(_mm_loadu_ps(st.vf[" << fs << "]));\n";
         if (source == Vt)
-            o << "        const __m128 t = vu1VNorm(_mm_loadu_ps(st.vf[" << ft << "]));\n";
+            o << "        const __m128 t = VU1_VNORM(_mm_loadu_ps(st.vf[" << ft << "]));\n";
         else if (source == Bc)
-            o << "        const __m128 t = _mm_set1_ps(vu1NormalizeOperand(st.vf[" << ft << "][" << (upper & 3u) << "]));\n";
+            o << "        const __m128 t = _mm_set1_ps(VU1_NORMOP(st.vf[" << ft << "][" << (upper & 3u) << "]));\n";
         else
-            o << "        const __m128 t = _mm_set1_ps(vu1NormalizeOperand(st." << (source == Q ? "q" : "i") << "));\n";
+            o << "        const __m128 t = _mm_set1_ps(VU1_NORMOP(st." << (source == Q ? "q" : "i") << "));\n";
         const char *opName = kind == Add ? "_mm_add_ps" : kind == Sub ? "_mm_sub_ps" : "_mm_mul_ps";
         // Lane c of the vector is component c; dest bit (8 >> c) selects it.
         const unsigned laneBits = ((dest & 8u) ? 1u : 0u) | ((dest & 4u) ? 2u : 0u) | ((dest & 2u) ? 4u : 0u) | ((dest & 1u) ? 8u : 0u);
@@ -588,11 +595,12 @@ static const uint32_t vu1MacSignBits[16] = {0x00u, 0x80u, 0x40u, 0xC0u, 0x20u, 0
         if (productSum)
         {
             o << "        const __m128 p = _mm_mul_ps(s, t);\n";
-            o << "        const __m128 a = vu1VNorm(_mm_loadu_ps(st.acc));\n";
+            o << "        const __m128 a = VU1_VNORM(_mm_loadu_ps(st.acc));\n";
             o << "        __m128 r = " << (kind == Madd ? "_mm_add_ps(a, p)" : "_mm_sub_ps(a, p)") << ";\n";
             // A zero operand makes the product an exact signed zero, so r = acc +/- 0 is exact too
             // (round-toward-zero gives the same signed zero as the interpreter's exact sum).
             o << "        const int exactZero = vu1VZeroMask(s) | vu1VZeroMask(t);\n";
+            o << "        if constexpr (!kFast)\n        {\n";
             o << "        bool inRange = ((vu1VProductSumOk(r, p" << (withFlags ? ", true" : ", false") << ") | exactZero) & laneBits) == laneBits;\n";
         }
         else
@@ -607,26 +615,35 @@ static const uint32_t vu1MacSignBits[16] = {0x00u, 0x80u, 0x40u, 0xC0u, 0x20u, 0
                     o << "        const int exactZero = _mm_movemask_ps(_mm_cmpeq_ps(s, vu1VNeg(t)));\n";
                 else
                     o << "        const int exactZero = _mm_movemask_ps(_mm_cmpeq_ps(s, t));\n";
+                o << "        if constexpr (!kFast)\n        {\n";
                 o << "        bool inRange = ((vu1VNormalNonMax(r) | exactZero) & laneBits) == laneBits;\n";
             }
             else
+            {
+                o << "        if constexpr (!kFast)\n        {\n";
                 o << "        bool inRange = (vu1VSingleRoundingOk(r) & laneBits) == laneBits; r = vu1VZeroDenormals(r);\n";
+            }
         }
         o << "        if (!inRange) { alignas(16) float rv[4]; _mm_store_ps(rv, r); ";
         if (withFlags)
             o << "A::fmacExact(vu, " << hex32(upper) << ", rv, " << dest << "u); r = _mm_load_ps(rv); }\n";
         else
             o << "A::normalizeFmacValues(vu, " << hex32(upper) << ", rv, " << dest << "u); r = _mm_load_ps(rv); }\n";
+        std::string fastFlags;
         if (withFlags)
         {
-            o << "        else { const int zeroLanes = vu1VZeroMask(r) & laneBits; const uint32_t signMac = vu1MacSignBits[_mm_movemask_ps(r) & laneBits];"
-                 " const uint32_t mac = signMac | (vu1MacSignBits[zeroLanes] >> 4);";
+            std::string flags = "const int zeroLanes = vu1VZeroMask(r) & laneBits; const uint32_t signMac = vu1MacSignBits[_mm_movemask_ps(r) & laneBits];"
+                                " const uint32_t mac = signMac | (vu1MacSignBits[zeroLanes] >> 4);";
             if (productSum)
-                o << " const uint32_t productSticky = ((_mm_movemask_ps(p) & laneBits) != 0 ? 2u : 0u) | ((exactZero & laneBits) != 0 ? 1u : 0u);";
+                flags += " const uint32_t productSticky = ((_mm_movemask_ps(p) & laneBits) != 0 ? 2u : 0u) | ((exactZero & laneBits) != 0 ? 1u : 0u);";
             else
-                o << " const uint32_t productSticky = 0u;";
-            o << " A::queueFmacFlags(vu, mac, (zeroLanes != 0 ? 1u : 0u) | (signMac != 0u ? 2u : 0u), productSticky); }\n";
+                flags += " const uint32_t productSticky = 0u;";
+            flags += " A::queueFmacFlags(vu, mac, (zeroLanes != 0 ? 1u : 0u) | (signMac != 0u ? 2u : 0u), productSticky);";
+            o << "        else { " << flags << " }\n";
+            fastFlags = "            " + flags + "\n";
         }
+        // Fast variant: clamp, and flags (zero/sign only) from the clamped result.
+        o << "        }\n        else\n        {\n            r = vu1VFastClamp(r);\n" << fastFlags << "            (void)laneBits;\n        }\n";
         const std::string target = accTarget ? "st.acc" : "st.vf[" + std::to_string(fd) + "]";
         if (laneBits == 0xFu)
             o << "        _mm_storeu_ps(" << target << ", r);\n";
@@ -689,7 +706,10 @@ static const uint32_t vu1MacSignBits[16] = {0x00u, 0x80u, 0x40u, 0xC0u, 0x20u, 0
         {
             o << "    { // ITOF inline SSE\n";
             o << "        const __m128 f = _mm_cvtepi32_ps(_mm_castps_si128(_mm_loadu_ps(st.vf[" << fs << "])));\n";
-            store(ft, sp == 0x10u ? std::string("f") : std::string("_mm_div_ps(f, _mm_set1_ps(") + scales[sp & 3u] + "))");
+            // Dividing by a power of two is multiplying by its exact reciprocal (an int32 converted
+            // to float is 0 or at least 1 in magnitude, so the result is never denormal).
+            static const char *const reciprocals[] = {"1.0f", "0.0625f", "0.000244140625f", "0.000030517578125f"};
+            store(ft, sp == 0x10u ? std::string("f") : std::string("_mm_mul_ps(f, _mm_set1_ps(") + reciprocals[sp & 3u] + "))");
             o << "    }\n";
             return true;
         }
@@ -1593,16 +1613,10 @@ int main(int argc, char **argv)
         }
         char fnName[64];
         std::snprintf(fnName, sizeof(fnName), isVu0 ? "vu0img_%016llx" : "vu1img_%016llx", static_cast<unsigned long long>(hash));
-        std::ofstream o(outDir / (std::string("vu1_") + (fnName + 7) + ".cpp"));
-        o << "// Generated by ps2x_vu1recomp from " << name << ".bin: " << pairs.size() << " pairs, entries";
-        for (uint32_t e : entries)
-            o << " 0x" << std::hex << e << std::dec;
-        o << ". Do not edit.\n";
-        o << "#include \"runtime/ps2_vu1_compiled.h\"\n#include <algorithm>\n#include <cstring>\n#include <emmintrin.h>\n\n";
-        o << kSimdPreamble;
-        o << "using A = Vu1CompiledAccess;\n";
-        o << "// Returned by a chunk when execution continues in another chunk.\n";
-        o << "static constexpr Vu1CompiledResult kContinue = static_cast<Vu1CompiledResult>(3);\n\n";
+        // The same code goes into two files: vu1_<hash>.cpp (exact PS2 float handling) and
+        // vu1_<hash>_fast.cpp (kFast, PS2X_VU1_FAST_FLOAT=1). Separate translation units keep the
+        // exact variant compiled exactly as it was without the fast one.
+        std::ostringstream o;
         std::map<uint32_t, std::vector<uint32_t>> chunks;
         for (uint32_t pc : pairs)
             chunks[chunkOf(pc)].push_back(pc);
@@ -1621,17 +1635,44 @@ int main(int argc, char **argv)
             o << "    default: return (st.pc >> " << kChunkShift << ") == " << chunk
               << "u ? Vu1CompiledResult::Fallback : kContinue;\n    }\n}\n\n";
         }
-        o << "Vu1CompiledResult " << fnName << "(VU1Interpreter &vu, uint64_t budgetEnd)\n{\n";
-        o << "    VU1State &st = A::state(vu);\n";
-        o << "    if (st.branchPending)\n        return Vu1CompiledResult::Fallback; // resumed mid-branch: the interpreter takes this run\n";
-        // Compiled pairs commit flags/Q/P lazily: commit what is due before the interpreter (or
-        // the caller) sees the state.
-        o << "    for (;;)\n    {\n        Vu1CompiledResult result;\n";
-        o << "        switch (st.pc >> " << kChunkShift << ")\n        {\n";
-        for (const auto &[chunk, chunkPairs] : chunks)
-            o << "        case " << chunk << "u: result = " << fnName << "_c" << chunk << "(vu, budgetEnd); break;\n";
-        o << "        default: A::commitReadyPipelines(vu); return Vu1CompiledResult::Fallback;\n        }\n";
-        o << "        if (result != kContinue)\n        {\n            A::commitReadyPipelines(vu);\n            return result;\n        }\n    }\n}\n";
+        const std::string body = o.str();
+        for (const bool fast : {false, true})
+        {
+            std::ofstream f(outDir / (std::string("vu1_") + (fnName + 7) + (fast ? "_fast" : "") + ".cpp"));
+            f << "// Generated by ps2x_vu1recomp from " << name << ".bin: " << pairs.size() << " pairs, entries";
+            for (uint32_t e : entries)
+                f << " 0x" << std::hex << e << std::dec;
+            f << (fast ? ". Fast-float variant" : "") << ". Do not edit.\n";
+            f << "#include \"runtime/ps2_vu1_compiled.h\"\n#include <algorithm>\n#include <cstring>\n#include <emmintrin.h>\n\n";
+            f << kSimdPreamble;
+            f << "using A = Vu1CompiledAccess;\n";
+            f << "static constexpr bool kFast = " << (fast ? "true" : "false") << ";\n";
+            // Operand normalization: the interpreter's in the exact variant, none in the fast one.
+            if (fast)
+                f << "#define VU1_VNORM(v) (v)\n#define VU1_NORMOP(v) (v)\n";
+            else
+                f << "#define VU1_VNORM(v) vu1VNorm(v)\n#define VU1_NORMOP(v) vu1NormalizeOperand(v)\n";
+            f << "// Returned by a chunk when execution continues in another chunk.\n";
+            f << "static constexpr Vu1CompiledResult kContinue = static_cast<Vu1CompiledResult>(3);\n\n";
+            f << body;
+            f << "Vu1CompiledResult " << fnName << (fast ? "_fast" : "") << "(VU1Interpreter &vu, uint64_t budgetEnd)\n{\n";
+            f << "    VU1State &st = A::state(vu);\n";
+            f << "    if (st.branchPending)\n        return Vu1CompiledResult::Fallback; // resumed mid-branch: the interpreter takes this run\n";
+            if (fast)
+            {
+                // Denormal operands read as zero and denormal results round to zero.
+                f << "    const unsigned savedCsr = _mm_getcsr();\n    _mm_setcsr(savedCsr | 0x8040u); // FTZ | DAZ\n";
+                f << "    struct RestoreCsr { unsigned csr; ~RestoreCsr() { _mm_setcsr(csr); } } restoreCsr{savedCsr};\n";
+            }
+            // Compiled pairs commit flags/Q/P lazily: commit what is due before the interpreter
+            // (or the caller) sees the state.
+            f << "    for (;;)\n    {\n        Vu1CompiledResult result;\n";
+            f << "        switch (st.pc >> " << kChunkShift << ")\n        {\n";
+            for (const auto &[chunk, chunkPairs] : chunks)
+                f << "        case " << chunk << "u: result = " << fnName << "_c" << chunk << "(vu, budgetEnd); break;\n";
+            f << "        default: A::commitReadyPipelines(vu); return Vu1CompiledResult::Fallback;\n        }\n";
+            f << "        if (result != kContinue)\n        {\n            A::commitReadyPipelines(vu);\n            return result;\n        }\n    }\n}\n";
+        }
         images.push_back(fnName);
         statusMasks.push_back(inlined != 0u ? 0x03Fu : 0xFFFu);
         std::cout << name << ": " << g_blockStarts.size() << " block starts, stall checks removed " << g_stallChecksRemoved
@@ -1647,11 +1688,12 @@ int main(int argc, char **argv)
     std::ofstream reg(outDir / "vu1_images.cpp");
     reg << "// Generated by ps2x_vu1recomp. Do not edit.\n#include \"runtime/ps2_vu1_compiled.h\"\n\n";
     for (const auto &fn : images)
-        reg << "Vu1CompiledResult " << fn << "(VU1Interpreter &vu, uint64_t budgetEnd);\n";
+        reg << "Vu1CompiledResult " << fn << "(VU1Interpreter &vu, uint64_t budgetEnd);\nVu1CompiledResult " << fn
+            << "_fast(VU1Interpreter &vu, uint64_t budgetEnd);\n";
     reg << "\nvoid registerGeneratedVu1Images()\n{\n";
     for (size_t i = 0; i < images.size(); ++i)
         reg << "    registerVu1CompiledImage(0x" << images[i].substr(7) << "ull, &" << images[i] << ", 0x" << std::hex
-            << statusMasks[i] << std::dec << "u);\n";
+            << statusMasks[i] << std::dec << "u, &" << images[i] << "_fast);\n";
     if (!g_exactTiming)
         reg << "    setVu1CompiledVerifyIgnoresCycles(true); // relaxed timing\n";
     reg << "}\n";

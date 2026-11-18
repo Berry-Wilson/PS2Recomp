@@ -92,6 +92,7 @@ namespace
     {
         Vu1CompiledFn fn = nullptr;
         uint32_t statusVerifyMask = 0xFFFu;
+        Vu1CompiledFn fastFn = nullptr;
     };
 
     std::unordered_map<uint64_t, CompiledImage> &compiledImages()
@@ -128,9 +129,9 @@ namespace
     }
 }
 
-void registerVu1CompiledImage(uint64_t imageHash, Vu1CompiledFn fn, uint32_t statusVerifyMask)
+void registerVu1CompiledImage(uint64_t imageHash, Vu1CompiledFn fn, uint32_t statusVerifyMask, Vu1CompiledFn fastFn)
 {
-    compiledImages()[imageHash] = CompiledImage{fn, statusVerifyMask};
+    compiledImages()[imageHash] = CompiledImage{fn, statusVerifyMask, fastFn};
 }
 
 void setVu1ImageDumpDir(const char *directory)
@@ -165,6 +166,19 @@ namespace
 void setVu1CompiledVerify(bool enabled)
 {
     g_vu1CompiledVerify = enabled;
+}
+
+bool vu1CompiledFastFloat()
+{
+    static const bool s_requested = []
+    {
+        const char *env = std::getenv("PS2X_VU1_FAST_FLOAT");
+        const bool on = env && env[0] == '1';
+        if (on)
+            std::fprintf(stderr, "[vu1] fast float: compiled microprograms skip exact PS2 float handling\n");
+        return on;
+    }();
+    return s_requested && !g_vu1CompiledVerify;
 }
 
 namespace
@@ -211,7 +225,10 @@ void VU1Interpreter::refreshCompiledImage(const uint8_t *vuCode, uint32_t codeSi
     m_imageHash = hashVu1CodeImage(vuCode, codeSize);
     const auto &images = compiledImages();
     const auto image = images.find(m_imageHash);
-    m_compiledImage = image != images.end() ? reinterpret_cast<const void *>(image->second.fn) : nullptr;
+    m_compiledImage = nullptr;
+    if (image != images.end())
+        m_compiledImage = reinterpret_cast<const void *>(
+            image->second.fastFn && vu1CompiledFastFloat() ? image->second.fastFn : image->second.fn);
 }
 
 VU1Interpreter::VU1Interpreter(Unit unit)
