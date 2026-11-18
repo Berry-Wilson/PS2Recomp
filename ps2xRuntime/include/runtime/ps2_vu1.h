@@ -305,6 +305,9 @@ private:
     void refreshCompiledImage(const uint8_t *vuCode, uint32_t codeSize, const PS2Memory *memory);
     void commitReadyPipelines();
     void commitReadyPipelinesNow();
+    // A free flag pipeline slot; when all are taken, commits what is due first (compiled code
+    // commits lazily, so due entries can still hold slots). -1 if none is free even then.
+    int freeFlagSlot();
     void advanceOneCycle();
     void advanceTo(uint64_t targetCycle);
     void flushPipelines();

@@ -144,68 +144,11 @@ public:
 
     PS2X_VU1_FORCEINLINE static void commitReadyPipelines(VU1Interpreter &vu)
     {
+        // Compiled code calls this only before a pair that can observe flags, Q or P (or calls
+        // the interpreter), and before it returns; several cycles' entries can then be due.
         if (vu.m_cycle < vu.m_nextCommitCycle)
             return;
-        // Compiled code mostly has FMAC flags, Q (FDIV) and P (EFU) in flight (stores are written
-        // at once, VF/VI/ACC use immediate writeback): commit those inline, in the same order as
-        // commitReadyPipelinesNow (flags, Q, P), instead of calling it every few cycles.
-        if ((vu.m_storeValidMask | vu.m_vfWriteValidMask | vu.m_viWriteValidMask | vu.m_accWriteValidMask) != 0u)
-        {
-            vu.commitReadyPipelinesNow();
-            return;
-        }
-        uint64_t next = ~0ull;
-        for (uint32_t mask = vu.m_flagValidMask; mask != 0u; mask &= mask - 1u)
-        {
-            uint32_t slot = 0u;
-            while (((mask >> slot) & 1u) == 0u)
-                ++slot;
-            auto &entry = vu.m_flagPipeline[slot];
-            if (entry.readyCycle > vu.m_cycle)
-            {
-                if (entry.readyCycle < next)
-                    next = entry.readyCycle;
-                continue;
-            }
-            if (entry.writesMac)
-                vu.m_state.mac = entry.mac;
-            if (entry.writesStatus)
-            {
-                const uint32_t current = entry.status & 0xFu;
-                vu.m_state.status = (vu.m_state.status & 0xFF0u) | current | ((current | entry.extraSticky) << 6);
-            }
-            if (entry.writesSticky)
-                vu.m_state.status = (vu.m_state.status & 0x03Fu) | (entry.status & 0xFC0u);
-            if (entry.writesClip)
-                vu.m_state.clip = entry.clip;
-            entry.valid = false;
-            vu.m_flagValidMask &= ~(1u << slot);
-        }
-        if (vu.m_fdiv.valid)
-        {
-            if (vu.m_fdiv.readyCycle <= vu.m_cycle)
-            {
-                vu.m_state.q = vu.m_fdiv.value;
-                const uint32_t currentDi = vu.m_fdiv.statusDi & 0x30u;
-                vu.m_state.status = (vu.m_state.status & 0xFCFu) | currentDi | (currentDi << 6);
-                vu.m_fdiv = {};
-            }
-            else if (vu.m_fdiv.readyCycle < next)
-                next = vu.m_fdiv.readyCycle;
-        }
-        for (auto &entry : vu.m_efu)
-        {
-            if (!entry.valid)
-                continue;
-            if (entry.readyCycle <= vu.m_cycle)
-            {
-                vu.m_state.p = entry.value;
-                entry = {};
-            }
-            else if (entry.readyCycle < next)
-                next = entry.readyCycle;
-        }
-        vu.m_nextCommitCycle = next;
+        vu.commitReadyPipelinesNow();
     }
     PS2X_VU1_FORCEINLINE static void advanceTo(VU1Interpreter &vu, uint64_t target) { vu.advanceTo(target); }
     // Same steps as VU1Interpreter::advanceOneCycle, inlined, except that PATH1 (XGKICK) is
@@ -244,7 +187,12 @@ public:
     // in-range value, so the MAC flags are the lane sign bits (same as updateFmacFlags).
     PS2X_VU1_FORCEINLINE static void queueFmacFlags(VU1Interpreter &vu, uint32_t mac, uint32_t status, uint32_t extraSticky)
     {
-        const uint32_t freeMask = ~vu.m_flagValidMask & ((1u << VU1Interpreter::kMaxFlagEntries) - 1u);
+        uint32_t freeMask = ~vu.m_flagValidMask & ((1u << VU1Interpreter::kMaxFlagEntries) - 1u);
+        if (freeMask == 0u && vu.m_cycle >= vu.m_nextCommitCycle)
+        {
+            vu.commitReadyPipelinesNow(); // entries left due by lazy commits
+            freeMask = ~vu.m_flagValidMask & ((1u << VU1Interpreter::kMaxFlagEntries) - 1u);
+        }
         if (freeMask == 0u)
         {
             const uint8_t laneFlags[4] = {0u, 0u, 0u, 0u};

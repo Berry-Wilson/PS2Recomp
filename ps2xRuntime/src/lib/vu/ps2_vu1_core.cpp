@@ -724,7 +724,7 @@ void VU1Interpreter::updateFmacFlags(const uint8_t laneFlags[4], uint8_t dest,
         status |= flags;
     }
 
-    const int slot = freeSlot(m_flagValidMask, kMaxFlagEntries);
+    const int slot = freeFlagSlot();
     if (slot < 0)
     {
         reportReservedInstruction(true, 0xFFFFFFFFu);
@@ -768,7 +768,7 @@ void VU1Interpreter::queueFsset(uint16_t immediate)
             entry.writesStatus = false;
     }
 
-    if (const int slot = freeSlot(m_flagValidMask, kMaxFlagEntries); slot >= 0)
+    if (const int slot = freeFlagSlot(); slot >= 0)
     {
         m_flagValidMask |= 1u << slot;
         FlagPipelineEntry &entry = m_flagPipeline[static_cast<size_t>(slot)];
@@ -789,7 +789,7 @@ void VU1Interpreter::queueFsset(uint16_t immediate)
 void VU1Interpreter::queueClip(uint32_t clip)
 {
     m_workingClip = ((m_workingClip << 6) | (clip & 0x3Fu)) & 0xFFFFFFu;
-    if (const int slot = freeSlot(m_flagValidMask, kMaxFlagEntries); slot >= 0)
+    if (const int slot = freeFlagSlot(); slot >= 0)
     {
         m_flagValidMask |= 1u << slot;
         FlagPipelineEntry &entry = m_flagPipeline[static_cast<size_t>(slot)];
@@ -815,7 +815,7 @@ void VU1Interpreter::queueFcset(uint32_t clip)
         if (entry.valid && entry.issueCycle == m_cycle)
             entry.writesClip = false;
     }
-    if (const int slot = freeSlot(m_flagValidMask, kMaxFlagEntries); slot >= 0)
+    if (const int slot = freeFlagSlot(); slot >= 0)
     {
         m_flagValidMask |= 1u << slot;
         FlagPipelineEntry &entry = m_flagPipeline[static_cast<size_t>(slot)];
@@ -962,6 +962,17 @@ void VU1Interpreter::queueAccWrite(uint8_t laneMask, const float value[4], uint3
     reportReservedInstruction(true, 0xFFFFFFF5u);
 }
 
+int VU1Interpreter::freeFlagSlot()
+{
+    int slot = freeSlot(m_flagValidMask, kMaxFlagEntries);
+    if (slot < 0 && m_cycle >= m_nextCommitCycle)
+    {
+        commitReadyPipelinesNow();
+        slot = freeSlot(m_flagValidMask, kMaxFlagEntries);
+    }
+    return slot;
+}
+
 void VU1Interpreter::commitReadyPipelines()
 {
     if (m_cycle < m_nextCommitCycle)
@@ -969,21 +980,63 @@ void VU1Interpreter::commitReadyPipelines()
     commitReadyPipelinesNow();
 }
 
-// Commits every queued entry whose readyCycle has been reached (queues in this fixed order,
-// slots in ascending index order) and recomputes m_nextCommitCycle from what remains.
+// Commits every queued entry whose readyCycle has been reached and recomputes
+// m_nextCommitCycle from what remains. Flags, Q and P commit in the order they became ready:
+// compiled code commits lazily (only before something can read them), so entries from several
+// cycles can be due at once. Entries due in the same cycle keep the fixed order (flags by slot,
+// then Q, then P); the other queues follow.
 void VU1Interpreter::commitReadyPipelinesNow()
 {
     uint64_t next = ~0ull;
 
-    for (uint32_t mask = m_flagValidMask; mask != 0u; mask &= mask - 1u)
+    for (;;)
     {
-        const int slot = std::countr_zero(mask);
-        FlagPipelineEntry &entry = m_flagPipeline[static_cast<size_t>(slot)];
-        if (entry.readyCycle > m_cycle)
+        uint64_t best = ~0ull;
+        int kind = -1;
+        int index = -1;
+        for (uint32_t mask = m_flagValidMask; mask != 0u; mask &= mask - 1u)
         {
-            next = std::min(next, entry.readyCycle);
+            const int slot = std::countr_zero(mask);
+            const uint64_t ready = m_flagPipeline[static_cast<size_t>(slot)].readyCycle;
+            if (ready <= m_cycle && ready < best)
+            {
+                best = ready;
+                kind = 0;
+                index = slot;
+            }
+        }
+        if (m_fdiv.valid && m_fdiv.readyCycle <= m_cycle && m_fdiv.readyCycle < best)
+        {
+            best = m_fdiv.readyCycle;
+            kind = 1;
+        }
+        for (size_t i = 0; i < m_efu.size(); ++i)
+        {
+            if (m_efu[i].valid && m_efu[i].readyCycle <= m_cycle && m_efu[i].readyCycle < best)
+            {
+                best = m_efu[i].readyCycle;
+                kind = 2;
+                index = static_cast<int>(i);
+            }
+        }
+        if (kind < 0)
+            break;
+        if (kind == 1)
+        {
+            m_state.q = m_fdiv.value;
+            const uint32_t currentDi = m_fdiv.statusDi & 0x30u;
+            m_state.status = (m_state.status & 0xFCFu) | currentDi | (currentDi << 6);
+            m_fdiv = {};
             continue;
         }
+        if (kind == 2)
+        {
+            m_state.p = m_efu[static_cast<size_t>(index)].value;
+            m_efu[static_cast<size_t>(index)] = {};
+            continue;
+        }
+        const int slot = index;
+        FlagPipelineEntry &entry = m_flagPipeline[static_cast<size_t>(slot)];
 
         if (entry.writesMac)
             m_state.mac = entry.mac;
@@ -1001,32 +1054,13 @@ void VU1Interpreter::commitReadyPipelinesNow()
         entry.valid = false;
         m_flagValidMask &= ~(1u << slot);
     }
-
+    for (uint32_t mask = m_flagValidMask; mask != 0u; mask &= mask - 1u)
+        next = std::min(next, m_flagPipeline[static_cast<size_t>(std::countr_zero(mask))].readyCycle);
     if (m_fdiv.valid)
-    {
-        if (m_fdiv.readyCycle <= m_cycle)
-        {
-            m_state.q = m_fdiv.value;
-            const uint32_t currentDi = m_fdiv.statusDi & 0x30u;
-            m_state.status = (m_state.status & 0xFCFu) | currentDi | (currentDi << 6);
-            m_fdiv = {};
-        }
-        else
-            next = std::min(next, m_fdiv.readyCycle);
-    }
-
-    for (ScalarPipelineEntry &entry : m_efu)
-    {
-        if (!entry.valid)
-            continue;
-        if (entry.readyCycle <= m_cycle)
-        {
-            m_state.p = entry.value;
-            entry = {};
-        }
-        else
+        next = std::min(next, m_fdiv.readyCycle);
+    for (const ScalarPipelineEntry &entry : m_efu)
+        if (entry.valid)
             next = std::min(next, entry.readyCycle);
-    }
 
     for (uint32_t mask = m_storeValidMask; mask != 0u; mask &= mask - 1u)
     {

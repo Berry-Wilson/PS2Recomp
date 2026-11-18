@@ -23,6 +23,7 @@
 #include <iostream>
 #include <map>
 #include <set>
+#include <regex>
 #include <sstream>
 #include <string>
 #include <vector>
@@ -1442,6 +1443,7 @@ static const uint32_t vu1MacSignBits[16] = {0x00u, 0x80u, 0x40u, 0xC0u, 0x20u, 0
 
 namespace
 {
+    uint32_t g_lazyCommitsKept = 0u, g_lazyCommitsSkipped = 0u;
     // VF0/VI0 are constants; the per-pair reset is only needed when the pair may write register
     // 0 (an interpreter fallback, or inline code naming st.vf[0]/st.vi[0]).
     void emitPair(std::ostream &out, const VU1Interpreter &vu, const uint8_t *code, uint32_t pc, const std::set<uint32_t> &compiled,
@@ -1460,6 +1462,42 @@ namespace
                                       rest.find("st.vf[0]") != std::string::npos || rest.find("st.vi[0]") != std::string::npos;
             if (!mayWriteZero)
                 text = rest;
+        }
+        // Lazy pipeline commits: flags, Q and P land in VU1State only when committed, and only a
+        // pair that reads them (or the interpreter) can tell when that happened. So commit before
+        // such a pair (and when leaving compiled code, in the image function), not every cycle.
+        // PS2X_VU1RECOMP_EAGER_COMMIT=1 keeps a commit after every cycle.
+        static const bool s_eager = []
+        {
+            const char *env = std::getenv("PS2X_VU1RECOMP_EAGER_COMMIT");
+            return env && env[0] == '1';
+        }();
+        if (!s_eager)
+        {
+            auto eraseAll = [&text](const std::string &what, const std::string &with)
+            {
+                for (size_t at = text.find(what); at != std::string::npos; at = text.find(what, at + with.size()))
+                    text.replace(at, what.size(), with);
+            };
+            eraseAll("    ++cyc; A::commitReadyPipelines(vu);\n", "    ++cyc;\n");
+            eraseAll("    A::commitReadyPipelines(vu);\n", "");
+            static const std::regex observes(
+                R"(\bst\.(q|p|mac|status|clip)\b|A::exec|A::queueQ|A::queueP|A::fdiv|A::efu)");
+            if (std::regex_search(text, observes))
+            {
+                // After the label's "{" and, at a block start, the budget check.
+                size_t at = text.find("{\n");
+                if (at != std::string::npos)
+                {
+                    at += 2u;
+                    if (text.compare(at, 22, "    if (cyc >= budgetEn") == 0)
+                        at = text.find('\n', at) + 1u;
+                    text.insert(at, "    A::commitReadyPipelines(vu);\n");
+                }
+                ++g_lazyCommitsKept;
+            }
+            else
+                ++g_lazyCommitsSkipped;
         }
         out << text;
     }
@@ -1586,17 +1624,21 @@ int main(int argc, char **argv)
         o << "Vu1CompiledResult " << fnName << "(VU1Interpreter &vu, uint64_t budgetEnd)\n{\n";
         o << "    VU1State &st = A::state(vu);\n";
         o << "    if (st.branchPending)\n        return Vu1CompiledResult::Fallback; // resumed mid-branch: the interpreter takes this run\n";
+        // Compiled pairs commit flags/Q/P lazily: commit what is due before the interpreter (or
+        // the caller) sees the state.
         o << "    for (;;)\n    {\n        Vu1CompiledResult result;\n";
         o << "        switch (st.pc >> " << kChunkShift << ")\n        {\n";
         for (const auto &[chunk, chunkPairs] : chunks)
             o << "        case " << chunk << "u: result = " << fnName << "_c" << chunk << "(vu, budgetEnd); break;\n";
-        o << "        default: return Vu1CompiledResult::Fallback;\n        }\n";
-        o << "        if (result != kContinue)\n            return result;\n    }\n}\n";
+        o << "        default: A::commitReadyPipelines(vu); return Vu1CompiledResult::Fallback;\n        }\n";
+        o << "        if (result != kContinue)\n        {\n            A::commitReadyPipelines(vu);\n            return result;\n        }\n    }\n}\n";
         images.push_back(fnName);
         statusMasks.push_back(inlined != 0u ? 0x03Fu : 0xFFFu);
         std::cout << name << ": " << g_blockStarts.size() << " block starts, stall checks removed " << g_stallChecksRemoved
                   << " kept " << g_stallChecksKept << " (max latency vf " << g_maxVfLatency << " vi " << g_maxViLatency
-                  << "); VF ready stores kept " << g_vfStoresKept << ", skipped " << g_vfStoresSkipped << "\n";
+                  << "); VF ready stores kept " << g_vfStoresKept << ", skipped " << g_vfStoresSkipped << "; pipeline commits kept "
+                  << g_lazyCommitsKept << ", skipped " << g_lazyCommitsSkipped << "\n";
+        g_lazyCommitsKept = g_lazyCommitsSkipped = 0u;
         std::cout << name << ": " << pairs.size() << " pairs from " << entries.size() << " entries; flag writers "
                   << analysis.writers << ", unobserved " << analysis.deadFlagWriters.size() << ", inlined " << inlined << " (+" << inlinedFlags << " with flags, " << inlinedSimple << " simple upper, " << inlinedLower << " lower)"
                   << (analysis.stickyObservable ? " (sticky status observable: no flag elimination)" : "") << "\n";

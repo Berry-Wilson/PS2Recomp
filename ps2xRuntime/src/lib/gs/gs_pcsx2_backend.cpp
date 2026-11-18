@@ -348,6 +348,7 @@ namespace
         {
             uint64_t tagLo = 0, tagHi = 0;
             uint32_t loop = 0, nloop = 0, reg = 0;
+            bool packedAd = false; // a PACKED tag with an A+D register among its NREG
         };
 
         void applyPrivilegedEffects(uint32_t path, const uint8_t *data, uint32_t size)
@@ -361,6 +362,13 @@ namespace
                     state.tagHi = word(data + offset + 8);
                     state.nloop = static_cast<uint32_t>(state.tagLo & 0x7FFFu);
                     state.loop = state.reg = 0;
+                    state.packedAd = false;
+                    if (((state.tagLo >> 58) & 3u) == 0u)
+                    {
+                        const uint32_t n = ((state.tagLo >> 60) & 0xFu) ? static_cast<uint32_t>((state.tagLo >> 60) & 0xFu) : 16u;
+                        for (uint32_t i = 0; i < n && !state.packedAd; ++i)
+                            state.packedAd = ((state.tagHi >> (i * 4u)) & 0xFu) == 0xEu;
+                    }
                     offset += 16u;
                     continue;
                 }
@@ -370,6 +378,16 @@ namespace
                 {
                     const uint32_t count = std::min<uint32_t>(state.nloop - state.loop, (size - offset) / 16u);
                     state.loop += count;
+                    offset += count * 16u;
+                    continue;
+                }
+                if (flg == 0u && !state.packedAd) // PACKED without A+D (vertex data): skip it whole
+                {
+                    const uint64_t remaining = static_cast<uint64_t>(state.nloop - state.loop) * nreg - state.reg;
+                    const uint32_t count = static_cast<uint32_t>(std::min<uint64_t>(remaining, (size - offset) / 16u));
+                    const uint64_t regs = static_cast<uint64_t>(state.reg) + count;
+                    state.loop += static_cast<uint32_t>(regs / nreg);
+                    state.reg = static_cast<uint32_t>(regs % nreg);
                     offset += count * 16u;
                     continue;
                 }
