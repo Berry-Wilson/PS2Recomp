@@ -303,6 +303,14 @@ namespace
                 std::cerr << "[pcsx2-gs] cannot load " << dll.string() << " (error " << GetLastError() << ")" << std::endl;
                 return false;
             }
+            // PCSX2 loads shaderc (its GLSL compiler, which Vulkan and OpenGL need) by bare name when
+            // it compiles shaders, and a bare name is not looked up in the DLL's folder. Loading it
+            // from there now makes that later lookup find this copy.
+            const std::filesystem::path shaderc = m_dllDir / "shaderc_shared.dll";
+            if (std::filesystem::exists(shaderc) &&
+                !LoadLibraryExW(shaderc.wstring().c_str(), nullptr, kLoadWithAlteredSearchPath))
+                std::cerr << "[pcsx2-gs] cannot load " << shaderc.string() << " (error " << GetLastError()
+                          << "); the Vulkan and OpenGL renderers will not start" << std::endl;
             auto get = [this](const char *name) { return GetProcAddress(m_module, name); };
             m_openFn = reinterpret_cast<Ps2xGsOpenFn>(get("ps2xgs_open"));
             m_gif = reinterpret_cast<Ps2xGsGifFn>(get("ps2xgs_gif"));
