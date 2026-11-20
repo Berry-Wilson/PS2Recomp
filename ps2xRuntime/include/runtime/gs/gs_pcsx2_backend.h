@@ -20,6 +20,10 @@ std::unique_ptr<GSRasterBackend> CreatePcsx2GSBackend(GSRegisters &registers, vo
 // line. Does nothing unless PCSX2's GS is running.
 void ps2xPcsx2SetOverlay(unsigned line, const char *text, uint32_t rgba);
 
+// Shows or hides PCSX2's statistics overlay (PS2X_PCSX2_OSD=1 shows it from the start). Does
+// nothing unless PCSX2's GS is running.
+void ps2xPcsx2ToggleOsd();
+
 // Saves the next presented frame as a PNG at `path`, at the internal resolution. Returns false
 // unless PCSX2's GS is running.
 bool ps2xPcsx2QueueSnapshot(const char *path);

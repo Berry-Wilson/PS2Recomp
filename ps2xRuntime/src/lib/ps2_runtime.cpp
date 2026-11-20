@@ -2920,6 +2920,9 @@ void PS2Runtime::run()
             }
         }
 #ifdef PS2X_GS_PCSX2
+        // F1: PCSX2's statistics overlay (resolution, GS stats, frame times, GPU).
+        if (ps2xPcsx2Active() && IsKeyPressed(KEY_F1))
+            ps2xPcsx2ToggleOsd();
         // F12: raylib saves its own (black) window contents as screenshotNNN.png during EndDrawing;
         // PCSX2 saves the real picture under the same name at its next present, replacing it.
         if (ps2xPcsx2Active() && IsKeyPressed(KEY_F12))

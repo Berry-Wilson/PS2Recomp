@@ -27,6 +27,8 @@ namespace
 {
     std::atomic<Ps2xGsSetOverlayFn> g_setOverlay{nullptr};
     std::atomic<Ps2xGsSnapshotFn> g_snapshot{nullptr};
+    std::atomic<Ps2xGsSetOsdFn> g_setOsd{nullptr};
+    std::atomic<bool> g_osdShown{false};
     std::atomic<bool> g_active{false};
     std::atomic<Ps2xGsCloseFn> g_close{nullptr};
 
@@ -117,6 +119,7 @@ namespace
             g_active.store(false, std::memory_order_release);
             g_setOverlay.store(nullptr, std::memory_order_release);
             g_snapshot.store(nullptr, std::memory_order_release);
+            g_setOsd.store(nullptr, std::memory_order_release);
             closeAtExit();
         }
 
@@ -145,6 +148,7 @@ namespace
             config.sharpness = static_cast<int>(envFloat("PS2X_PCSX2_SHARPNESS", 0.0f));
             config.vsync = 0; // the runtime paces frames itself
             config.osd = envFloat("PS2X_PCSX2_OSD", 0.0f) != 0.0f ? 1 : 0;
+            g_osdShown.store(config.osd != 0, std::memory_order_release);
             config.data_dir = dataDir.c_str();
             config.resources_dir = resources.c_str();
             config.serial = serial.empty() ? nullptr : serial.c_str();
@@ -312,6 +316,7 @@ namespace
                 return false;
             }
             g_setOverlay.store(reinterpret_cast<Ps2xGsSetOverlayFn>(get("ps2xgs_set_overlay")), std::memory_order_release);
+            g_setOsd.store(reinterpret_cast<Ps2xGsSetOsdFn>(get("ps2xgs_set_osd")), std::memory_order_release);
             std::cerr << "[pcsx2-gs] loaded " << dll.string() << std::endl;
             return true;
 #else
@@ -444,6 +449,18 @@ void ps2xPcsx2SetOverlay(unsigned line, const char *text, uint32_t rgba)
         return;
     if (Ps2xGsSetOverlayFn fn = g_setOverlay.load(std::memory_order_acquire))
         fn(line, text, rgba);
+}
+
+void ps2xPcsx2ToggleOsd()
+{
+    if (!g_active.load(std::memory_order_acquire))
+        return;
+    if (Ps2xGsSetOsdFn fn = g_setOsd.load(std::memory_order_acquire))
+    {
+        const bool show = !g_osdShown.load(std::memory_order_acquire);
+        g_osdShown.store(show, std::memory_order_release);
+        fn(show ? 1 : 0);
+    }
 }
 
 bool ps2xPcsx2QueueSnapshot(const char *path)
