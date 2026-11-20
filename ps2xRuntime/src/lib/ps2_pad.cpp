@@ -1,6 +1,12 @@
 #include "runtime/ps2_pad.h"
+#include "runtime/input_bindings.h"
 #include "ps2_host_backend.h"
+#include <cmath>
+#include <cstdio>
+#include <cstdlib>
 #include <cstring>
+#include <string>
+#include <vector>
 
 namespace
 {
@@ -23,6 +29,53 @@ namespace
     constexpr uint16_t PAD_L1 = 0x0400u;
     constexpr uint16_t PAD_R2 = 0x0200u;
     constexpr uint16_t PAD_L2 = 0x0100u;
+
+    // Pad bit for each button Action, in ps2x::input::Action order.
+    constexpr uint16_t kActionMasks[ps2x::input::kButtonActionCount] = {
+        PAD_UP, PAD_DOWN, PAD_LEFT, PAD_RIGHT, PAD_CROSS, PAD_CIRCLE, PAD_SQUARE, PAD_TRIANGLE,
+        PAD_L1, PAD_R1, PAD_L2, PAD_R2, PAD_L3, PAD_R3, PAD_START, PAD_SELECT};
+
+    // PS2X_CONTROLS=<file> picks the controls file; otherwise controls.ini in the working directory
+    // is used if it exists, and the built-in defaults if not (docs/input-bindings.md).
+    const ps2x::input::Bindings &controls()
+    {
+        static const ps2x::input::Bindings s_bindings = []()
+        {
+            ps2x::input::Bindings bindings = ps2x::input::Bindings::defaults();
+            const char *env = std::getenv("PS2X_CONTROLS");
+            const std::string path = env && env[0] ? env : "controls.ini";
+            std::vector<std::string> warnings;
+            if (ps2x::input::loadFile(path, bindings, &warnings))
+            {
+                std::fprintf(stderr, "[pad] controls from %s\n", path.c_str());
+                for (const std::string &w : warnings)
+                    std::fprintf(stderr, "[pad] %s: %s\n", path.c_str(), w.c_str());
+            }
+            else if (env && env[0])
+                std::fprintf(stderr, "[pad] cannot read %s, using the default controls\n", path.c_str());
+            return bindings;
+        }();
+        return s_bindings;
+    }
+
+    // raylib numbers gamepad buttons its own way; ps2x::input uses GLFW's standard order.
+    constexpr int kRaylibButtonFor[ps2x::input::kGamepadButtonCount] = {
+        GAMEPAD_BUTTON_RIGHT_FACE_DOWN,  // South
+        GAMEPAD_BUTTON_RIGHT_FACE_RIGHT, // East
+        GAMEPAD_BUTTON_RIGHT_FACE_LEFT,  // West
+        GAMEPAD_BUTTON_RIGHT_FACE_UP,    // North
+        GAMEPAD_BUTTON_LEFT_TRIGGER_1,   // LeftShoulder
+        GAMEPAD_BUTTON_RIGHT_TRIGGER_1,  // RightShoulder
+        GAMEPAD_BUTTON_MIDDLE_LEFT,      // Back
+        GAMEPAD_BUTTON_MIDDLE_RIGHT,     // Start
+        GAMEPAD_BUTTON_MIDDLE,           // Guide
+        GAMEPAD_BUTTON_LEFT_THUMB,       // LeftStick
+        GAMEPAD_BUTTON_RIGHT_THUMB,      // RightStick
+        GAMEPAD_BUTTON_LEFT_FACE_UP,     // DpadUp
+        GAMEPAD_BUTTON_LEFT_FACE_RIGHT,  // DpadRight
+        GAMEPAD_BUTTON_LEFT_FACE_DOWN,   // DpadDown
+        GAMEPAD_BUTTON_LEFT_FACE_LEFT,   // DpadLeft
+    };
 }
 
 bool PSPadBackend::readState(int /*port*/, int /*slot*/, uint8_t *data, size_t size)
@@ -37,97 +90,52 @@ bool PSPadBackend::readState(int /*port*/, int /*slot*/, uint8_t *data, size_t s
     data[3] = 0xFF;
     data[4] = data[5] = data[6] = data[7] = kPadStickCenter;
 
+    // Every connected gamepad and the keyboard count together, so an idle or wrongly mapped pad in
+    // slot 0 cannot shut out the others.
+    constexpr int kMaxGamepads = 4;
+    static bool s_padConnected[kMaxGamepads] = {};
+    std::vector<ps2x::input::GamepadState> gamepads;
+    for (int pad = 0; pad < kMaxGamepads; ++pad)
+    {
+        const bool available = IsGamepadAvailable(pad);
+        if (available != s_padConnected[pad])
+        {
+            s_padConnected[pad] = available;
+            if (available)
+                std::fprintf(stderr, "[pad] gamepad %d connected: %s\n", pad, GetGamepadName(pad));
+            else
+                std::fprintf(stderr, "[pad] gamepad %d disconnected\n", pad);
+        }
+        if (!available)
+            continue;
+        ps2x::input::GamepadState state;
+        for (int b = 0; b < ps2x::input::kGamepadButtonCount; ++b)
+            state.buttons[b] = IsGamepadButtonDown(pad, kRaylibButtonFor[b]);
+        for (int a = 0; a < ps2x::input::kGamepadAxisCount; ++a)
+            state.axes[a] = GetGamepadAxisMovement(pad, a); // same order as GAMEPAD_AXIS_*
+        gamepads.push_back(state);
+    }
+
+    // raylib's KEY_* values are GLFW's key codes, which the bindings use.
+    const ps2x::input::PadState pad = ps2x::input::evaluate(
+        controls(), [](int key) { return IsKeyDown(key); }, gamepads);
+
     uint16_t btns = 0xFFFFu;
-    constexpr int kGamepad = 0;
-    const bool useGamepad = IsGamepadAvailable(kGamepad);
-    auto clearBit = [&btns](uint16_t mask)
-    { btns &= ~mask; };
-
-    if (useGamepad)
+    for (int i = 0; i < ps2x::input::kButtonActionCount; ++i)
     {
-        if (IsGamepadButtonDown(kGamepad, GAMEPAD_BUTTON_LEFT_FACE_UP))
-            clearBit(PAD_UP);
-        if (IsGamepadButtonDown(kGamepad, GAMEPAD_BUTTON_LEFT_FACE_DOWN))
-            clearBit(PAD_DOWN);
-        if (IsGamepadButtonDown(kGamepad, GAMEPAD_BUTTON_LEFT_FACE_LEFT))
-            clearBit(PAD_LEFT);
-        if (IsGamepadButtonDown(kGamepad, GAMEPAD_BUTTON_LEFT_FACE_RIGHT))
-            clearBit(PAD_RIGHT);
-        if (IsGamepadButtonDown(kGamepad, GAMEPAD_BUTTON_RIGHT_FACE_DOWN))
-            clearBit(PAD_CROSS);
-        if (IsGamepadButtonDown(kGamepad, GAMEPAD_BUTTON_RIGHT_FACE_RIGHT))
-            clearBit(PAD_CIRCLE);
-        if (IsGamepadButtonDown(kGamepad, GAMEPAD_BUTTON_RIGHT_FACE_LEFT))
-            clearBit(PAD_SQUARE);
-        if (IsGamepadButtonDown(kGamepad, GAMEPAD_BUTTON_RIGHT_FACE_UP))
-            clearBit(PAD_TRIANGLE);
-        if (IsGamepadButtonDown(kGamepad, GAMEPAD_BUTTON_LEFT_TRIGGER_1))
-            clearBit(PAD_L1);
-        if (IsGamepadButtonDown(kGamepad, GAMEPAD_BUTTON_RIGHT_TRIGGER_1))
-            clearBit(PAD_R1);
-        if (IsGamepadButtonDown(kGamepad, GAMEPAD_BUTTON_LEFT_TRIGGER_2))
-            clearBit(PAD_L2);
-        if (IsGamepadButtonDown(kGamepad, GAMEPAD_BUTTON_RIGHT_TRIGGER_2))
-            clearBit(PAD_R2);
-        if (IsGamepadButtonDown(kGamepad, GAMEPAD_BUTTON_MIDDLE_RIGHT))
-            clearBit(PAD_START);
-        if (IsGamepadButtonDown(kGamepad, GAMEPAD_BUTTON_MIDDLE_LEFT))
-            clearBit(PAD_SELECT);
-        if (IsGamepadButtonDown(kGamepad, GAMEPAD_BUTTON_LEFT_THUMB))
-            clearBit(PAD_L3);
-        if (IsGamepadButtonDown(kGamepad, GAMEPAD_BUTTON_RIGHT_THUMB))
-            clearBit(PAD_R3);
-
-        float lx = GetGamepadAxisMovement(kGamepad, GAMEPAD_AXIS_LEFT_X);
-        float ly = GetGamepadAxisMovement(kGamepad, GAMEPAD_AXIS_LEFT_Y);
-        float rx = GetGamepadAxisMovement(kGamepad, GAMEPAD_AXIS_RIGHT_X);
-        float ry = GetGamepadAxisMovement(kGamepad, GAMEPAD_AXIS_RIGHT_Y);
-        data[6] = static_cast<uint8_t>(128 + lx * 127);
-        data[7] = static_cast<uint8_t>(128 + ly * 127);
-        data[4] = static_cast<uint8_t>(128 + rx * 127);
-        data[5] = static_cast<uint8_t>(128 + ry * 127);
+        if (pad.isPressed(static_cast<ps2x::input::Action>(i)))
+            btns &= static_cast<uint16_t>(~kActionMasks[i]);
     }
-    else
+    const float *axes = pad.sticks.data(); // lx, ly, rx, ry in [-1, 1]
+    auto stickByte = [](float value) -> uint8_t
     {
-        if (IsKeyDown(KEY_UP) || IsKeyDown(KEY_W))
-            clearBit(PAD_UP);
-        if (IsKeyDown(KEY_DOWN) || IsKeyDown(KEY_S))
-            clearBit(PAD_DOWN);
-        if (IsKeyDown(KEY_LEFT) || IsKeyDown(KEY_A))
-            clearBit(PAD_LEFT);
-        if (IsKeyDown(KEY_RIGHT) || IsKeyDown(KEY_D))
-            clearBit(PAD_RIGHT);
-        if (IsKeyDown(KEY_X) || IsKeyDown(KEY_SPACE))
-            clearBit(PAD_CROSS);
-        if (IsKeyDown(KEY_C) || IsKeyDown(KEY_ESCAPE))
-            clearBit(PAD_CIRCLE);
-        if (IsKeyDown(KEY_Z) || IsKeyDown(KEY_KP_0))
-            clearBit(PAD_SQUARE);
-        if (IsKeyDown(KEY_V) || IsKeyDown(KEY_KP_1))
-            clearBit(PAD_TRIANGLE);
-        if (IsKeyDown(KEY_Q))
-            clearBit(PAD_L1);
-        if (IsKeyDown(KEY_E))
-            clearBit(PAD_R1);
-        if (IsKeyDown(KEY_LEFT_SHIFT))
-            clearBit(PAD_L2);
-        if (IsKeyDown(KEY_RIGHT_SHIFT))
-            clearBit(PAD_R2);
-        if (IsKeyDown(KEY_ENTER))
-            clearBit(PAD_START);
-        if (IsKeyDown(KEY_TAB))
-            clearBit(PAD_SELECT);
-
-        // Right analog stick: IJKL (I/K = up/down, J/L = left/right).
-        if (IsKeyDown(KEY_J))
-            data[4] = 0x00;
-        else if (IsKeyDown(KEY_L))
-            data[4] = 0xFF;
-        if (IsKeyDown(KEY_I))
-            data[5] = 0x00;
-        else if (IsKeyDown(KEY_K))
-            data[5] = 0xFF;
-    }
+        value = std::fmax(-1.0f, std::fmin(1.0f, value));
+        return static_cast<uint8_t>(kPadStickCenter + static_cast<int>(value * 127.0f));
+    };
+    data[6] = stickByte(axes[0]);
+    data[7] = stickByte(axes[1]);
+    data[4] = stickByte(axes[2]);
+    data[5] = stickByte(axes[3]);
 
     data[2] = static_cast<uint8_t>(btns & 0xFF);
     data[3] = static_cast<uint8_t>(btns >> 8);
