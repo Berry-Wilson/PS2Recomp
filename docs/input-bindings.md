@@ -77,8 +77,8 @@ buttons) can push a stick too.
 
 ### Reserved keys
 
-F1 (PCSX2 overlay or debug panel), F3 (VSync counter), F5 (super-sampling) and F12 (screenshot)
-are used by the runtime or the games built on it.
+F1 (PCSX2 overlay or debug panel), F3 (VSync counter), F5 (super-sampling), F11 (full screen) and
+F12 (screenshot) are used by the runtime or the games built on it.
 `isReservedKey()` reports them, and a front end should refuse to bind them.
 
 ## The controls file

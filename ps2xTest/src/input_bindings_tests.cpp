@@ -133,7 +133,8 @@ void register_input_bindings_tests()
 
         tc.Run("function keys the runtime uses are reserved", [](TestCase &t)
         {
-            t.IsTrue(isReservedKey(290) && isReservedKey(292) && isReservedKey(294) && isReservedKey(301), "F1, F3, F5 and F12");
+            t.IsTrue(isReservedKey(290) && isReservedKey(292) && isReservedKey(294) && isReservedKey(300) && isReservedKey(301),
+                     "F1, F3, F5, F11 and F12");
             t.IsFalse(isReservedKey(291), "F2 is free");
         });
     });

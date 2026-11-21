@@ -1115,6 +1115,9 @@ bool PS2Runtime::initialize(const char *title)
             windowWidth = static_cast<int>(HOST_WINDOW_HEIGHT * ps2xOutputAspect() + 0.5f);
 #endif
         InitWindow(windowWidth, HOST_WINDOW_HEIGHT, title);
+        // PS2X_FULLSCREEN=1 starts in borderless full screen on the window's monitor; F11 toggles it.
+        if (const char *fullscreen = std::getenv("PS2X_FULLSCREEN"); fullscreen && fullscreen[0] == '1')
+            ToggleBorderlessWindowed();
         InitAudioDevice();
         m_audioBackend.setAudioReady(IsAudioDeviceReady());
         startSpu2Stream();
@@ -2925,6 +2928,10 @@ void PS2Runtime::run()
                 DrawText(text, pad, pad, fontSize, s_gameRate >= 57.0f ? LIME : (s_gameRate >= 45.0f ? YELLOW : RED));
             }
         }
+        // F11: borderless full screen on the monitor the window is on, and back to the window as it
+        // was. No display mode change, so PCSX2's child window just follows the new size.
+        if (IsKeyPressed(KEY_F11))
+            ToggleBorderlessWindowed();
 #ifdef PS2X_GS_PCSX2
         // F1: PCSX2's statistics overlay (resolution, GS stats, frame times, GPU).
         if (ps2xPcsx2Active() && IsKeyPressed(KEY_F1))

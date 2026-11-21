@@ -152,7 +152,7 @@ namespace ps2x::input
     std::optional<Binding> bindingFromId(std::string_view id);
 
     // Keys the runtime keeps for itself (F1 overlay or debug panel, F3 VSync counter, F5
-    // super-sampling, F12 screenshot).
+    // super-sampling, F11 full screen, F12 screenshot).
     bool isReservedKey(int glfwKey);
 
     // The controls file: an INI-style text with [keyboard], [controller] and [sticks] sections.

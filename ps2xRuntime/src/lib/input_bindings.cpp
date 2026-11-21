@@ -409,9 +409,10 @@ namespace ps2x::input
 
     bool isReservedKey(int glfwKey)
     {
-        // F1, F3, F5 and F12: the hotkeys of the games using this runtime (overlay or debug panel,
-        // VSync counter, super-sampling, screenshot).
-        return glfwKey == kKeyF1 || glfwKey == kKeyF1 + 2 || glfwKey == kKeyF1 + 4 || glfwKey == kKeyF1 + 11;
+        // F1, F3, F5, F11 and F12: the hotkeys of the games using this runtime (overlay or debug
+        // panel, VSync counter, super-sampling, full screen, screenshot).
+        return glfwKey == kKeyF1 || glfwKey == kKeyF1 + 2 || glfwKey == kKeyF1 + 4 || glfwKey == kKeyF1 + 10 ||
+               glfwKey == kKeyF1 + 11;
     }
 
     std::string serialize(const Bindings &bindings)
