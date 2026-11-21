@@ -20,6 +20,11 @@ std::unique_ptr<GSRasterBackend> CreatePcsx2GSBackend(GSRegisters &registers, vo
 // line. Does nothing unless PCSX2's GS is running.
 void ps2xPcsx2SetOverlay(unsigned line, const char *text, uint32_t rgba);
 
+// The width / height the picture is shown at, from PS2X_ASPECT (only "16:9" so far); 0 keeps the
+// PS2's own 4:3. PCSX2 then stretches the picture to that shape, and the game window starts that
+// shape. The game must draw for it (narrower 3D projection and screen art), which is up to the port.
+float ps2xOutputAspect();
+
 // Shows or hides PCSX2's statistics overlay (PS2X_PCSX2_OSD=1 shows it from the start). Does
 // nothing unless PCSX2's GS is running.
 void ps2xPcsx2ToggleOsd();

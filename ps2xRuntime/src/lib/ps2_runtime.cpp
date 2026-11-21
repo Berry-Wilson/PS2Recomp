@@ -1108,7 +1108,13 @@ bool PS2Runtime::initialize(const char *title)
         InitWindow(HOST_WINDOW_WIDTH, HOST_WINDOW_HEIGHT, title); // raylib vita does not support audio
 #else
         SetConfigFlags(FLAG_WINDOW_RESIZABLE);
-        InitWindow(HOST_WINDOW_WIDTH, HOST_WINDOW_HEIGHT, title);
+        int windowWidth = HOST_WINDOW_WIDTH;
+#ifdef PS2X_GS_PCSX2
+        // PS2X_ASPECT=16:9: the window starts the shape PCSX2 stretches the picture to.
+        if (ps2xOutputAspect() > 0.0f)
+            windowWidth = static_cast<int>(HOST_WINDOW_HEIGHT * ps2xOutputAspect() + 0.5f);
+#endif
+        InitWindow(windowWidth, HOST_WINDOW_HEIGHT, title);
         InitAudioDevice();
         m_audioBackend.setAudioReady(IsAudioDeviceReady());
         startSpu2Stream();

@@ -144,7 +144,7 @@ namespace
             config.parent_window = parentWindow;
             config.renderer = envRenderer();
             config.upscale = upscale;
-            config.widescreen = 0;
+            config.widescreen = ps2xOutputAspect() > 0.0f ? 1 : 0;
             config.sharpness = static_cast<int>(envFloat("PS2X_PCSX2_SHARPNESS", 0.0f));
             config.vsync = 0; // the runtime paces frames itself
             config.osd = envFloat("PS2X_PCSX2_OSD", 0.0f) != 0.0f ? 1 : 0;
@@ -457,6 +457,16 @@ void ps2xPcsx2SetOverlay(unsigned line, const char *text, uint32_t rgba)
         return;
     if (Ps2xGsSetOverlayFn fn = g_setOverlay.load(std::memory_order_acquire))
         fn(line, text, rgba);
+}
+
+float ps2xOutputAspect()
+{
+    static const float aspect = []()
+    {
+        const char *value = std::getenv("PS2X_ASPECT");
+        return value && std::strcmp(value, "16:9") == 0 ? 16.0f / 9.0f : 0.0f;
+    }();
+    return aspect;
 }
 
 void ps2xPcsx2ToggleOsd()
