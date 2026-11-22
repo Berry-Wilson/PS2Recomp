@@ -26,3 +26,6 @@ android/.gradle/
 
 # Memory card saves written when running from this folder
 mc0/
+
+# Local notes on the input bindings framework, kept out of the repo.
+docs/input-bindings.md
