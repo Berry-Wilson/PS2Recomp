@@ -250,21 +250,9 @@ namespace
             put(kSmode1, kSmode1Ntsc);
             put(kSmode2, request.smode2);
             put(kDispfb1, request.dispfb1);
-            // Interlaced FRAME mode (SMODE2 INT and FFMD) shows each field's own picture. Games that
-            // draw the two halves of one progressive image there (the intro movies: even lines on
-            // field 0, odd lines on field 1) look right on a TV, which puts field 1 half a line
-            // lower, but bob up and down with PCSX2's deinterlacer off. Raise field 1 by that line.
-            // CSR.FIELD says which half the game drew last; presentation is not in step with VBlank.
-            const bool frameMode = (request.smode2 & 3u) == 3u;
-            auto display = [&](uint64_t value) {
-                const uint64_t dy = (value >> 12) & 0x7FFull;
-                if (!frameMode || request.field == 0u || dy == 0u)
-                    return value;
-                return (value & ~(0x7FFull << 12)) | ((dy - 1u) << 12);
-            };
-            put(kDisplay1, display(request.display1));
+            put(kDisplay1, request.display1);
             put(kDispfb2, request.dispfb2);
-            put(kDisplay2, display(request.display2));
+            put(kDisplay2, request.display2);
             put(kBgcolor, request.bgcolor);
             m_vsync(m_field);
             m_field ^= 1u;
