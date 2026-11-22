@@ -326,6 +326,18 @@ namespace ps2_syscalls
         ee.transferIfRequested(false);
     }
 
+    // Interrupt-handler variants. Games whose libkernel InitThread is stubbed (so its top thread,
+    // which libkernel's iSuspendThread wrapper relies on, never exists) bind the wrapper here.
+    void iSuspendThread(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
+    {
+        setReturnS32(ctx, scheduler(rdram, ctx, runtime).suspendThread(static_cast<int>(getRegU32(ctx, 4)), true));
+    }
+
+    void iResumeThread(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
+    {
+        setReturnS32(ctx, scheduler(rdram, ctx, runtime).resumeThread(static_cast<int>(getRegU32(ctx, 4)), true));
+    }
+
     void GetThreadId(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
     {
         setReturnS32(ctx, scheduler(rdram, ctx, runtime).currentThreadId());

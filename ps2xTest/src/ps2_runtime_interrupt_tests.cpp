@@ -373,6 +373,60 @@ namespace
         ctx->pc = 0u;
         runtime->requestStop();
     }
+
+    // iSuspendThread on the interrupted thread from a GS VSync callback (ezmpeg's vblank handler
+    // suspends its own reader thread): the handler must finish before the thread stops.
+    constexpr uint32_t kSelfSuspendMainPc = 0x00160600u;
+    constexpr uint32_t kSelfSuspendMainResumePc = 0x00160610u;
+    constexpr uint32_t kSelfSuspendHandlerPc = 0x00160620u;
+    constexpr uint32_t kSelfSuspendOtherPc = 0x00160630u;
+    bool g_selfSuspendHandlerDoneBeforeOther = false;
+
+    void schedulerSelfSuspendHandler(uint8_t *, R5900Context *ctx, PS2Runtime *runtime)
+    {
+        g_dispatchTrace.push_back(2);
+        EeScheduler &scheduler = runtime->eeScheduler();
+        scheduler.suspendThread(EeScheduler::kMainThreadId, true);
+        g_dispatchTrace.push_back(3);
+        ctx->pc = 0u;
+    }
+
+    void schedulerSelfSuspendOther(uint8_t *, R5900Context *ctx, PS2Runtime *runtime)
+    {
+        EeScheduler &scheduler = runtime->eeScheduler();
+        const GuestThread *main = scheduler.thread(EeScheduler::kMainThreadId);
+        g_selfSuspendHandlerDoneBeforeOther = main && main->invocations.empty() &&
+                                              main->status == EeThreadStatus::Suspended;
+        g_dispatchTrace.push_back(4);
+        ctx->pc = 0u;
+        scheduler.resumeThread(EeScheduler::kMainThreadId, false);
+    }
+
+    void schedulerSelfSuspendMain(uint8_t *, R5900Context *ctx, PS2Runtime *runtime)
+    {
+        g_dispatchTrace.push_back(1);
+        EeScheduler &scheduler = runtime->eeScheduler();
+        EeThreadCreateParams other{};
+        other.entry = kSelfSuspendOtherPc;
+        other.stack = 0x1C000u;
+        other.stackSize = 0x1000u;
+        other.priority = 10;
+        scheduler.startThread(scheduler.createThread(other), 0u, *ctx, false);
+
+        GuestInvocation invocation{};
+        invocation.kind = GuestInvocationKind::GsCallback;
+        invocation.context.pc = kSelfSuspendHandlerPc;
+        setRegU32(invocation.context, 31, 0u);
+        scheduler.queueInvocation(std::move(invocation));
+        ctx->pc = kSelfSuspendMainResumePc;
+    }
+
+    void schedulerSelfSuspendMainResume(uint8_t *, R5900Context *ctx, PS2Runtime *runtime)
+    {
+        g_dispatchTrace.push_back(5);
+        ctx->pc = 0u;
+        runtime->requestStop();
+    }
 }
 
 void register_ps2_runtime_interrupt_tests()
@@ -600,6 +654,28 @@ void register_ps2_runtime_interrupt_tests()
             t.IsFalse(exhausted, "queued callbacks must not consume one invocation stack per pending item");
             t.Equals(g_invocationQueueRuns, 96u, "every queued callback should execute exactly once");
             t.IsFalse(g_invocationQueueSpChanged, "sequential callbacks should reuse the same stack depth");
+        });
+
+        tc.Run("iSuspendThread on the interrupted thread takes effect when its handler returns", [](TestCase &t)
+        {
+            TestEnv env;
+            env.runtime.registerFunction(kSelfSuspendMainPc, schedulerSelfSuspendMain);
+            env.runtime.registerFunction(kSelfSuspendMainResumePc, schedulerSelfSuspendMainResume);
+            env.runtime.registerFunction(kSelfSuspendHandlerPc, schedulerSelfSuspendHandler);
+            env.runtime.registerFunction(kSelfSuspendOtherPc, schedulerSelfSuspendOther);
+
+            g_dispatchTrace.clear();
+            g_selfSuspendHandlerDoneBeforeOther = false;
+            R5900Context mainContext{};
+            mainContext.pc = kSelfSuspendMainPc;
+            env.runtime.eeScheduler().reset(env.rdram.data(), mainContext);
+            env.runtime.eeScheduler().run();
+
+            const std::vector<int> expected{1, 2, 3, 4, 5};
+            t.IsTrue(g_dispatchTrace == expected,
+                     "the handler should finish, the suspended thread should yield, and resume should restore it");
+            t.IsTrue(g_selfSuspendHandlerDoneBeforeOther,
+                     "the interrupted thread should be suspended with its handler frame already returned");
         });
 
         tc.Run("iSignalSema defers selection until IRQ return", [](TestCase &t)

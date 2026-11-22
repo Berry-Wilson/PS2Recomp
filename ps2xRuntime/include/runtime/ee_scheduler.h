@@ -123,6 +123,8 @@ struct GuestThread
     int currentPriority = 0;
     EeThreadStatus status = EeThreadStatus::Dormant;
     int suspendCount = 0;
+    // Suspended by an interrupt handler running on this thread: takes effect when it returns.
+    bool suspendAfterInterrupt = false;
     uint32_t wakeupCount = 0;
     bool ownsStack = false;
     uint32_t tlsBase = 0;
@@ -391,6 +393,7 @@ private:
     [[nodiscard]] GuestThread *selectReady();
     void makeRunning(GuestThread &thread);
     void makeDormant(GuestThread &thread);
+    void applySuspendAfterInterrupt(GuestThread &thread);
     void removeFromWaitObject(GuestThread &thread);
     [[noreturn]] void blockCurrent(EeWaitState wait);
     void makeReady(GuestThread &thread, int result, bool interruptSafe);

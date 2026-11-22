@@ -156,6 +156,21 @@ void EeScheduler::reset(uint8_t *rdram, const R5900Context &mainContext)
     publishSnapshot();
 }
 
+namespace
+{
+    // What a lap of a rotate-to-a-peer polling loop is charged. More than a real lap costs: guest
+    // time cannot run ahead of the host clock (events wait for both), and the host spends far more
+    // per lap than the EE would, so a real-cost charge left the intro movies at ~60% speed.
+    constexpr uint32_t kRotateYieldCycles = 8192u;
+
+    bool isInterruptContext(GuestInvocationKind kind)
+    {
+        return kind == GuestInvocationKind::Interrupt ||
+               kind == GuestInvocationKind::Alarm ||
+               kind == GuestInvocationKind::GsCallback;
+    }
+}
+
 void EeScheduler::run()
 {
     assertExecutor();
@@ -250,6 +265,7 @@ void EeScheduler::run()
                     {
                     }
                 }
+                applySuspendAfterInterrupt(*running);
                 continue;
             }
             makeDormant(*running);
@@ -300,7 +316,9 @@ void EeScheduler::run()
 
         try
         {
-            m_insideInterrupt = !running->invocations.empty() && running->invocations.back().kind == GuestInvocationKind::Interrupt;
+            // INTC/DMAC handlers, alarm handlers and the GS VSync callback all run in interrupt
+            // context on the EE.
+            m_insideInterrupt = !running->invocations.empty() && isInterruptContext(running->invocations.back().kind);
             m_guestExecuting.store(true, std::memory_order_release);
             function(m_rdram, &context, &m_runtime);
             m_guestExecuting.store(false, std::memory_order_release);
@@ -509,6 +527,7 @@ int EeScheduler::startThread(int id, uint32_t arg, const R5900Context &caller, b
     target->context.pc = target->entry;
     target->arg = arg;
     target->suspendCount = 0;
+    target->suspendAfterInterrupt = false;
     target->wakeupCount = 0;
     target->wait = {};
     SET_GPR_U32(&target->context, 4, arg);
@@ -601,6 +620,15 @@ int EeScheduler::suspendThread(int id, bool interruptSafe)
     switch (target->status)
     {
     case EeThreadStatus::Running:
+        if (m_insideInterrupt)
+        {
+            // The handler runs on this thread (iSuspendThread on the interrupted thread). The
+            // kernel suspends it on return from the interrupt, so the rest of the handler still
+            // runs; libkernel's wrapper does the same through its top thread.
+            target->suspendAfterInterrupt = true;
+            publishSnapshot();
+            return KE_OK;
+        }
         target->status = EeThreadStatus::Suspended;
         m_currentThreadId = 0;
         m_rescheduleRequested = true;
@@ -647,6 +675,7 @@ int EeScheduler::resumeThread(int id, bool interruptSafe)
     {
         return KE_OK;
     }
+    target->suspendAfterInterrupt = false;
     if (target->status == EeThreadStatus::WaitingSuspended)
     {
         target->status = EeThreadStatus::Waiting;
@@ -788,6 +817,13 @@ int EeScheduler::rotateReadyQueue(int priority, bool interruptSafe)
         {
             setReturnS32(&self->activeContext(), KE_OK);
             spinUntilNextEvent();
+        }
+        // Threads that poll by rotating to each other (a movie reader and decoder waiting on the
+        // CD stream) would otherwise trade the CPU for a few cycles a lap, and the stream and
+        // VBlank, which are timed in EE cycles, would crawl. Charge a polling lap's real cost.
+        if (!interruptSafe)
+        {
+            accountCycles(kRotateYieldCycles);
         }
         enqueueReady(*self);
         m_currentThreadId = 0;
@@ -1786,8 +1822,36 @@ void EeScheduler::makeDormant(GuestThread &item)
     item.wait = {};
     item.resumeCompletion = {};
     item.suspendCount = 0;
+    item.suspendAfterInterrupt = false;
     item.wakeupCount = 0;
     item.invocations.clear();
+}
+
+void EeScheduler::applySuspendAfterInterrupt(GuestThread &item)
+{
+    if (!item.suspendAfterInterrupt || !item.invocations.empty())
+    {
+        return;
+    }
+    item.suspendAfterInterrupt = false;
+    if (item.suspendCount == 0)
+    {
+        return;
+    }
+    if (item.status == EeThreadStatus::Running)
+    {
+        item.status = EeThreadStatus::Suspended;
+        if (m_currentThreadId == item.id)
+        {
+            m_currentThreadId = 0;
+        }
+    }
+    else if (item.status == EeThreadStatus::Ready)
+    {
+        removeReady(item);
+        item.status = EeThreadStatus::Suspended;
+    }
+    publishSnapshot();
 }
 
 void EeScheduler::removeFromWaitObject(GuestThread &item)
