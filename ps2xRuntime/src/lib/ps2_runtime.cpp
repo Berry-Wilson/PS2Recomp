@@ -429,6 +429,7 @@ namespace
 //   PS2X_FRAME_DUMP_DIR   folder to write frame_<n>_tick<vsync>.png into (dumping is off when unset)
 //   PS2X_FRAME_DUMP_EVERY save every Nth newly presented frame (default 60, ~1 per second)
 //   PS2X_FRAME_DUMP_MAX   stop after this many files (default 300)
+//   PS2X_FRAME_DUMP_START skip the presented frames before this one (default 0)
 // Alpha is forced opaque in the saved copy since GS alpha (0..0x80) is not display opacity.
 static void dumpPresentedFrame(const std::vector<uint8_t> &rgba, uint32_t width, uint32_t height, uint64_t tick)
 {
@@ -453,10 +454,16 @@ static void dumpPresentedFrame(const std::vector<uint8_t> &rgba, uint32_t width,
         const long value = env ? std::strtol(env, nullptr, 10) : 300;
         return static_cast<uint32_t>(value > 0 ? value : 300);
     }();
+    static const uint32_t s_start = []
+    {
+        const char *env = std::getenv("PS2X_FRAME_DUMP_START");
+        const long value = env ? std::strtol(env, nullptr, 10) : 0;
+        return static_cast<uint32_t>(value > 0 ? value : 0);
+    }();
     static uint32_t s_frameIndex = 0u;
     static uint32_t s_written = 0u;
     const uint32_t frameIndex = s_frameIndex++;
-    if (frameIndex % s_every != 0u || s_written >= s_max)
+    if (frameIndex < s_start || (frameIndex - s_start) % s_every != 0u || s_written >= s_max)
     {
         return;
     }
@@ -506,10 +513,16 @@ static void dumpPresentedFramePcsx2(uint64_t tick)
         const long value = env ? std::strtol(env, nullptr, 10) : 300;
         return static_cast<uint32_t>(value > 0 ? value : 300);
     }();
+    static const uint32_t s_start = []
+    {
+        const char *env = std::getenv("PS2X_FRAME_DUMP_START");
+        const long value = env ? std::strtol(env, nullptr, 10) : 0;
+        return static_cast<uint32_t>(value > 0 ? value : 0);
+    }();
     static uint32_t s_frameIndex = 0u;
     static uint32_t s_written = 0u;
     const uint32_t frameIndex = s_frameIndex++;
-    if (frameIndex % s_every != 0u || s_written >= s_max)
+    if (frameIndex < s_start || (frameIndex - s_start) % s_every != 0u || s_written >= s_max)
         return;
     std::error_code ec;
     std::filesystem::create_directories(s_dir, ec);
