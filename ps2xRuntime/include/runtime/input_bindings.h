@@ -151,7 +151,8 @@ namespace ps2x::input
     std::string bindingLabel(const Binding &binding); // "Left Shift", "South (A / Cross)", "Left stick left"
     std::optional<Binding> bindingFromId(std::string_view id);
 
-    // Keys the runtime keeps for itself (F1 debug panel, F5 super-sampling, F12 screenshot).
+    // Keys the runtime keeps for itself: F1 statistics, F3 speed counter, F5 internal resolution,
+    // F11 full screen, F12 screenshot.
     bool isReservedKey(int glfwKey);
 
     // The controls file: an INI-style text with [keyboard], [controller] and [sticks] sections.

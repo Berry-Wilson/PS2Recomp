@@ -409,7 +409,9 @@ namespace ps2x::input
 
     bool isReservedKey(int glfwKey)
     {
-        return glfwKey == kKeyF1 || glfwKey == kKeyF1 + 4 || glfwKey == kKeyF1 + 11;
+        // F1 statistics, F3 speed counter, F5 internal resolution, F11 full screen, F12 screenshot.
+        const int n = glfwKey - kKeyF1 + 1;
+        return n == 1 || n == 3 || n == 5 || n == 11 || n == 12;
     }
 
     std::string serialize(const Bindings &bindings)
