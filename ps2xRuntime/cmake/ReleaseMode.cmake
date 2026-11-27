@@ -53,6 +53,12 @@ function(EnableFastReleaseMode TargetName)
 
     if(IPO_SUPPORTED)
         set_property(TARGET ${TargetName} PROPERTY INTERPROCEDURAL_OPTIMIZATION_RELEASE TRUE)
+        if(MINGW AND CMAKE_CXX_COMPILER_ID MATCHES "Clang")
+            # lld's ThinLTO runs one thread per physical core by default. With every hardware thread
+            # the runner's link, the longest step of a build, takes about a quarter less time; the
+            # program it makes is the same.
+            target_link_options(${TargetName} PRIVATE $<$<CONFIG:Release>:-Wl,--thinlto-jobs=all>)
+        endif()
     else()
         message(WARNING "Interprocedural optimization not supported: ${ipo_error}")
     endif()
