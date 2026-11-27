@@ -3630,7 +3630,14 @@ void PS2Runtime::run()
         m_debugUiInitialized = false;
     }
 #if defined(PS2X_HAS_HOST_DISPLAY)
-    display.hide(); // closed by ~PS2Runtime, after the GS backend that draws into it
+    // main leaves through _Exit, which skips ~PS2Runtime but still ends in ExitProcess. That stops
+    // PCSX2's GS thread wherever it is and then runs ps2x-gs.dll's static destructors, which
+    // destroy its Vulkan shader cache on a device that was never closed, and crash. So the GS
+    // backend is closed here, as ~PS2Runtime would: after the VIF1 worker that feeds it and
+    // before the window it draws into. Both steps do nothing if ~PS2Runtime runs them again.
+    m_memory.stopVif1Worker();
+    m_gs.setRasterBackend(nullptr);
+    HostDisplay::destroy();
 #else
     UnloadTexture(frameTex);
     CloseWindow();
