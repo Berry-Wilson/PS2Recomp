@@ -1,4 +1,5 @@
 #include "runtime/ee_scheduler.h"
+#include "runtime/display_clock.h"
 
 #include "ps2_log.h"
 #include "ps2_runtime_macros.h"
@@ -1933,6 +1934,8 @@ void EeScheduler::processDueDeadlines()
                 {
                     nextVBlankHost = vblankNow;
                 }
+                // On a display at a multiple of 60 Hz, the vblank moves onto its refreshes.
+                nextVBlankHost = ps2x::display_clock::align(nextVBlankHost, vblankNow);
                 scheduleEvent(scheduled.deadlineCycle + kVBlankDurationCycles,
                               scheduled.hostDeadline + kVBlankDuration,
                               EeEvent{EeEventType::VBlankEnd, 0, m_vsyncTick + 1u});

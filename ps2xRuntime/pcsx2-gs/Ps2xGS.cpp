@@ -212,10 +212,10 @@ namespace
 		}
 	}
 
-	void GsThread(bool vsync)
+	void GsThread(GSVSyncMode vsync)
 	{
 		std::memset(s_regs, 0, sizeof(s_regs));
-		const bool ok = GSopen(EmuConfig.GS, s_type, s_regs, vsync ? GSVSyncMode::FIFO : GSVSyncMode::Disabled, false);
+		const bool ok = GSopen(EmuConfig.GS, s_type, s_regs, vsync, false);
 		{
 			std::lock_guard<std::mutex> lk(s_q_lock);
 			s_open_result = ok ? 1 : -1;
@@ -590,7 +590,10 @@ PS2XGS_API int ps2xgs_open(const Ps2xGsConfig *config)
 		default: s_type = GSRendererType::Auto; break;
 	}
 	s_open_result = 0;
-	const bool vsync = config->vsync != 0;
+	// PCSX2 falls back to FIFO where the API or the full-screen mode has no mailbox.
+	const GSVSyncMode vsync = config->vsync == 1 ? GSVSyncMode::Mailbox :
+	                          config->vsync == 2 ? GSVSyncMode::FIFO :
+	                                               GSVSyncMode::Disabled;
 	s_gs_thread = new std::thread([vsync] { GsThread(vsync); });
 	{
 		std::unique_lock<std::mutex> lk(s_q_lock);

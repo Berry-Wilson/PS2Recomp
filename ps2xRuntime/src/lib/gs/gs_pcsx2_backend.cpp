@@ -1,5 +1,6 @@
 #include "runtime/gs/gs_pcsx2_backend.h"
 #include "gs_frame_interpolation.h"
+#include "runtime/display_clock.h"
 #include "runtime/host_display.h"
 
 #include "../../../pcsx2-gs/ps2x_gs_api.h"
@@ -319,7 +320,10 @@ void GSPcsx2Backend::Impl::ensureOpen()
         config.upscale = upscale;
         config.widescreen = HostDisplay::outputAspect() > 0.0f ? 1 : 0;
         config.sharpness = static_cast<int>(envFloat("PS2X_PCSX2_SHARPNESS", 0.0f));
-        config.vsync = 0; // the runtime paces frames itself
+        // The runtime paces the game's frames itself (and lines them up with the display's refreshes
+        // where it can, see display_clock.h). With vsync each picture is then shown at the display's
+        // next refresh, a newer one taking its place if it comes first, so presenting never waits.
+        config.vsync = ps2x::display_clock::vsyncEnabled() ? 1 : 0;
         config.osd = envFloat("PS2X_PCSX2_OSD", 0.0f) != 0.0f ? 1 : 0;
         osd = config.osd != 0;
         config.data_dir = dataDir.c_str();

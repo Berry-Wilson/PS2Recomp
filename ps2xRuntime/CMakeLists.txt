@@ -410,6 +410,7 @@ add_library(ps2_runtime STATIC
     src/lib/ps2_write_watch.cpp
     src/lib/ps2x_config.cpp
     src/lib/ps2_guest_clock.cpp
+    src/lib/display_clock.cpp
     src/lib/games_database.cpp
 )
 
@@ -548,6 +549,7 @@ target_include_directories(ps2_runtime PUBLIC
 target_link_libraries(ps2_runtime PUBLIC ps2_host_backend ffmpeg ps2_iop)
 if(WIN32)
     target_link_libraries(ps2_runtime PUBLIC dbghelp) # ps2_write_watch.cpp names the writing code
+    target_link_libraries(ps2_runtime PUBLIC dxgi) # display_clock.cpp waits for the display's refreshes
 endif()
 
 if(PS2X_USE_HOST_DISPLAY)

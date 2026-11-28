@@ -26,7 +26,9 @@ typedef struct Ps2xGsConfig
     float upscale;          // internal resolution multiplier, 1 = the PS2's
     int widescreen;         // 1: show the picture at 16:9 (the game draws it narrowed), 0: 4:3
     int sharpness;          // 0 off, 1 low, 2 high: anisotropic filtering and CAS sharpening
-    int vsync;              // 1: wait for the display's refresh when presenting
+    int vsync;              // 0: present at once; 1: each picture is shown at the display's next
+                            // refresh, a newer one replacing it if it comes first (mailbox);
+                            // 2: presenting waits for the refresh (FIFO)
     int osd;                // 1: PCSX2's statistics overlay
     const char *data_dir;   // where PCSX2 writes its shader cache and logs (created if missing)
     const char *resources_dir; // PCSX2's resources folder (shaders, fonts, GameIndex.yaml)

@@ -1,4 +1,5 @@
 #include "runtime/host_display.h"
+#include "runtime/display_clock.h"
 #include "runtime/host_input.h"
 
 #define GLFW_INCLUDE_NONE
@@ -79,6 +80,7 @@ HostDisplay::HostDisplay() : m_impl(std::make_unique<Impl>()) {}
 
 HostDisplay::~HostDisplay()
 {
+    ps2x::display_clock::stop();
     hostinput::detach();
     if (m_impl->window)
         glfwDestroyWindow(m_impl->window);
@@ -180,6 +182,7 @@ bool HostDisplay::create(const char *title, int width, int height)
     hostinput::attach(window);
 
     s_display = std::move(display);
+    ps2x::display_clock::start(s_display->nativeWindow());
     return true;
 }
 
