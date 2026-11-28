@@ -1,7 +1,12 @@
 @echo off
 setlocal enabledelayedexpansion
 rem Builds ps2x-gs.dll inside a PCSX2 source tree.
-rem   build-ps2x-gs.bat <pcsx2 source dir> <ffmpeg dir> [output dir]
+rem   build-ps2x-gs.bat <pcsx2 source dir> <ffmpeg dir> [output dir] [build folder]
+rem The build folder is inside the PCSX2 tree, build-gs unless named. Projects that share one PCSX2 tree
+rem each need their own: configuring points the build folder's PS2X_GS_DIR at the folder this script
+rem is in, so two projects building in one folder keep switching it to their own source. Pass "" as
+rem the output dir to name a build folder without copying. Each build folder also gets its own copy of FFmpeg's headers,
+rem deps-ffmpeg-<build folder>, so projects can build against different FFmpeg versions.
 rem With an output dir (the runner's pcsx2-gs folder, ps2xRuntime\Release\pcsx2-gs in the build), it
 rem also copies there the DLL, the dependency DLLs it loads and PCSX2's resources, and writes
 rem PCSX2's commit to pcsx2-commit.txt. See README.md.
@@ -12,6 +17,8 @@ rem satisfy PCSX2's configure step; the PS2Recomp build already has a copy.
 set "PCSX2=%~1"
 set "FFMPEG=%~2"
 set "OUTDIR=%~3"
+set "BUILDDIR=%~4"
+if "%BUILDDIR%"=="" set "BUILDDIR=build-gs"
 set "GSDIR=%~dp0"
 set "GSDIR=%GSDIR:~0,-1%"
 if "%PCSX2%"=="" goto usage
@@ -23,7 +30,7 @@ set "PATH=!VSINSTPATH!\VC\Tools\Llvm\x64\bin;!VSINSTPATH!\Common7\IDE\CommonExte
 
 rem PCSX2 reads FFmpeg's version from libavutil/ffversion.h, which in a build from git holds a commit
 rem hash. A copy of the headers with the release version written in satisfies its check.
-set "FFINC=%PCSX2%\deps-ffmpeg\include"
+set "FFINC=%PCSX2%\deps-ffmpeg-%BUILDDIR%\include"
 if exist "%FFINC%" rmdir /S /Q "%FFINC%"
 xcopy "%FFMPEG%\include" "%FFINC%\" /E /I /Q /Y > nul || goto error
 for /f "tokens=3" %%v in ('findstr /c:"define LIBAVCODEC_VERSION_MAJOR" "%FFMPEG%\include\libavcodec\version_major.h"') do set "AVCODEC_MAJOR=%%v"
@@ -41,17 +48,17 @@ for %%c in (avcodec avformat avutil swresample swscale) do (
 )
 
 cd /d "%PCSX2%" || goto error
-cmake -B build-gs -G Ninja -DCMAKE_BUILD_TYPE=Release ^
+cmake -B "%BUILDDIR%" -G Ninja -DCMAKE_BUILD_TYPE=Release ^
   -DCMAKE_C_COMPILER=clang-cl -DCMAKE_CXX_COMPILER=clang-cl ^
   -DCMAKE_PREFIX_PATH="%PCSX2%\deps" ^
   -DENABLE_QT_UI=OFF -DENABLE_TESTS=OFF -DDISABLE_ADVANCE_SIMD=ON ^
   -DPS2X_GS_DIR="%GSDIR%" !FFOPTS! || goto error
-cmake --build build-gs --target ps2x-gs || goto error
-echo Built ps2x-gs.
+cmake --build "%BUILDDIR%" --target ps2x-gs || goto error
+echo Built ps2x-gs in %PCSX2%\%BUILDDIR%.
 if "%OUTDIR%"=="" exit /B 0
 
 if not exist "%OUTDIR%" mkdir "%OUTDIR%" || goto error
-copy /Y "build-gs\ps2x-gs\ps2x-gs.dll" "%OUTDIR%\" > nul || goto error
+copy /Y "%BUILDDIR%\ps2x-gs\ps2x-gs.dll" "%OUTDIR%\" > nul || goto error
 copy /Y "deps\bin\*.dll" "%OUTDIR%\" > nul || goto error
 xcopy "bin\resources" "%OUTDIR%\resources\" /E /I /Q /Y > nul || goto error
 rem Which PCSX2 source this is, for whoever is given the DLL.
@@ -60,7 +67,7 @@ echo Copied ps2x-gs.dll, its dependencies and resources to %OUTDIR%.
 exit /B 0
 
 :usage
-echo usage: build-ps2x-gs.bat ^<pcsx2 source dir^> ^<ffmpeg dir^> [output dir]
+echo usage: build-ps2x-gs.bat ^<pcsx2 source dir^> ^<ffmpeg dir^> [output dir] [build folder]
 exit /B 2
 
 :error

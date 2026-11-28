@@ -40,8 +40,23 @@ PCSX2 at commit `1ccd6a8dc` (4 November 2026) is known to work.
    ```
    build-ps2x-gs.bat C:\src\pcsx2 <PS2Recomp>\out\build\ThirdParty\ffmpeg-prefix\src\ffmpeg_external <PS2Recomp>\out\build\ps2xRuntime\Release\pcsx2-gs
    ```
+   It builds in `C:\src\pcsx2\build-gs`. A fourth argument names another build folder in the
+   PCSX2 tree, for example `build-gs-dg`.
 
-After changing `Ps2xGS.cpp`, run step 4 again.
+After changing `Ps2xGS.cpp`, run step 4 again, with the same build folder.
+
+### More than one project in one PCSX2 tree
+
+Several projects can build their DLL from one PCSX2 tree, but each needs its own build folder.
+Configuring a build folder points it at the `pcsx2-gs` folder of the project whose script ran, so two
+projects building in `build-gs` would keep switching it to their own source. Pass each project's
+calls the same fourth argument every time:
+```
+build-ps2x-gs.bat C:\src\pcsx2 <ffmpeg dir> <runner>\pcsx2-gs build-gs-dg
+```
+Each build folder also gets its own copy of FFmpeg's headers, `deps-ffmpeg-<build folder>\include` in
+the PCSX2 tree, so the projects can use different FFmpeg versions. The dependencies in `deps` are
+shared.
 
 ## Giving the DLL to others
 
